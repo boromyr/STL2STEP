@@ -1,0 +1,15 @@
+# generated CAD output
+*.step
+*.stp
+*.brep
+
+# logs, reports, scratch text
+*.txt
+*.log
+
+# python
+__pycache__/
+*.pyc
+
+# local backups
+.bak/
