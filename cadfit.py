@@ -1,5 +1,5 @@
-"""Per ogni faccia del CAD originale: le faccette della mesh che le competono
-stanno davvero su UNA primitiva, con la nostra tolleranza?"""
+"""For each face of the original CAD: do the mesh facets that belong to it
+really sit on ONE primitive, within our tolerance?"""
 import sys
 import numpy as np
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
@@ -12,7 +12,7 @@ shA = R.read_input(sys.argv[1])[0]
 shB = load_brep(sys.argv[2])
 topo = R.Topo(shB)
 toA, med, mx, tA, fA, tipA, arA = align(shA, shB)
-print(f"allineamento ICP: medio {med:.5f} max {mx:.5f} mm")
+print(f"ICP alignment: mean {med:.5f} max {mx:.5f} mm")
 cent = np.array([topo.cents[i] for i in range(topo.nF)])
 dd, _, jj = closest_on_tris(toA(cent), tA)
 of = fA[jj]
@@ -27,19 +27,19 @@ for o in range(len(tipA)):
     P = np.vstack([topo.verts[i] for i in m])
     p = R.refit_best(m, topo.verts, topo.norms, topo.areas)
     if p is None:
-        print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} facce -> fit None")
+        print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} faces -> fit None")
         continue
     p2 = sg._snap_cylinder(p, m)
     d = np.abs(p2.dist(P))
     fuori = [i for i in m if not sg.within(p2, i)]
     if not fuori or "BSpline" in tipA[o]:
-        print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} facce -> "
-              f"{p2.label():7s} res max {d.max():.2e}  fuori {len(fuori)}")
+        print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} faces -> "
+              f"{p2.label():7s} max residual {d.max():.2e}  outside {len(fuori)}")
         continue
-    print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} facce -> "
-          f"{p2.label():7s} res max {d.max():.2e}  fuori {len(fuori)}")
+    print(f"  {tipA[o].replace('GeomAbs_',''):16s} area {arA[o]:8.3f} {len(m):5d} faces -> "
+          f"{p2.label():7s} max residual {d.max():.2e}  outside {len(fuori)}")
     for i in fuori:
         V = topo.verts[i]
         res = float(np.abs(p2.dist(V)).max())
-        print(f"       faccetta area {topo.areas[i]:.5f}  res {res:.2e}  "
-              f"soglia {sg.face_tol(p2, i):.2e}  dist dal CAD {dd[i]:.2e}")
+        print(f"       facet area {topo.areas[i]:.5f}  residual {res:.2e}  "
+              f"threshold {sg.face_tol(p2, i):.2e}  dist from CAD {dd[i]:.2e}")

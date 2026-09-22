@@ -1,6 +1,6 @@
-"""Allinea due B-Rep dello stesso pezzo (assi d'inerzia) e confronta le facce.
+"""Aligns two B-Reps of the same part (inertia axes) and compares the faces.
 
-uso:  python align.py originale.step nostro.step
+usage:  python align.py original.step ours.step
 """
 import sys, itertools
 import numpy as np
@@ -18,7 +18,7 @@ from OCP.GProp import GProp_GProps
 
 
 def tri_of(shape, defl):
-    """(triangoli (n,3,3), id faccia per triangolo, tipi di superficie, aree)."""
+    """(triangles (n,3,3), face id per triangle, surface types, areas)."""
     BRepMesh_IncrementalMesh(shape, defl, False, 0.3, True)
     tris, fid, tipi, aree = [], [], [], []
     ex = TopExp_Explorer(shape, TopAbs_FACE)
@@ -53,7 +53,7 @@ def inertia_frame(shape):
 
 
 def best_transform(shA, shB, PA, PB):
-    """Rototraslazione che porta A su B, scelta fra le 24 combinazioni di assi."""
+    """Rigid transform taking A onto B, chosen among the 24 axis combinations."""
     cA, VA, wA = inertia_frame(shA)
     cB, VB, wB = inertia_frame(shB)
     best = None
@@ -80,7 +80,7 @@ def chamfer(P, Q, cap=1500):
 
 
 def point_tri_dist(P, T, chunk=400):
-    """Distanza di ogni punto dal triangolo piu' vicino: (dist, indice)."""
+    """Distance of each point from the closest triangle: (dist, index)."""
     A, B, C = T[:, 0], T[:, 1], T[:, 2]
     out_d = np.full(len(P), np.inf)
     out_i = np.zeros(len(P), dtype=int)
@@ -104,7 +104,7 @@ def point_tri_dist(P, T, chunk=400):
         v = (d00 * d21 - d01 * d20) / den
         inside = (u >= 0) & (v >= 0) & (u + v <= 1)
         d = np.where(inside, np.abs(h), np.inf)
-        # fuori dal triangolo: distanza dai tre lati
+        # outside the triangle: distance to the three sides
         for p0, p1 in ((a, b), (b, c), (c, a)):
             e = p1 - p0
             ee = np.maximum(np.einsum("ij,ij->i", e, e), 1e-20)
@@ -120,32 +120,32 @@ def point_tri_dist(P, T, chunk=400):
 
 
 def main():
-    shA = R.read_input(sys.argv[1])[0]          # originale
-    shB = R.read_input(sys.argv[2])[0]          # nostro
+    shA = R.read_input(sys.argv[1])[0]          # original
+    shB = R.read_input(sys.argv[2])[0]          # ours
     diag = 1.0
     tA, fA, tipA, arA = tri_of(shA, 0.05)
     tB, fB, tipB, arB = tri_of(shB, 0.05)
     PA = tA.reshape(-1, 3)
     PB = tB.reshape(-1, 3)
     d, cA, cB, Rm = best_transform(shA, shB, PA, PB)
-    print(f"allineamento: scarto medio {d:.4f} mm")
-    # porta il NOSTRO nel frame dell'originale
+    print(f"alignment: mean residual {d:.4f} mm")
+    # bring OURS into the original's frame
     Rinv = Rm.T
     def toA(P):
         return cA + (P - cB) @ Rinv.T
     cen = tB.mean(axis=1)
     cenA = toA(cen)
     dd, jj = point_tri_dist(cenA, tA)
-    print(f"distanza dei baricentri dei nostri triangoli dall'originale: "
-          f"media {dd.mean():.4f}  p99 {np.percentile(dd,99):.4f}  max {dd.max():.4f} mm")
-    # per ogni faccia originale: quante NOSTRE facce ci stanno sopra
-    origf = fA[jj]                    # faccia originale sotto ogni nostro triangolo
+    print(f"distance of our triangles' centroids from the original: "
+          f"mean {dd.mean():.4f}  p99 {np.percentile(dd,99):.4f}  max {dd.max():.4f} mm")
+    # for each original face: how many OUR faces sit on it
+    origf = fA[jj]                    # original face under each of our triangles
     from collections import defaultdict
     sotto = defaultdict(set)
     for tri_i, of in enumerate(origf):
         sotto[of].add(fB[tri_i])
-    print(f"\nfacce originali {len(tipA)}, nostre {len(tipB)}")
-    print("faccia originale                      -> nostre facce")
+    print(f"\noriginal faces {len(tipA)}, ours {len(tipB)}")
+    print("original face                          -> our faces")
     righe = []
     for of in range(len(tipA)):
         ns = sotto.get(of, set())
@@ -153,9 +153,9 @@ def main():
         righe.append((len(ns), arA[of], tipA[of], tt))
     righe.sort(key=lambda r: -r[0])
     for n, a, t, tt in righe[:20]:
-        print(f"  {t:16s} area {a:8.3f}  -> {n:4d} facce  {','.join(tt)}")
+        print(f"  {t:16s} area {a:8.3f}  -> {n:4d} faces  {','.join(tt)}")
     tot = sum(r[0] for r in righe)
-    print(f"  ... totale nostre facce assegnate: {tot}")
+    print(f"  ... total assigned faces of ours: {tot}")
 
 
 if __name__ == "__main__":

@@ -1,49 +1,49 @@
 # STL2STEP
 
-Riconversione "morbida" di mesh (STL, o STEP nato da mesh) in B-Rep analitica con OpenCascade.
+"Soft" reconversion of a mesh (STL, or a STEP born from a mesh) into an analytic B-Rep using OpenCascade.
 
-Il principio e' uno solo: **ogni modifica alla geometria e' locale**, viene verificata subito (solido
-ancora chiuso, facce valide, orientamento coerente, area e volume coerenti con la mesh) e se non
-passa il controllo viene scartata. Quello che non si riesce a convertire resta tassellato com'era:
-il file di uscita e' sempre coerente con quello di ingresso, al massimo e' meno "pulito". Non si
-cuce (Sewing) e non si ricostruisce niente globalmente.
+The principle is a single one: **every change to the geometry is local**, is verified right away
+(solid still closed, faces valid, consistent orientation, area and volume consistent with the mesh)
+and is discarded if it doesn't pass the check. Whatever can't be converted stays tessellated as it
+was: the output file is always consistent with the input one, at worst it's just less "clean". There
+is no global Sewing and nothing is rebuilt globally.
 
-## Fasi
+## Phases
 
-- **Fase A** (`-a`): unione delle facce complanari e degli spigoli collineari.
-- **Fase B** (`-b`): fori circolari — pareti cilindriche chiuse a 360°, concave, con i bordi che
-  sono cerchi esatti.
-- **Fase C** (`-c`): raccordi, smussi, svasature, lamature, sfere d'angolo, bossi — ogni regione di
-  faccette che sta su un cilindro / cono / sfera / toro viene sostituita dalla superficie analitica.
-  Dove nessuna quadrica descrive la superficie, la regione viene ricostruita con una B-spline.
+- **Phase A** (`-a`): merging of coplanar faces and collinear edges.
+- **Phase B** (`-b`): circular holes — cylindrical walls closed 360°, concave, with edges that are
+  exact circles.
+- **Phase C** (`-c`): fillets, chamfers, countersinks, spotfaces, corner spheres, bosses — every
+  region of facets that sits on a cylinder / cone / sphere / torus gets replaced by the analytic
+  surface. Where no quadric describes the surface, the region is rebuilt with a B-spline.
 
-Le fasi si eseguono nell'ordine in cui sono scritte in riga di comando. Senza flag la sequenza e'
-`A B C A` (l'ultima riunisce le facce piane spezzate dalle sostituzioni).
+The phases run in the order they're written on the command line. With no flags the sequence is
+`A B C A` (the last one re-merges the planar faces split by the replacements).
 
 ```
-python refit.py pezzo.stl -a -b -c -a 0.005
+python refit.py part.stl -a -b -c -a 0.005
 ```
 
-Vedi il docstring in testa a `refit.py` per la guida completa (tolleranze, come leggere il report,
-il passo finale degli archi).
+See the docstring at the top of `refit.py` for the full guide (tolerances, how to read the report,
+the final arc-snapping step).
 
-## File
+## Files
 
-- `refit.py` — lo strumento principale.
-- `verify.py` — misura lo scarto fra un'uscita e la mesh di partenza.
-- `archi.py` — conta quante spezzate della mesh sono in realta' archi di cerchio.
-- `tassellate.py` — stima quanta curvatura e' rimasta tassellata nell'uscita.
-- `test0.stl` … `test10.stl` — mesh di prova, ordinate per numero di facce crescente (`test0` la
-  piu' semplice, `test10` la piu' complessa).
-- altri script (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
-  `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — strumenti di analisi e
-  debug usati durante lo sviluppo.
+- `refit.py` — the main tool.
+- `verify.py` — measures the deviation between an output and the starting mesh.
+- `archi.py` — counts how many of the mesh's polylines are actually circular arcs.
+- `tassellate.py` — estimates how much curvature is left tessellated in the output.
+- `test0.stl` … `test10.stl` — test meshes, ordered by increasing facet count (`test0` the
+  simplest, `test10` the most complex).
+- other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
+  `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
+  used during development.
 
-## Rami
+## Branches
 
-- `main` — documentazione e commenti in inglese.
-- `ita` — documentazione e commenti in italiano (lingua originale di sviluppo).
+- `main` — documentation and comments in English.
+- `ita` — documentation and comments in Italian (original development language).
 
-## Licenza
+## License
 
-MIT — vedi [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

@@ -1,4 +1,4 @@
-"""Anatomia di un B-Rep: facce per tipo di superficie, spigoli per tipo di curva."""
+"""Anatomy of a B-Rep: faces by surface type, edges by curve type."""
 import sys
 import numpy as np
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
@@ -23,12 +23,12 @@ def info(path):
             cu["?"] += 1
     V = topo.vpos
     print(f"--- {path}")
-    print(f"    facce {topo.nF}   spigoli {len(topo.edges)}   vertici {len(V)}")
-    print(f"    superfici: {dict(sf.most_common())}")
-    print(f"    curve    : {dict(cu.most_common())}")
+    print(f"    faces {topo.nF}   edges {len(topo.edges)}   vertices {len(V)}")
+    print(f"    surfaces: {dict(sf.most_common())}")
+    print(f"    curves  : {dict(cu.most_common())}")
     n8 = sum(v for k, v in lati.items() if k > 8)
-    print(f"    lati per faccia: max {max(lati)}  con >8 lati {n8}  "
-          f"distribuzione {dict(sorted(lati.items())[:10])}")
+    print(f"    sides per face: max {max(lati)}  with >8 sides {n8}  "
+          f"distribution {dict(sorted(lati.items())[:10])}")
     print(f"    volume {R.shape_volume(sh):.4f} mm3   bbox {(V.max(axis=0)-V.min(axis=0)).round(2)}")
     return sh, topo
 

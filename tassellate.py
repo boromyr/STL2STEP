@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Quanta CURVA e' rimasta tassellata nell'uscita: facce piane che confinano
-con altre facce piane con un diedro fra 1 e 30 gradi = una banda curva spezzata."""
+"""How much CURVATURE is left tessellated in the output: planar faces bordering
+other planar faces with a dihedral angle between 1 and 30 degrees = a curved band cut into pieces."""
 import sys, math
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
 import numpy as np
@@ -28,7 +28,7 @@ for path in sys.argv[1:]:
                 break
     tot = A.sum()
     print(f"--- {path}")
-    print(f"    facce {t.nF}  piane {int(pian.sum())}  analitiche {int((~pian).sum())}")
-    print(f"    piane che fanno parte di una banda curva tassellata: {int(curva.sum())} "
-          f"({100*A[curva].sum()/tot:.1f}% dell'area)")
-    print(f"    area coperta da facce analitiche: {100*A[~pian].sum()/tot:.1f}%")
+    print(f"    faces {t.nF}  planar {int(pian.sum())}  analytic {int((~pian).sum())}")
+    print(f"    planar faces that are part of a tessellated curved band: {int(curva.sum())} "
+          f"({100*A[curva].sum()/tot:.1f}% of the area)")
+    print(f"    area covered by analytic faces: {100*A[~pian].sum()/tot:.1f}%")

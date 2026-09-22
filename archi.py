@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Quante SPEZZATE dell'uscita sono in realta' un ARCO (o un segmento) del CAD.
+How many POLYLINES in the output are actually an ARC (or a segment) from the CAD.
 
-Per ogni wire si prendono le corse massimali di spigoli rettilinei consecutivi
-e si prova a farci passare: una retta (allora la Fase A non ha unito) oppure
-un cerchio. Se passa entro tolleranza, quella corsa e' una curva sola travestita
-da spezzata.
+For every wire, the maximal runs of consecutive straight edges are taken and
+we try to fit: a line (meaning Phase A failed to merge it) or a circle. If it
+fits within tolerance, that run is a single curve in disguise as a polyline.
 """
 import sys, math
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
@@ -26,7 +25,7 @@ def curve_type(e):
 
 
 def fit_circle_3d(P):
-    """(centro, raggio, scarto max) del cerchio ai minimi quadrati per P (n x 3)."""
+    """(center, radius, max deviation) of the least-squares circle for P (n x 3)."""
     c0 = P.mean(axis=0)
     Q = P - c0
     u, s, vt = np.linalg.svd(Q, full_matrices=False)
@@ -50,11 +49,11 @@ def main(path, tol, ang_vivo=20.0):
     sh = R.read_input(path)[0]
     topo = R.Topo(sh)
     diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0)))
-    print(f"--- {path}   diagonale {diag:.1f} mm   tolleranza di giudizio {tol:g} mm")
+    print(f"--- {path}   diagonal {diag:.1f} mm   judgment tolerance {tol:g} mm")
     tipi = Counter()
     for e in topo.edges:
         tipi[curve_type(e)] += 1
-    print(f"    spigoli {len(topo.edges)}: {dict(tipi.most_common())}")
+    print(f"    edges {len(topo.edges)}: {dict(tipi.most_common())}")
 
     visti = set()
     restanti = set()
@@ -76,7 +75,7 @@ def main(path, tol, ang_vivo=20.0):
             n = len(seq)
             chiuso = n > 2
             lin = [curve_type(e) == "Line" for e, _ in seq]
-            # corse massimali di rettilinei consecutivi (sul wire, che e' ciclico)
+            # maximal runs of consecutive straight edges (on the wire, which is cyclic)
             if not any(lin):
                 continue
             start = 0
@@ -96,11 +95,11 @@ def main(path, tol, ang_vivo=20.0):
                         runs.append(cur); cur = []
                 if cur:
                     runs.append(cur)
-            # ⚠️ UNA CORSA VA SPEZZATA ANCHE AGLI SPIGOLI VIVI. Un anello tutto
-            # rettilineo non e' una curva sola: e' una catena di archi e rette
-            # attaccati agli angoli. Senza questo taglio si prova a far passare
-            # UN cerchio per tutto l'anello, non passa, e si conclude - a torto -
-            # che li' non c'era nessun arco.
+            # ⚠️ A RUN MUST ALSO BE SPLIT AT SHARP CORNERS. A ring that is
+            # entirely straight is not a single curve: it's a chain of arcs
+            # and lines meeting at corners. Without this cut you try to fit
+            # ONE circle through the whole ring, it doesn't fit, and you
+            # wrongly conclude that there was no arc there at all.
             spezzate = []
             for run in runs:
                 if len(run) < 3:
@@ -124,7 +123,7 @@ def main(path, tol, ang_vivo=20.0):
                 corse += 1
                 P = np.array([seq[j][1] for j in run] +
                              [seq[(run[-1] + 1) % n][1]])
-                # retta?
+                # is it a line?
                 d0 = P - P[0]
                 dr = P[-1] - P[0]
                 L = float(np.linalg.norm(dr))
@@ -141,9 +140,9 @@ def main(path, tol, ang_vivo=20.0):
                 if c is None:
                     continue
                 cen, rad, dev = c
-                # ⚠️ il cerchio deve spiegare la corsa MOLTO meglio della retta,
-                # altrimenti una spezzata quasi dritta passa per un cerchio
-                # qualunque e il conto si gonfia di niente.
+                # ⚠️ the circle has to explain the run MUCH better than the
+                # line, otherwise a nearly-straight polyline fits any old
+                # circle and the count inflates for nothing.
                 if dev <= tol and rad < 0.5 * diag and dev < 0.2 * dev_retta:
                     V = P - cen
                     ang = 0.0
@@ -155,21 +154,21 @@ def main(path, tol, ang_vivo=20.0):
                         continue
                     restanti.discard(id(run))
                     archi.append((len(run), rad, ang, dev))
-    print(f"    corse di >=3 segmenti consecutivi: {corse}")
-    print(f"    ARCHI mancati : {len(archi)}  ({sum(a[0] for a in archi)} spigoli che "
-          f"sarebbero {len(archi)} cerchi)")
+    print(f"    runs of >=3 consecutive segments: {corse}")
+    print(f"    MISSED ARCS : {len(archi)}  ({sum(a[0] for a in archi)} edges that "
+          f"would be {len(archi)} circles)")
     if archi:
         r = np.array([a[1] for a in archi]); g = np.array([a[2] for a in archi])
         nn = np.array([a[0] for a in archi])
-        print(f"       raggio  min {r.min():.3f}  mediana {np.median(r):.3f}  max {r.max():.3f}")
-        print(f"       apertura mediana {np.median(g):.1f} gradi   segmenti per arco "
-              f"mediana {int(np.median(nn))}  max {nn.max()}")
+        print(f"       radius  min {r.min():.3f}  median {np.median(r):.3f}  max {r.max():.3f}")
+        print(f"       median span {np.median(g):.1f} degrees   segments per arc "
+              f"median {int(np.median(nn))}  max {nn.max()}")
         for k, v in sorted(Counter(np.round(r, 3)).most_common(12)):
             pass
-        print("       raggi piu' frequenti:",
+        print("       most frequent radii:",
               dict(Counter(np.round(r, 2)).most_common(8)))
-    print(f"    RETTE mancate : {len(rette)}  ({sum(a[0] for a in rette)} spigoli che "
-          f"sarebbero {len(rette)} segmenti)")
+    print(f"    MISSED LINES : {len(rette)}  ({sum(a[0] for a in rette)} edges that "
+          f"would be {len(rette)} segments)")
 
 
 if __name__ == "__main__":

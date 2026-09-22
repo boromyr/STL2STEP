@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Rende un B-Rep come lo vede un CAD: facce ombreggiate + spigoli neri."""
+"""Renders a B-Rep the way a CAD viewer would: shaded faces + black edges."""
 import sys, numpy as np
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
 import matplotlib; matplotlib.use("Agg")
@@ -80,7 +80,7 @@ def main(path, out, eye_dir, target=None, zoom=None):
     X = T[:, :, 0]; Y = T[:, :, 1]
     x0, x1 = (zoom[0], zoom[1]) if zoom else (X.min(), X.max())
     y0, y1 = (zoom[2], zoom[3]) if zoom else (Y.min(), Y.max())
-    # --- z-buffer per togliere gli spigoli nascosti ---------------------------
+    # --- z-buffer to remove hidden edges ---------------------------------------
     W = 1400; H = max(8, int(W * (y1 - y0) / max(x1 - x0, 1e-9)))
     zb = np.full((H, W), -1e30)
     sx = (W - 1) / (x1 - x0); sy = (H - 1) / (y1 - y0)
@@ -125,7 +125,7 @@ def main(path, out, eye_dir, target=None, zoom=None):
     ax.set_aspect("equal"); ax.axis("off")
     ax.set_facecolor("#202020"); fig.patch.set_facecolor("#202020")
     plt.tight_layout(); plt.savefig(out, dpi=100)
-    print("salvato", out, len(tris), "triangoli", len(segs), "spigoli")
+    print("saved", out, len(tris), "triangles", len(segs), "edges")
 
 if __name__ == "__main__":
     tgt = None; zm = None

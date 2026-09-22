@@ -3,354 +3,369 @@
 """
 refit.py
 =============================================================================
-Riconversione "morbida" di mesh (STL, o STEP nato da mesh) in B-Rep analitica.
+"Soft" reconversion of a mesh (STL, or STEP born from a mesh) into an analytic B-Rep.
 
-Il principio e' uno solo: OGNI modifica alla geometria e' locale, viene
-verificata subito (solido ancora chiuso, facce valide, orientamento coerente,
-area e volume coerenti con la mesh) e se non passa il controllo viene
-SCARTATA. Quello che non si riesce a convertire resta tassellato com'era: il
-file di uscita e' sempre coerente con quello di ingresso, al massimo e' meno
-"pulito". Non si cuce (Sewing) e non si ricostruisce niente globalmente.
+The principle is a single one: EVERY change to the geometry is local, is
+verified immediately (solid still closed, faces valid, consistent
+orientation, area and volume consistent with the mesh) and if it fails the
+check it is DISCARDED. Whatever can't be converted stays tessellated as it
+was: the output file is always consistent with the input one, at worst it's
+just less "clean". Nothing is sewn (Sewing) and nothing is rebuilt globally.
 
-FASE A (-a) : unione delle facce complanari e degli spigoli collineari.
-              Due facce si fondono solo se TUTTI i vertici del gruppo unito
-              stanno entro la tolleranza lineare dal piano comune.
-FASE B (-b) : FORI CIRCOLARI. Pareti cilindriche chiuse a 360 gradi, concave,
-              che sboccano su due facce piane ortogonali all'asse, con i due
-              bordi che sono cerchi esatti -> un cilindro analitico con due
-              cerchi. Niente altro: e' la fase prudente.
-FASE C (-c) : raccordi, smussi, svasature, lamature, sfere d'angolo, bossi:
-              ogni regione di faccette che sta su un cilindro / cono / sfera /
-              toro viene sostituita dalla superficie analitica, una regione
-              alla volta, con lo stesso controllo e lo stesso scarto. Quello
-              che la Fase B rifiuta (fori lamati, fori che sboccano su una
-              faccia curva) qui passa, con i bordi lasciati poligonali dove
-              non c'e' una curva esatta.
-              Dove NESSUNA quadrica descrive la superficie - lo smusso che
-              corre lungo uno spigolo curvo, il raccordo a tre vie in un
-              angolo - la regione viene ricostruita con una B-spline (vedi
-              "SMUSSI CURVI" piu' sotto). Si disattiva con --no-free.
+PHASE A (-a) : merging of coplanar faces and collinear edges.
+               Two faces merge only if ALL the vertices of the combined
+               group lie within the linear tolerance of the common plane.
+PHASE B (-b) : CIRCULAR HOLES. Cylindrical walls closed 360 degrees, concave,
+               opening onto two planar faces orthogonal to the axis, with
+               both boundaries being exact circles -> an analytic cylinder
+               with two circles. Nothing else: it's the cautious phase.
+PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
+               bosses: every region of facets lying on a cylinder / cone /
+               sphere / torus is replaced by the analytic surface, one
+               region at a time, with the same check and the same tolerance.
+               What Phase B rejects (counterbored holes, holes opening onto
+               a curved face) passes here, with the boundaries left
+               polygonal where no exact curve describes them.
+               Where NO quadric describes the surface - a chamfer running
+               along a curved edge, a three-way fillet at a corner - the
+               region is rebuilt with a B-spline (see "CURVED FILLETS"
+               below). Disabled with --no-free.
 
-LE FASI SI ESEGUONO NELL'ORDINE IN CUI SONO SCRITTE, e nessuna ne tira
-dentro un'altra. Senza flag la sequenza e' A B C A (l'ultima riunisce le
-facce piane spezzate dalle sostituzioni). Si puo' scrivere quello che serve:
-  refit.py x.stl -c                 solo la Fase C, sulla mesh cruda
-  refit.py x.stl -a -b -c           senza riunione finale
-  refit.py x.stl -a -b -c -a 0.005  riunione finale larga (la piu' pulita)
-Serve anche per capire dove nasce un difetto: se '-c' da solo lo mostra, non
-e' colpa della Fase A.
-⚠️ La riunione finale a 0.005 mm non sposta niente: misurato su tutti i test,
-la distanza massima dal pezzo di partenza e' la stessa del default, mentre le
-facce crollano (test4 333 -> 54, test5 217 -> 116).
+THE PHASES RUN IN THE ORDER THEY'RE WRITTEN, and none pulls another one in.
+Without flags the sequence is A B C A (the last one re-merges the planar
+faces split up by the replacements). You can write whatever you need:
+  refit.py x.stl -c                 only Phase C, on the raw mesh
+  refit.py x.stl -a -b -c           without the final re-merge
+  refit.py x.stl -a -b -c -a 0.005  wide final re-merge (the cleanest)
+It's also useful for finding where a defect comes from: if '-c' alone shows
+it, it's not Phase A's fault.
+⚠️ The final 0.005 mm re-merge doesn't move anything: measured on all the
+test files, the maximum distance from the starting part is the same as the
+default, while the face count collapses (test4 333 -> 54, test5 217 -> 116).
 
-COME LEGGERE IL REPORT (--report)
----------------------------------
-Una riga per regione, col tipo di primitiva, la copertura angolare, il numero
-di faccette, lo scarto vertici-superficie (rms e max) e l'esito:
+HOW TO READ THE REPORT (--report)
+----------------------------------
+One line per region, with the primitive type, the angular coverage, the
+facet count, the vertex-to-surface deviation (rms and max) and the outcome:
 
-  [N spigoli analitici . N riusati . N poligonali]
-      analitici = bordi rifatti con la curva esatta (cerchio, ellisse,
-                  intersezione delle due superfici);
-      riusati   = bordi gia' buoni, presi dalla mesh senza toccarli;
-      poligonali= bordi lasciati come spezzata della mesh perche' nessuna
-                  curva esatta li descrive entro tolleranza.
-  "bordi coi piani lasciati poligonali"  = secondo tentativo: la faccia e'
-      analitica ma i bordi coi piani vicini restano quelli della mesh.
-  "contorno lasciato poligonale"         = terzo tentativo: nessuno spigolo
-      nuovo, il contorno resta identico alla mesh (serve quando il vicino e'
-      una faccia analitica gia' chiusa, col suo seam, che non va toccata).
-  "scartata: ..." spiega il motivo: la regione resta tassellata. In
-      particolare "regione piccola e isolata in mezzo a faccette tassellate"
-      vuol dire che era una primitiva fittata sul rumore (raggi a caso in
-      zona di raccordo): la si lascia alla mesh, si rifinisce a mano.
+  [N analytic edges . N reused . N polygonal]
+      analytic = boundaries rebuilt with the exact curve (circle, ellipse,
+                 intersection of the two surfaces);
+      reused   = boundaries already good, taken from the mesh untouched;
+      polygonal= boundaries left as the mesh's polyline because no exact
+                 curve describes them within tolerance.
+  "boundaries with the neighboring planes left polygonal" = second attempt:
+      the face is analytic but the boundaries with the neighboring planes
+      stay the mesh's.
+  "contour left polygonal"               = third attempt: no new edge at
+      all, the contour stays identical to the mesh (needed when the
+      neighbor is an already-closed analytic face, with its own seam, that
+      must not be touched).
+  "rejected: ..." explains why: the region stays tessellated. In
+      particular "small region isolated among tessellated facets" means it
+      was a primitive fitted on noise (random radii in a fillet zone): it's
+      left to the mesh, to be cleaned up by hand.
 
-GLI SPIGOLI DEL CAD SONO GIA' NELLA MESH
+THE CAD's EDGES ARE ALREADY IN THE MESH
 
-Un tassellatore lavora una faccia CAD alla volta: dentro una faccia la trama
-e' uniforme, attraverso uno spigolo del CAD cambia di colpo, perche' i due
-lati sono stati tassellati da due passaggi indipendenti e con due curvature
-diverse (il piano a triangoloni, il raccordo a striscioline). Si vede a
-occhio guardando la mesh, e si misura: su test4 il salto di dimensione fra
-faccette vale 0.00 (mediana, in log2) dentro una faccia piana e 1.48 (p90)
-fra facce diverse.
-Quegli spigoli vengono riconosciuti e usati due volte.
-1. PROTETTI: la Fase A non fonde mai attraverso uno di essi. La regola e'
-   "salto di trama > 1.5 (cioe' quasi tre volte) E angolo > 0.2 gradi": la
-   seconda condizione e' quella che la rende sicura, perche' dentro una
-   faccia piana vera le faccette sono complanari a 0.04 gradi (p99 misurato)
-   e un salto di trama da solo, li', e' solo triangolazione di Delaunay. Su
-   test4: zero tagli falsi, 573 spigoli del CAD protetti.
-2. COME CONFINI DI LAVORO: tagliando la mesh dove c'e' uno spigolo vivo
-   (diedro > 30 gradi) oppure un salto di trama si ottengono le SEZIONI, che
-   sono le facce del CAD di partenza. Verificato contro il file STEP
-   originale di test4: le sezioni ritagliano esattamente il cono della
-   svasatura (26.99 mm2), i cilindri (105.52 e 60.31) e le superfici a forma
-   libera (5.21 e 5.21) che il fit a quadriche copriva con cinque sfere e un
-   toro. E' su quelle sezioni che si prova la superficie a forma libera.
-   QUANTO VALE, in numeri, sempre su test4 contro il CAD vero: degli 8.523
-   spigoli della mesh, 1.323 sono spigoli del CAD; la regola ne trova 1.285
-   (97,1%) con 18 falsi su 7.200 interni (0,25%). Provati e SCARTATI: il
-   salto di allungamento dei triangoli (41% di presi ma 2,8% di falsi) e il
-   coseno fra le direzioni dominanti, che sembrava fortissimo (dentro una
-   faccia vale 1,000 fino al p99) ma porta il 4% di falsi, e il filtro a
-   catene non li toglie perche' anche i falsi stanno in catena.
-3. E I PONTI. I 38 spigoli del CAD che sfuggono hanno TUTTI un solo spigolo
-   di mesh: sono contatti d'angolo, dove due facce si toccano quasi in un
-   punto (diedro 1-3 gradi, stessa trama: geometricamente invisibili). Ma
-   topologicamente sono evidenti - sono PONTI del grafo delle faccette - e si
-   trovano con Tarjan. Senza tagliarli, venti facce del CAD finivano in una
-   sezione sola. Si taglia solo il ponte che separa due parti di almeno
-   quattro faccette: una scheggia attaccata per un lato solo non e' una
-   faccia, e staccarla lascerebbe della mesh in giro.
-   ⚠️ La "dimensione" di una faccia va misurata come distanza mediana fra
-   TUTTI i suoi vertici, non come lunghezza dei lati: una faccia piana grande
-   col contorno finemente segmentato (il bordo sagomato di una piastra) ha
-   lati corti come una faccetta e sembrerebbe fine quanto lei.
-Serve soprattutto per gli spigoli TANGENTI (piano-raccordo), dove il diedro
-e' quasi nullo e nessun criterio angolare li vede: sono proprio quelli che
-una Fase A a tolleranza larga cancellava, appiattendo il raccordo dentro il
-piano e togliendo alla Fase C la superficie da riconoscere. Misura del
-danno, su test4 con la Fase A da sola a -a 0.005 e poi -b -c: 171 facce
-senza barriera, 138 con. Si disattiva con --no-cad-edges.
-Limite noto: il segnale e' la DENSITA' della trama, quindi non vede lo
-spigolo tangente fra due facce curve tassellate con lo stesso passo (per
-quelle serve la geometria, cioe' il segmentatore).
+A tessellator works one CAD face at a time: inside a face the texture is
+uniform, across a CAD edge it changes abruptly, because the two sides were
+tessellated by two independent passes with two different curvatures (the
+plane in big triangles, the fillet in thin strips). It's visible to the eye
+looking at the mesh, and it's measurable: on test4 the facet-size jump is
+0.00 (median, in log2) inside a planar face and 1.48 (p90) across different
+faces.
+Those edges are recognized and used twice.
+1. PROTECTED: Phase A never merges across one of them. The rule is
+   "texture jump > 1.5 (i.e. almost threefold) AND angle > 0.2 degrees":
+   the second condition is what makes it safe, because inside a real
+   planar face the facets are coplanar to within 0.04 degrees (p99
+   measured) and a texture jump alone, there, is just Delaunay
+   triangulation. On test4: zero false cuts, 573 CAD edges protected.
+2. AS WORKING BOUNDARIES: cutting the mesh where there's a sharp edge
+   (dihedral > 30 degrees) or a texture jump yields the SECTIONS, which
+   are the original CAD's faces. Checked against test4's original STEP
+   file: the sections cut out exactly the countersink's cone (26.99 mm2),
+   the cylinders (105.52 and 60.31) and the free-form surfaces (5.21 and
+   5.21) that the quadric fit was covering with five spheres and a torus.
+   It's on those sections that the free-form surface is attempted.
+   WHAT IT'S WORTH, in numbers, still on test4 against the real CAD: of
+   8,523 mesh edges, 1,323 are CAD edges; the rule finds 1,285 of them
+   (97.1%) with 18 false positives out of 7,200 internal ones (0.25%).
+   Tried and DISCARDED: the triangle-elongation jump (41% caught but 2.8%
+   false) and the cosine between dominant directions, which looked very
+   strong (inside a face it's 1.000 up to the p99) but brings 4% false
+   positives, and the chain filter doesn't remove them because the false
+   ones sit in chains too.
+3. AND THE BRIDGES. The 38 CAD edges that escape ALL have a single mesh
+   edge: they're corner contacts, where two faces touch almost at a point
+   (dihedral 1-3 degrees, same texture: geometrically invisible). But
+   topologically they're obvious - they're BRIDGES of the facet graph - and
+   are found with Tarjan. Without cutting them, twenty CAD faces ended up
+   in a single section. Only a bridge separating two parts of at least four
+   facets is cut: a sliver attached on one side only isn't a face, and
+   detaching it would leave loose mesh around.
+   ⚠️ A face's "size" must be measured as the median distance between ALL
+   its vertices, not as the length of its sides: a large planar face with a
+   finely segmented outline (a plate's shaped edge) has sides as short as a
+   facet's and would look as fine as one.
+This mostly matters for TANGENT edges (plane-fillet), where the dihedral is
+nearly zero and no angular criterion sees them: those are exactly the ones
+a loose-tolerance Phase A used to erase, flattening the fillet into the
+plane and taking away from Phase C the surface to recognize. Measured
+damage, on test4 with Phase A alone at -a 0.005 and then -b -c: 171 faces
+without the barrier, 138 with it. Disabled with --no-cad-edges.
+Known limit: the signal is texture DENSITY, so it doesn't see a tangent
+edge between two curved faces tessellated at the same rate (for those you
+need geometry, i.e. the segmenter).
 
-SMUSSI CURVI, SVASATURE E ALTRE GEOMETRIE CONICHE
+CURVED FILLETS, COUNTERSINKS AND OTHER CONICAL GEOMETRIES
 
-Lo smusso lungo uno spigolo DRITTO e' un piano, lungo un ARCO e' un cono:
-tutti e due si riconoscono. Ma lungo uno spigolo qualunque - il bordo
-sagomato di una piastra, il punto dove due raccordi si incontrano - non e'
-ne' l'uno ne' l'altro: e' una superficie di raccordo che il CAD scrive come
-B-spline, e si riconosce anche dalla tassellatura, che li' e' dieci volte
-piu' fitta. Un fit a quadriche non puo' che spezzarla in decine di
-cilindretti osculatori da dieci gradi, ognuno col raggio diverso e il
-contorno frastagliato: sono le "facce con troppi lati" che si vedono nel
-pezzo finito. Quei frammenti vengono riconosciuti, raggruppati per contatto
-e sostituiti da UNA superficie a forma libera.
-Il fit non abbassa la precisione, la alza: una B-spline ha tanti gradi di
-liberta' quanti ne servono, e su queste macchie arriva a un decimo della
-tolleranza con cui i cilindretti passavano a fatica. Il controllo e' doppio:
-scarto sui VERTICI della mesh, e scarto sui punti-sonda, cioe' i baricentri
-delle faccette proiettati sulle primitive dei frammenti che si sostituiscono
-(sono punti che stanno sulla superficie vera, e sono l'unico modo di
-guardare negli spazi FRA i vertici, dove una spline con troppi poli
-ondeggia). Passa la rete di poli piu' rada che supera entrambi gli esami; se
-non ne passa nessuna, la macchia resta tassellata.
+A chamfer along a STRAIGHT edge is a plane, along an ARC it's a cone: both
+are recognized. But along an arbitrary edge - a plate's shaped border, the
+point where two fillets meet - it's neither one nor the other: it's a
+blending surface that the CAD writes as a B-spline, and it's also
+recognizable from the tessellation, which there is ten times denser. A
+quadric fit can't help but split it into dozens of ten-degree osculating
+little cylinders, each with a different radius and a jagged outline: those
+are the "faces with too many sides" you see in the finished part. Those
+fragments are recognized, grouped by contact and replaced by ONE free-form
+surface.
+The fit doesn't lower precision, it raises it: a B-spline has as many
+degrees of freedom as it needs, and on these patches it reaches a tenth of
+the tolerance the little cylinders were barely passing with. The check is
+twofold: deviation on the mesh's VERTICES, and deviation on probe points,
+i.e. the facet centroids projected onto the primitives of the fragments
+being replaced (these are points that lie on the real surface, and are the
+only way to look into the gaps BETWEEN vertices, where a spline with too
+many poles wobbles). The sparsest pole grid that passes both tests wins; if
+none passes, the patch stays tessellated.
 
-QUANTO CI SI AVVICINA AL CAD DI PARTENZA (test4, misurato)
-Il pezzo originale ha 51 facce: 25 piani, 17 cilindri, 6 B-spline, 3 coni.
-Con 'refit.py test4.stl -a -b -c -a 0.005' escono 54 facce: 28 piani, 18
-cilindri, 4 B-spline, 4 coni, e la corrispondenza e' quasi sempre una a una.
-Quello che ancora NON torna sono gli SPIGOLI: 1.028 contro 129, perche' i
-bordi che non nascono da un'intersezione esatta restano la spezzata della
-mesh (nel CAD sono 79 rette, 34 cerchi, 11 B-spline e 5 ellissi). Riconoscere
-che una catena di segmenti e' UNA curva del CAD e' il passo successivo.
+HOW CLOSE IT GETS TO THE STARTING CAD (test4, measured)
+The original part has 51 faces: 25 planes, 17 cylinders, 6 B-splines, 3
+cones. With 'refit.py test4.stl -a -b -c -a 0.005' you get 54 faces: 28
+planes, 18 cylinders, 4 B-splines, 4 cones, and the correspondence is
+almost always one to one. What still doesn't match are the EDGES: 1,028
+against 129, because boundaries that don't come from an exact intersection
+stay the mesh's polyline (in the CAD they are 79 lines, 34 circles, 11
+B-splines and 5 ellipses). Recognizing that a chain of segments is ONE CAD
+curve is the next step.
 
-Il cono, poi, non e' piu' una superficie di serie B. Le sue intersezioni
-esatte con quello che gli sta intorno - il foro che svasa (cilindro
-coassiale), il raccordo che lo chiude (toro coassiale), la parete che lo
-taglia (piano: cerchio, ellisse o iperbole a seconda dell'inclinazione) -
-adesso ci sono tutte. Senza, il bordo di una svasatura restava la spezzata
-della mesh e, peggio, il ripiego "cerchio per i vertici" ne inventava uno
-che sulla superficie non ci sta: le pcurve si incrociavano, la faccia usciva
-SelfIntersectingWire e la svasatura tornava tassellata tutta intera.
+The cone, moreover, is no longer a second-class surface. Its exact
+intersections with what's around it - the counterbore that flares out
+(coaxial cylinder), the fillet that closes it off (coaxial torus), the wall
+that cuts it (plane: circle, ellipse or hyperbola depending on the tilt) -
+are all there now. Without them, a countersink's boundary stayed the mesh's
+polyline and, worse, the "circle through the vertices" fallback invented
+one that doesn't actually lie on the surface: the pcurves crossed, the face
+came out SelfIntersectingWire and the whole countersink went back to being
+fully tessellated.
 
-QUANTO E' GROSSOLANA LA MESH (e perche' conta)
-----------------------------------------------
-Le tolleranze non sono un numero assoluto: sono rapportate a quello che la
-mesh stessa sa dire.
-  - la soglia di ACCETTAZIONE di una faccetta (--tol) e' la piu' larga fra il
-    valore assoluto e META' della freccia della faccetta, cioe' di quanto la
-    sua corda si stacca dalla superficie trovata; non supera mai la
-    tolleranza di crescita. Una faccetta che taglia un raccordo R1.5 a passi
-    di 22 gradi sta gia' due centesimi sotto la superficie vera: pretendere
-    che i suoi vertici cadano entro un micron sarebbe chiedere alla mesh una
-    precisione che non ha, e il risultato sarebbe lasciare a strisce tutti i
-    raccordi tassellati grossolanamente. Sopra quel limite, invece, la
-    faccetta NON sta sulla superficie e la regione viene scartata: e' il
-    confine fra "ricostruire" e "deformare".
-  - l'intorno del seme attraversa gli spigoli quasi lisci (20 gradi). Se con
-    quella soglia non si trova nulla, o si trova una primitiva appoggiata a
-    meno di sei faccette, l'intorno si riapre fino a 32 gradi: fra due
-    faccette dello STESSO raccordo l'angolo e' il passo di tassellatura, e su
-    una mesh grossolana supera i 20 gradi. Il tetto resta sotto i 45 gradi
-    degli smussi, che e' il caso da cui la soglia stretta difende.
-  - in Fase A due strisce gemelle (i due triangoli di un quadrilatero
-    svirgolato, complanari entro un decimo di micron ma separati da qualche
-    millesimo di grado) vengono riunite: senza, ogni raccordo tassellato esce
-    col doppio delle facce.
-  - finita la ricerca, due passate di RECUPERO rimettono a posto quello che
-    l'ordine dei semi ha lasciato indietro: ogni regione riprova a crescere
-    sulle faccette ancora sciolte, e i gruppetti di faccette sciolte
-    completamente circondati da superfici gia' rifatte vengono dati alla
-    regione confinante che li spiega meglio. Sono le schegge che si vedevano
-    accanto a foro, smusso e raccordo.
+HOW COARSE THE MESH IS (and why it matters)
+---------------------------------------------
+Tolerances aren't an absolute number: they're scaled to what the mesh
+itself can actually tell you.
+  - the ACCEPTANCE threshold of a facet (--tol) is the wider of the
+    absolute value and HALF the facet's sag, i.e. how far its chord lifts
+    off the surface found; it never exceeds the growth tolerance. A facet
+    cutting an R1.5 fillet in 22-degree steps is already two hundredths
+    below the real surface: demanding its vertices land within a micron
+    would be asking the mesh for a precision it doesn't have, and the
+    result would be leaving every coarsely-tessellated fillet in strips.
+    Above that limit, though, the facet does NOT lie on the surface and
+    the region is rejected: that's the boundary between "reconstructing"
+    and "deforming".
+  - the seed's neighborhood crosses nearly-smooth edges (20 degrees). If
+    nothing is found at that threshold, or a primitive is found resting on
+    fewer than six facets, the neighborhood reopens up to 32 degrees:
+    between two facets of the SAME fillet the angle is just the
+    tessellation step, and on a coarse mesh it exceeds 20 degrees. The
+    ceiling stays under the 45 degrees of chamfers, which is the case the
+    tight threshold guards against.
+  - in Phase A two twin strips (the two triangles of a warped
+    quadrilateral, coplanar to within a tenth of a micron but separated by
+    a few thousandths of a degree) get merged: without this, every
+    tessellated fillet comes out with double the faces.
+  - once the search is done, two RECOVERY passes put back what the seed
+    order left behind: every region tries again to grow onto the facets
+    still unclaimed, and clusters of loose facets fully surrounded by
+    already-rebuilt surfaces are handed to whichever neighboring region
+    explains them best. These are the slivers you used to see next to a
+    hole, chamfer or fillet.
 
-VELOCITA' (-j N)
-----------------
-La ricerca delle primitive dai semi, che e' la fetta piu' grossa delle Fasi B
-e C, gira su piu' PROCESSI: -j N ne usa fino a N (default: i core della
-macchina meno due, al massimo 22). Non thread, perche' sia OpenCascade sia il
-codice numpy tengono il GIL e sui thread non si guadagna niente. Il numero di
-processi viene poi proporzionato al lavoro da fare: su un pezzo piccolo
-accenderne venti costa piu' di quanto faccia risparmiare. Restano su un core
-solo la Fase A e le sostituzioni nel solido: lavorano su una struttura
-OpenCascade condivisa e vanno verificate una alla volta.
-Con piu' processi i semi vengono provati su una fotografia delle faccette gia'
-prese, quindi l'insieme delle regioni trovate puo' cambiare di poco rispetto a
--j 1; ogni regione resta comunque verificata e scartata con gli stessi
-criteri. Per un risultato riproducibile al 100% si usa -j 1.
+SPEED (-j N)
+------------
+The primitive search from the seeds, which is the biggest slice of Phases B
+and C, runs on multiple PROCESSES: -j N uses up to N of them (default: the
+machine's cores minus two, capped at 22). Not threads, because both
+OpenCascade and the numpy code hold the GIL and threads gain nothing. The
+number of processes is then scaled to the work at hand: on a small part,
+spinning up twenty costs more than it saves. Only Phase A and the
+in-solid replacements stay on a single core: they work on a shared
+OpenCascade structure and must be checked one at a time.
+With more processes the seeds are tried against a snapshot of the facets
+already claimed, so the set of regions found can differ slightly from
+-j 1; every region is still checked and rejected with the same criteria.
+For a 100% reproducible result, use -j 1.
 
-UNA FACCIA DEL CAD, UNA FACCIA NOSTRA
--------------------------------------
-La crescita parte da semi diversi, e una parete lunga finisce spesso in due o
-tre regioni con la stessa identica superficie: nel file diventano due o tre
-facce separate da spigoli che nel CAD non ci sono, e in mezzo restano le
-faccette che nessuna delle due ha preso - le "schegge". Per questo le regioni
-confinanti che giacciono sulla STESSA superficie vengono riunite e rifittate.
-⚠️ TRE COSE CHE SEMBRANO DETTAGLI E NON LO SONO.
- 1. Si rifonde DUE VOLTE: dopo i semi e di nuovo alla fine. Due pezzi separati
-    da qualche faccetta sciolta non si toccano nemmeno, e alla prima passata
-    passano indenni: diventano confinanti solo dopo il recupero delle sciolte.
- 2. Il confronto fra le due primitive e' un FILTRO, non la sentenza. Chiedere
-    assi entro 0,05 gradi non ha senso per due pezzi della stessa parete: un
-    cilindro fittato su dieci faccette che coprono venti gradi ha il fit mal
-    condizionato (raggio e centro si compensano) e l'asse incerto di qualche
-    decimo. Si allarga a un grado e al 2% del raggio, e decide il rifit
-    dell'unione col metro di tol_grow - che e' gia' la definizione di "vicino"
-    con cui le regioni sono cresciute. Un gradino vero fra due alesaggi (due
-    centesimi) lo sfonda di sei volte e resta due facce.
- 3. L'unione non deve STROZZARSI: se il bordo unito ha un anello interno che
-    tocca quello esterno in un vertice, BRepCheck in memoria la accetta ma
-    dopo la scrittura STEP la faccia diventa "IntersectingWires" e il pezzo
-    non e' piu' valido. Quelle si lasciano separate.
-Misurato su test4 contro il file CAD vero: il cilindro R=3 usciva spezzato in
-due facce da 10,5 e 2,4 mm2 con tre schegge piane in mezzo, dove il CAD ha UNA
-faccia da 13,697 mm2. Ora e' una faccia da 13,722 e le schegge non ci sono
-piu' (55 facce contro le 51 del CAD, erano 59).
+ONE CAD FACE, ONE FACE OF OURS
+-------------------------------
+Growth starts from different seeds, and a long wall often ends up as two or
+three regions with the exact same surface: in the file they become two or
+three faces separated by edges that don't exist in the CAD, with the
+facets neither one claimed left in between - the "slivers". That's why
+neighboring regions lying on the SAME surface are merged and refitted.
+⚠️ THREE THINGS THAT LOOK LIKE DETAILS AND AREN'T.
+ 1. The merge runs TWICE: after the seeds, and again at the end. Two pieces
+    separated by a few loose facets don't even touch, and pass the first
+    round unscathed: they only become neighbors after the loose facets are
+    recovered.
+ 2. Comparing the two primitives is a FILTER, not the verdict. Requiring
+    axes within 0.05 degrees makes no sense for two pieces of the same
+    wall: a cylinder fitted on ten facets spanning twenty degrees has a
+    poorly conditioned fit (radius and center trade off against each
+    other) and an axis uncertain by a few tenths of a degree. It's widened
+    to one degree and 2% of the radius, and the union's refit, measured
+    with the tol_grow yardstick - already the definition of "close" that
+    the regions grew by - has the final say. A real step between two bores
+    (two hundredths) blows through it sixfold and stays two faces.
+ 3. The union must not PINCH: if the merged boundary has an inner ring
+    touching the outer one at a vertex, BRepCheck accepts it in memory but
+    after the STEP write the face becomes "IntersectingWires" and the part
+    is no longer valid. Those are left separate.
+Measured on test4 against the real CAD file: the R=3 cylinder came out
+split into two faces of 10.5 and 2.4 mm2 with three planar slivers in
+between, where the CAD has ONE face of 13.697 mm2. Now it's one face of
+13.722 and the slivers are gone (55 faces against the CAD's 51, it used to
+be 59).
 
-IL TETTO SUL VOLUME CONTA ANCHE I VICINI
-----------------------------------------
-Ogni sostituzione passa da un controllo di volume. Il tetto era calcolato
-sulla sola area della regione, ma sostituire una regione non muove solo la sua
-faccia: i bordi poligonali che la toccano diventano curve e le facce vicine si
-rifanno con quelle. Una calotta sferica R0,5 da mezzo mm2 incastrata fra tre
-facce da 1, 5 e 12 mm2 sforava di un soffio (+0,0555 contro 0,0513) e restava
-tassellata - mentre due calotte IDENTICHE, altrove, passavano. E' esattamente
-il "geometrie identiche, risultati diversi" che si vede aprendo il file.
-⚠️ Su test8 il controllo bocciava 66 conversioni e NESSUNA oltre quattro volte
-il tetto: non stava piu' prendendo errori veri, solo conversioni buone. Il
-tetto nuovo e' un limite VERO e non una stima - se nessuna faccia si sposta di
-piu' di dev, il volume racchiuso non puo' cambiare di piu' dell'area toccata
-per dev - e non stringe mai quello di prima.
+THE VOLUME CEILING ALSO COUNTS THE NEIGHBORS
+-----------------------------------------------
+Every replacement goes through a volume check. The ceiling used to be
+computed on the region's area alone, but replacing a region doesn't just
+move its own face: the polygonal boundaries touching it become curves and
+the neighboring faces get rebuilt along with them. A spherical cap R0.5 of
+half a mm2 wedged between three faces of 1, 5 and 12 mm2 overshot by a
+hair (+0.0555 against 0.0513) and stayed tessellated - while two IDENTICAL
+caps, elsewhere, passed. That's exactly the "identical geometry, different
+results" you see when you open the file.
+⚠️ On test8 the check was rejecting 66 conversions and NONE of them by more
+than four times the ceiling: it wasn't catching real errors anymore, only
+good conversions. The new ceiling is a TRUE bound, not an estimate - if no
+face moves more than dev, the enclosed volume can't change by more than
+the touched area times dev - and it never tightens the previous one.
 
-E POI GLI ARCHI (ultimo passo, --no-arcs per spegnerlo)
--------------------------------------------------------
-Finite le fasi, si guarda il B-Rep FINITO e si chiede a ogni catena di segmenti
-rettilinei: stai su un cerchio? Serve perche' il motore rifa' con la curva
-esatta solo i bordi di cui sa calcolare l'intersezione, e lascia tutto il resto
-com'era - su test8, 4.862 bordi riusati contro 328 rifatti. Cosi' un cilindro e
-il piano su cui sbuca si toccavano ancora lungo una spezzata di sei segmenti.
-Misurato su test8: delle 249 catene sostituibili (vertici interni di grado 2 e
-sempre le stesse due facce ai lati) 110 stanno su un cerchio a meno di un
-MICRON, e i raggi sono quelli del disegno - R0.5 cinquantatre volte, R0.3
-diciotto, R0.8 otto. Non e' un'approssimazione: e' lo spigolo vero del CAD che
-la tassellatura aveva spezzato, e rimetterlo avvicina il pezzo all'originale.
-Ogni arco viene verificato SULLE DUE FACCE che lo toccano prima di essere
-accettato, e alla fine si ricontrolla il pezzo intero: se non regge si rinuncia
-a tutti insieme.
-  pezzo    spigoli           archi   volume
-  test8    5.962 -> 5.687     51     +0,0003%   (cerchi da 277 a 328)
-  test4   1.039 ->   819     16     +0,0033%
-  test1      666 ->   548     19     +0,0038%
-  test5    1.106 ->   927     10     -0,0015%
-  test2    1.203 -> 1.106      6     -0,0074%
-Nessuna faccia si muove, la fedelta' non cambia (test8: scarto medio dalla mesh
-0,00082 mm prima e dopo, massimo 0,044).
-⚠️ DUE TRAPPOLE, tutte e due costate ore. (1) La terna della SVD non e' detta
-destrorsa: gp_Ax2(P, N, X) misura l'angolo da X verso N x X, quindi usando
-vt[1] come asse Y meta' degli archi esce specchiata. (2) MakeEdge(cerchio,
-V1, V2) prende l'arco che va da V1 a V2 a parametro CRESCENTE: scambiando i
-due vertici senza girare anche il cerchio si prende l'arco COMPLEMENTARE -
-300 gradi al posto di 60 - che in (u,v) sbuca dall'altra parte della
-superficie e fa "UnorientableShape".
+AND THEN THE ARCS (last step, --no-arcs to turn it off)
+----------------------------------------------------------
+Once the phases are done, the FINISHED B-Rep is examined and every chain
+of straight segments is asked: are you sitting on a circle? This is needed
+because the engine only rebuilds with the exact curve the boundaries whose
+intersection it can compute, and leaves everything else as it was - on
+test8, 4,862 boundaries reused against 328 rebuilt. So a cylinder and the
+plane it emerges from were still touching along a six-segment polyline.
+Measured on test8: of the 249 replaceable chains (interior vertices of
+degree 2, always the same two faces on either side) 110 sit on a circle to
+within a MICRON, and the radii are the ones from the drawing - R0.5 fifty-
+three times, R0.3 eighteen, R0.8 eight. It's not an approximation: it's the
+CAD's real edge that the tessellation had split up, and putting it back
+brings the part closer to the original.
+Every arc is checked on BOTH faces touching it before being accepted, and
+at the end the whole part is rechecked: if it doesn't hold up, all of them
+are given up at once.
+  part     edges             arcs    volume
+  test8    5,962 -> 5,687     51     +0.0003%   (circles from 277 to 328)
+  test4   1,039 ->   819     16     +0.0033%
+  test1      666 ->   548     19     +0.0038%
+  test5    1,106 ->   927     10     -0.0015%
+  test2    1,203 -> 1,106      6     -0.0074%
+No face moves, fidelity doesn't change (test8: mean deviation from the mesh
+0.00082 mm before and after, maximum 0.044).
+⚠️ TWO TRAPS, both of which cost hours. (1) The SVD's frame isn't
+necessarily right-handed: gp_Ax2(P, N, X) measures the angle from X toward
+N x X, so using vt[1] as the Y axis, half the arcs come out mirrored. (2)
+MakeEdge(circle, V1, V2) takes the arc going from V1 to V2 at INCREASING
+parameter: swapping the two vertices without also flipping the circle
+takes the COMPLEMENTARY arc - 300 degrees instead of 60 - which in (u,v)
+exits on the other side of the surface and produces "UnorientableShape".
 
-LE DUE TOLLERANZE, CHE NON SI PARLANO
--------------------------------------
-Sono due, indipendenti, e regolano cose diverse. Confonderle e' il modo piu'
-facile di ottenere un risultato peggiore credendo di averlo migliorato.
+THE TWO TOLERANCES, WHICH DON'T TALK TO EACH OTHER
+------------------------------------------------------
+There are two, independent, and they govern different things. Confusing
+them is the easiest way to get a worse result while believing you've
+improved it.
 
-1. LA TOLLERANZA DELLA FASE A - il numero dopo -a, oppure --lin-tol.
-   Quanto possono distare dal piano comune i vertici di due facce perche'
-   vengano FUSE IN UNA. Riguarda solo la geometria gia' piana: non cambia
-   nessun fit. Default della passata iniziale: 2e-6 x diagonale.
+1. PHASE A'S TOLERANCE - the number after -a, or --lin-tol.
+   How far the vertices of two faces can be from the common plane for them
+   to be MERGED INTO ONE. It only concerns geometry that's already planar:
+   it changes no fit. Default of the initial pass: 2e-6 x diagonal.
 
-2. LA TOLLERANZA DELLE FASI B e C - --tol.
-   Quanto puo' distare dalla superficie un vertice della mesh perche' la
-   primitiva sia ACCETTATA. E' l'unica tolleranza delle due fasi curve: le
-   altre ne discendono tutte.
-       crescita della regione        10 x tol   (mai oltre 1e-3 x diagonale)
-       curve d'intersezione           4 x tol
-       "stessa superficie del vicino" 50 x tol
-       tetto tolleranze degli spigoli 20 x tol  (--max-edge-tol)
-   Default: 1e-5 x diagonale, minimo 2e-4. Su un pezzo da 148 mm di
-   diagonale fa 1.5e-3.
-   ⚠️ ALLARGARLA NON FA RICONOSCERE DI PIU': FA RICONOSCERE DI MENO.
-   E' il contrario di quello che dice l'intuito, ed e' misurato. test9, mesh
-   grossolana (26.384 triangoli su 112 mm), sempre 'refit.py test9.stl -a -b
-   -c -a 0.05', cambiando solo --tol:
+2. PHASES B AND C's TOLERANCE - --tol.
+   How far a mesh vertex can be from the surface for the primitive to be
+   ACCEPTED. It's the only tolerance of the two curved phases: all the
+   others derive from it.
+       region growth                  10 x tol   (never beyond 1e-3 x diagonal)
+       intersection curves             4 x tol
+       "same surface as the neighbor" 50 x tol
+       edge-tolerance ceiling         20 x tol   (--max-edge-tol)
+   Default: 1e-5 x diagonal, minimum 2e-4. On a part with a 148 mm
+   diagonal that's 1.5e-3.
+   ⚠️ WIDENING IT DOESN'T RECOGNIZE MORE: IT RECOGNIZES LESS.
+   It's the opposite of what intuition says, and it's measured. test9, a
+   coarse mesh (26,384 triangles over 112 mm), always
+   'refit.py test9.stl -a -b -c -a 0.05', changing only --tol:
 
-     --tol     regioni C  cilindri  sfere  facce  >8 lati   scarto medio   max
-     0.02          97        41       15   2.444    112      0.00121 mm  0.496
-     0.0015 (def) 390       304       39   1.281    139      0.00131 mm  0.150
-     0.0005       413       346       20   1.594     95      0.00104 mm  0.150
-     0.0002       389       342        7   1.881     94      0.00084 mm  0.053
+     --tol     C regions  cylinders  spheres  faces  >8 sides  mean dev    max
+     0.02          97        41       15   2,444    112      0.00121 mm  0.496
+     0.0015 (def) 390       304       39   1,281    139      0.00131 mm  0.150
+     0.0005       413       346       20   1,594     95      0.00104 mm  0.150
+     0.0002       389       342        7   1,881     94      0.00084 mm  0.053
 
-   (scarto = distanza dei punti dell'uscita dalla mesh, su 20.000 campioni.)
-   A 0.02 i cilindri crollano da 304 a 41: con una soglia larga la banda
-   curva passa il test del PIANO, viene presa per piana e non diventa mai una
-   regione curva. E le poche che restano sconfinano oltre lo spigolo del CAD,
-   si portano dentro faccette che non gli appartengono e poi il fit non
-   chiude: la regione si perde tutta. Il massimo di riconoscimento sta
-   INTORNO A 5e-4, e sotto si perde solo quello che era fittato sul rumore
-   (le sfere da 39 a 7, e intanto lo scarto massimo scende da 15 a 5
-   centesimi di millimetro). Si allarga --tol solo per accettare una
-   deformazione voluta, mai per "prendere piu' roba".
+   (dev = distance of the output's points from the mesh, over 20,000 samples.)
+   At 0.02 the cylinders collapse from 304 to 41: with a wide threshold the
+   curved band passes the PLANE test, gets taken as flat and never becomes
+   a curved region. And the few that remain overrun past the CAD edge,
+   pull in facets that don't belong to them and then the fit doesn't
+   close: the whole region is lost. Peak recognition sits AROUND 5e-4, and
+   below that you only lose what was fitted on noise (spheres from 39 down
+   to 7, while the maximum deviation drops from 15 to 5 hundredths of a
+   millimeter). You widen --tol only to accept a deliberate deformation,
+   never to "catch more stuff".
 
-QUANDO UNA CURVA NON SI RICONOSCE, SPESSO E' LA MESH
-----------------------------------------------------
-Su test9 il 25% dell'area esce ancora tassellata. Guardando dove: 619 delle
-887 facce rimaste sono sotto il mezzo millimetro quadrato e valgono lo 0,6%
-dell'area (sono le scritte incise, e non c'e' niente da riconoscere). L'area
-vera sta in poche pareti grandi e pochissimo curve, e li' il problema e' il
-passo della mesh: una banda da 520 mm2 che copre 11 gradi di parete e' fatta
-di SEI corde e ha sette vertici distinti in sezione. Il miglior cilindro passa
-a 8.3e-02 mm dai vertici, il miglior cerchio in sezione (R 287) a 6.3e-02: la
-sezione non e' un arco, e con sette punti non si distingue da niente altro.
-Per prenderla bisognerebbe alzare --tol a 0.02-0.05, cioe' accettare di
-spostare la parete di cinque-otto centesimi. Non si fa di default: meglio una
-parete tassellata ma nel punto giusto che una parete liscia e spostata.
+WHEN A CURVE ISN'T RECOGNIZED, IT'S OFTEN THE MESH
+------------------------------------------------------
+On test9, 25% of the area still comes out tessellated. Looking at where:
+619 of the 887 remaining faces are under half a square millimeter and add
+up to 0.6% of the area (they're the engraved lettering, and there's
+nothing to recognize there). The real area sits in a few large walls with
+very little curvature, and there the problem is the mesh's step: a 520 mm2
+band covering 11 degrees of wall is made of SIX chords and has seven
+distinct vertices in cross-section. The best cylinder passes 8.3e-02 mm
+from the vertices, the best cross-section circle (R 287) at 6.3e-02: the
+cross-section isn't an arc, and with seven points it's indistinguishable
+from anything else. Catching it would require raising --tol to 0.02-0.05,
+i.e. accepting moving the wall by five to eight hundredths. This isn't
+done by default: a tessellated wall in the right spot beats a smooth wall
+that's been moved.
 
-USO
----
-    python refit.py pezzo.stl                 # A + B + C + riunione finale A
-    python refit.py pezzo.stl -a              # solo Fase A
-    python refit.py pezzo.stl -a 0.01         # solo Fase A, unione a 10 micron
-    python refit.py pezzo.stl -b              # A + fori
-    python refit.py pezzo.stl -c              # A + raccordi/lavorazioni
-    python refit.py pezzo.stl -b -c --report  # tutto, con report .txt
-    python refit.py pezzo.stl -b -c -a 0.01   # tutto, riunione finale a 10 um
-    python refit.py pezzo.stl -b -c -i 2      # due cicli B/C prima di salvare
-    python refit.py pezzo.stl -j 22           # fino a 22 processi di lavoro
-    python refit.py pezzo.stl -j 1            # tutto in sequenza, riproducibile
-    python refit.py pezzo.step -o out.step    # ingresso STEP
-    python refit.py --check                   # verifica l'ambiente
+USAGE
+-----
+    python refit.py part.stl                  # A + B + C + final A re-merge
+    python refit.py part.stl -a               # Phase A only
+    python refit.py part.stl -a 0.01          # Phase A only, 10-micron merge
+    python refit.py part.stl -b               # A + holes
+    python refit.py part.stl -c               # A + fillets/machining
+    python refit.py part.stl -b -c --report   # everything, with a .txt report
+    python refit.py part.stl -b -c -a 0.01    # everything, final merge at 10 um
+    python refit.py part.stl -b -c -i 2       # two B/C cycles before saving
+    python refit.py part.stl -j 22            # up to 22 worker processes
+    python refit.py part.stl -j 1             # everything sequential, reproducible
+    python refit.py part.step -o out.step     # STEP input
+    python refit.py --check                   # check the environment
 
-DIPENDENZE
-----------
-    pip install cadquery-ocp numpy       (OCP, consigliato su Windows)
-    oppure conda install -c conda-forge pythonocc-core numpy
+DEPENDENCIES
+------------
+    pip install cadquery-ocp numpy       (OCP, recommended on Windows)
+    or conda install -c conda-forge pythonocc-core numpy
 """
 
 from __future__ import annotations
@@ -412,7 +427,7 @@ _STYLE = {
 
 
 def _out(text: str) -> None:
-    """print() che non muore sulle console senza UTF-8 (cp1252, pipe)."""
+    """print() that doesn't die on consoles without UTF-8 (cp1252, pipes)."""
     try:
         print(text, flush=True)
     except UnicodeEncodeError:
@@ -472,7 +487,7 @@ class Log:
 
 
 # =============================================================================
-# 1. IMPORT OpenCascade (OCP di cadquery oppure OCC.Core di pythonocc)
+# 1. IMPORT OpenCascade (cadquery's OCP or pythonocc's OCC.Core)
 # =============================================================================
 
 
@@ -488,7 +503,7 @@ def _load_occ():
 
 _NS = _load_occ()
 if _NS is None:
-    print("\n[X] OpenCascade non trovato.\n    pip install cadquery-ocp   (oppure conda install -c conda-forge pythonocc-core)\n", file=sys.stderr)
+    print("\n[X] OpenCascade not found.\n    pip install cadquery-ocp   (or conda install -c conda-forge pythonocc-core)\n", file=sys.stderr)
     sys.exit(2)
 
 
@@ -498,9 +513,9 @@ def _m(name: str):
 
 def _st(cls, name: str):
     """
-    Metodo STATICO di una classe OCC, qualunque sia il binding:
+    STATIC method of an OCC class, whatever the binding:
       OCP        : BRep_Tool.Pnt_s
-      pythonocc  : BRep_Tool.Pnt   (oppure brep_tool.Pnt / BRep_Tool_Pnt)
+      pythonocc  : BRep_Tool.Pnt   (or brep_tool.Pnt / BRep_Tool_Pnt)
     """
     for nm in (name + "_s", name):
         f = getattr(cls, nm, None)
@@ -515,7 +530,7 @@ def _st(cls, name: str):
     f = getattr(low, name, None) if low is not None else None
     if callable(f):
         return f
-    raise AttributeError(f"{cls.__name__}.{name} non disponibile in {_NS}")
+    raise AttributeError(f"{cls.__name__}.{name} not available in {_NS}")
 
 
 _gp = _m("gp")
@@ -607,7 +622,7 @@ Geom_BSplineSurface = _Geom.Geom_BSplineSurface
 TopLoc_Location = _TopLoc.TopLoc_Location
 
 
-# --- cast TopoDS_Shape -> sotto-tipo ---------------------------------------
+# --- cast TopoDS_Shape -> subtype -------------------------------------------
 def _cast(kind: str):
     holder = getattr(_TopoDS, "topods", None)
     if holder is not None and hasattr(holder, kind):
@@ -621,13 +636,13 @@ def _cast(kind: str):
             f = getattr(cls, nm, None)
             if callable(f):
                 return f
-    raise AttributeError(f"cast TopoDS -> {kind} non disponibile in {_NS}")
+    raise AttributeError(f"cast TopoDS -> {kind} not available in {_NS}")
 
 
 td_Face, td_Edge, td_Vertex = _cast("Face"), _cast("Edge"), _cast("Vertex")
 td_Shell, td_Wire, td_Solid = _cast("Shell"), _cast("Wire"), _cast("Solid")
 
-# --- metodi statici usati ovunque -------------------------------------------
+# --- static methods used everywhere -----------------------------------------
 bt_Pnt = _st(BRep_Tool, "Pnt")
 bt_Tolerance = _st(BRep_Tool, "Tolerance")
 bt_Range = _st(BRep_Tool, "Range")
@@ -656,7 +671,7 @@ def _iface_set(key: str, val: str) -> None:
 
 
 # =============================================================================
-# 2. UTILITY TOPOLOGICHE
+# 2. TOPOLOGY UTILITIES
 # =============================================================================
 
 
@@ -670,9 +685,10 @@ def _size(m) -> int:
 
 def _iter_list(lst):
     """
-    Itera una TopTools_ListOfShape. ⚠️ Con OCP l'iterazione nativa (for s in
-    lst) e' 50 volte piu' veloce del ListIterator chiamato da Python: su un
-    pezzo da 10.000 spigoli fa la differenza fra 3 s e 0.1 s per indice.
+    Iterates a TopTools_ListOfShape. ⚠️ With OCP, native iteration (for s in
+    lst) is 50 times faster than the ListIterator called from Python: on a
+    part with 10,000 edges that's the difference between 3 s and 0.1 s per
+    index.
     """
     try:
         return list(lst)
@@ -689,7 +705,7 @@ def _iter_list(lst):
 
 
 def explore(shape, kind) -> List:
-    """Sotto-shape unici (senza duplicati, orientazione ignorata)."""
+    """Unique sub-shapes (no duplicates, orientation ignored)."""
     m = TopTools_IndexedMapOfShape()
     te_MapShapes(shape, kind, m)
     return [m.FindKey(i) for i in range(1, _size(m) + 1)]
@@ -718,7 +734,7 @@ def edge_face_map(shape):
 
 
 def count_free_edges(shape) -> int:
-    """Spigoli con una sola faccia: 0 = guscio chiuso."""
+    """Edges with a single face: 0 = closed shell."""
     m = edge_face_map(shape)
     return sum(1 for i in range(1, _size(m) + 1) if _size(m.FindFromIndex(i)) == 1)
 
@@ -728,9 +744,9 @@ _SFT = _ShapeFix.ShapeFix_ShapeTolerance
 
 def set_tolerance(sub, tol: float) -> None:
     """
-    IMPOSTA la tolleranza di un vertice/spigolo (anche piu' bassa).
-    ⚠️ BRep_Builder.UpdateVertex/UpdateEdge(tol) possono solo ALZARLA: un
-    rollback fatto con quelle non riporta mai indietro niente.
+    SETS the tolerance of a vertex/edge (even lower). ⚠️
+    BRep_Builder.UpdateVertex/UpdateEdge(tol) can only RAISE it: a rollback
+    done with those never brings anything back down.
     """
     try:
         _SFT().SetTolerance(sub, float(max(tol, 1e-9)), sub.ShapeType())
@@ -739,9 +755,10 @@ def set_tolerance(sub, tol: float) -> None:
 
 
 def face_edges_map(shape):
-    """spigolo(indice mappa) -> [facce] costruita per traversata delle facce.
-    ⚠️ ef.FindFromIndex(k) copia una lista C++ a ogni chiamata (0.3 ms): su
-    10.000 spigoli x 30 ricostruzioni sono 80 s. Cosi' e' quasi gratis."""
+    """edge(map index) -> [faces] built by walking the faces.
+    ⚠️ ef.FindFromIndex(k) copies a C++ list on every call (0.3 ms): on
+    10,000 edges x 30 rebuilds that's 80 s. Built this way it's almost
+    free."""
     emap = TopTools_IndexedMapOfShape()
     te_MapShapes(shape, TopAbs_EDGE, emap)
     fmap = TopTools_IndexedMapOfShape()
@@ -795,7 +812,7 @@ def face_surface_type(face) -> int:
 
 
 def face_plane_normal(face) -> Optional[np.ndarray]:
-    """Normale USCENTE di una faccia planare (None se non planare)."""
+    """OUTWARD normal of a planar face (None if not planar)."""
     f = td_Face(face)
     ad = BRepAdaptor_Surface(f, True)
     if ad.GetType() != GeomAbs_Plane:
@@ -831,7 +848,7 @@ for _n in dir(_BRepCheck):
 
 
 def check_detail(shape, limit: int = 6) -> List[str]:
-    """Errori di BRepCheck in chiaro ([] = valida)."""
+    """BRepCheck errors in plain text ([] = valid)."""
     try:
         an = BRepCheck_Analyzer(shape)
         if an.IsValid():
@@ -839,7 +856,7 @@ def check_detail(shape, limit: int = 6) -> List[str]:
     except Exception as e:
         return [f"BRepCheck: {e}"]
     out: List[str] = []
-    for kind, lab in ((TopAbs_FACE, "faccia"), (TopAbs_WIRE, "wire"), (TopAbs_EDGE, "edge"), (TopAbs_VERTEX, "vertice")):
+    for kind, lab in ((TopAbs_FACE, "face"), (TopAbs_WIRE, "wire"), (TopAbs_EDGE, "edge"), (TopAbs_VERTEX, "vertex")):
         for s in explore(shape, kind):
             try:
                 res = an.Result(s)
@@ -870,7 +887,7 @@ def is_valid(shape) -> bool:
 
 
 def make_solid_from_faces(shape):
-    """Shell (chiuso, si spera) + solido, con verso controllato."""
+    """Shell (closed, hopefully) + solid, with the orientation checked."""
     b = BRep_Builder()
     shell = TopoDS_Shell()
     b.MakeShell(shell)
@@ -883,7 +900,7 @@ def make_solid_from_faces(shape):
         cl = BRepClass3d_SolidClassifier(sol)
         cl.PerformInfinitePoint(1e-6)
         if cl.State() == TopAbs_IN:
-            Log.warn("Normali della mesh rivolte verso l'interno: inverto il guscio.")
+            Log.warn("Mesh normals point inward: flipping the shell.")
             sol = td_Solid(sol.Reversed())
     except Exception:
         pass
@@ -891,7 +908,7 @@ def make_solid_from_faces(shape):
 
 
 def ensure_solid(shape):
-    """Se la shape non e' un solido (compound/shell), prova a farne uno."""
+    """If the shape isn't a solid (compound/shell), tries to make one."""
     if count_sub(shape, TopAbs_SOLID) >= 1:
         return shape
     return make_solid_from_faces(shape)
@@ -903,22 +920,22 @@ def ensure_solid(shape):
 
 
 def read_stl(path: str):
-    """STL binario o ASCII -> solido di facce triangolari con spigoli CONDIVISI."""
+    """Binary or ASCII STL -> solid of triangular faces with SHARED edges."""
     t0 = time.perf_counter()
     RWStl = _m("RWStl").RWStl
     tri = _st(RWStl, "ReadFile")(path)
     if tri is None or tri.NbTriangles() == 0:
-        Log.error(f"STL vuoto o illeggibile: {path}")
+        Log.error(f"Empty or unreadable STL: {path}")
         sys.exit(3)
     mk = _BRepBuilderAPI.BRepBuilderAPI_MakeShapeOnMesh(tri)
     mk.Build()
     sh = mk.Shape()
     sol = make_solid_from_faces(sh)
     st = shape_stats(sol)
-    Log.ok(f"STL letto in {time.perf_counter() - t0:.2f}s -> {os.path.basename(path)}  ({tri.NbTriangles():,} triangoli · {tri.NbNodes():,} vertici)")
+    Log.ok(f"STL read in {time.perf_counter() - t0:.2f}s -> {os.path.basename(path)}  ({tri.NbTriangles():,} triangles · {tri.NbNodes():,} vertices)")
     fe = count_free_edges(sol)
     if fe:
-        Log.warn(f"Mesh non chiusa: {fe:,} spigoli con una sola faccia. Restano aperti anche in uscita (non si inventa geometria).")
+        Log.warn(f"Mesh not closed: {fe:,} edges with a single face. They stay open in the output too (no geometry is invented).")
     return sol, st
 
 
@@ -926,22 +943,22 @@ def read_step(path: str):
     t0 = time.perf_counter()
     r = STEPControl_Reader()
     if r.ReadFile(path) != IFSelect_RetDone:
-        Log.error(f"Lettura STEP fallita: {path}")
+        Log.error(f"STEP read failed: {path}")
         sys.exit(3)
     r.TransferRoots()
     shape = r.OneShape()
     if shape.IsNull():
-        Log.error("Lo STEP non contiene geometria trasferibile.")
+        Log.error("The STEP file contains no transferable geometry.")
         sys.exit(3)
     shape = ensure_solid(shape)
     st = shape_stats(shape)
-    Log.ok(f"STEP letto in {time.perf_counter() - t0:.2f}s -> {os.path.basename(path)}  ({st['faces']:,} facce · {st['solids']} solidi)")
+    Log.ok(f"STEP read in {time.perf_counter() - t0:.2f}s -> {os.path.basename(path)}  ({st['faces']:,} faces · {st['solids']} solids)")
     return shape, st
 
 
 def read_input(path: str):
     if not os.path.isfile(path):
-        Log.error(f"File non trovato: {path}")
+        Log.error(f"File not found: {path}")
         sys.exit(2)
     if os.path.splitext(path)[1].lower() == ".stl":
         return read_stl(path)
@@ -955,37 +972,37 @@ def write_step(shape, path: str, schema: str = "AP214IS") -> None:
     w = STEPControl_Writer()
     w.Transfer(shape, STEPControl_AsIs)
     if w.Write(path) != IFSelect_RetDone:
-        Log.error(f"Scrittura STEP fallita: {path}")
+        Log.error(f"STEP write failed: {path}")
         return
-    Log.ok(f"Salvato: {path}  ({os.path.getsize(path) / 1024:,.0f} KB)")
+    Log.ok(f"Saved: {path}  ({os.path.getsize(path) / 1024:,.0f} KB)")
 
 
 # =============================================================================
-# 4. FASE A — UNIONE FACCE COMPLANARI
+# 4. PHASE A — MERGING COPLANAR FACES
 # =============================================================================
 #
-# ⚠️ PERCHE' NON BASTA UnifySameDomain CON UNA TOLLERANZA ANGOLARE.
-# Il criterio "normali entro X gradi" non ha una taratura giusta:
-#   - con 0.05 gradi (il vecchio default) sul pezzo di prova le strisce lunghe
-#     38 mm dei raccordi venivano fuse coi triangoli delle sfere d'angolo
-#     (0.01-0.05 gradi di differenza) e la faccia fusa si portava dietro una
-#     tolleranza di 0.03 mm: geometria deformata, in silenzio;
-#   - con 0.005 gradi sul secondo pezzo (triangoli da 0.001 mm2, rumore float32
-#     dell'STL di 0.01-0.03 gradi) non si fonde piu' quasi niente.
-# Il criterio giusto e' una DISTANZA: due faccette stanno sullo stesso piano se
-# TUTTI i vertici del gruppo stanno entro lin_tol dal piano medio del gruppo.
-# Le faccette piccole e rumorose si fondono (la deviazione e' microscopica),
-# le strisce lunghe e storte no. I gruppi si calcolano qui in numpy e si
-# passano a UnifySameDomain bloccando (KeepShape) gli spigoli fra gruppi
-# diversi: cosi' OCC costruisce le facce fuse, ma fonde solo cio' che diciamo.
+# ⚠️ WHY UnifySameDomain WITH AN ANGULAR TOLERANCE ISN'T ENOUGH.
+# The "normals within X degrees" criterion has no right calibration:
+#   - at 0.05 degrees (the old default), on the test part the 38 mm-long
+#     fillet strips were merged with the corner spheres' triangles
+#     (0.01-0.05 degrees of difference) and the merged face carried away a
+#     tolerance of 0.03 mm: deformed geometry, silently;
+#   - at 0.005 degrees, on the second part (0.001 mm2 triangles, 0.01-0.03
+#     degrees of float32 noise from the STL) almost nothing merges anymore.
+# The right criterion is a DISTANCE: two facets lie on the same plane if
+# ALL the vertices of the group are within lin_tol of the group's mean
+# plane. Small, noisy facets merge (the deviation is microscopic), long
+# crooked strips don't. The groups are computed here in numpy and handed to
+# UnifySameDomain, locking (KeepShape) the edges between different groups:
+# that way OCC builds the merged faces, but only merges what we tell it to.
 
 
 def face_arrays(shape):
     """
-    Dati per il clustering planare di QUALSIASI shape a facce planari (anche
-    dopo le fasi B/C: le facce curve restano gruppi a se').
-    Ritorna V, liste di indici vertice per faccia, normali (None se curva),
-    aree, mappa spigoli, facce per spigolo.
+    Data for the planar clustering of ANY shape with planar faces (even
+    after phases B/C: curved faces remain their own groups).
+    Returns V, lists of vertex indices per face, normals (None if curved),
+    areas, edge map, faces per edge.
     """
     emap, fmap, e_faces = face_edges_map(shape)
     vmap = TopTools_IndexedMapOfShape()
@@ -1003,7 +1020,7 @@ def face_arrays(shape):
 
 
 def face_scale(V, idx, cap: int = 64) -> float:
-    """Dimensione tipica di una faccia: distanza mediana fra i suoi vertici."""
+    """Typical size of a face: median distance between its vertices."""
     if len(idx) < 2:
         return 1e-12
     P = V[idx]
@@ -1016,27 +1033,27 @@ def face_scale(V, idx, cap: int = 64) -> float:
 
 def texture_barrier(V, fv, nrm, areas, e_faces, size_cut: float = 1.5, ang_min_deg: float = 0.2):
     """
-    Spigoli che erano spigoli del CAD e vanno protetti dalla fusione.
+    Edges that used to be CAD edges and need to be protected from merging.
 
-    ⚠️ LA MESH SE LI RICORDA. Un tassellatore lavora una faccia CAD alla
-    volta: dentro una faccia la trama e' uniforme, attraverso uno spigolo del
-    CAD cambia di colpo, perche' i due lati sono stati tassellati da due
-    passaggi indipendenti (e con due curvature diverse: il piano a faccette
-    enormi, il raccordo a striscioline). Si vede a occhio nel pezzo e si
-    misura: su test4 il salto di dimensione fra faccette vale 0.00 (mediana)
-    dentro una faccia piana e 1.48 (p90, cioe' quasi tre volte) fra facce
-    diverse.
-    Preso da solo il salto di trama sbaglia qualche volta (dentro una faccia
-    piana triangolata alla Delaunay convivono schegge e triangoloni), ma
-    basta aggiungere una condizione: dentro una faccia piana vera le faccette
-    sono complanari a 0.04 gradi (p99 misurato), quindi un salto di trama che
-    arriva insieme a un angolo di mezzo grado non e' tassellatura, e' uno
-    spigolo. Con "trama > 1.5 E angolo > 0.2 gradi" su test4 i tagli falsi
-    dentro una faccia piana sono ZERO e i tagli veri 573.
-    Serve per gli spigoli TANGENTI (piano-raccordo, dove il diedro e' quasi
-    nullo e nessun criterio angolare li vede): sono proprio quelli che una
-    Fase A a tolleranza larga cancellava, appiattendo il raccordo dentro il
-    piano e togliendo alla Fase C la superficie da riconoscere.
+    ⚠️ THE MESH REMEMBERS THEM. A tessellator works one CAD face at a time:
+    inside a face the texture is uniform, across a CAD edge it changes
+    abruptly, because the two sides were tessellated by two independent
+    passes (and with two different curvatures: the plane in huge facets,
+    the fillet in thin strips). It's visible to the eye on the part and
+    it's measurable: on test4 the facet-size jump is 0.00 (median) inside a
+    planar face and 1.48 (p90, i.e. almost threefold) across different
+    faces.
+    Taken alone, the texture jump is sometimes wrong (inside a real planar
+    face, Delaunay triangulation mixes slivers and huge triangles), but
+    adding one condition is enough: inside a real planar face the facets
+    are coplanar to within 0.04 degrees (p99 measured), so a texture jump
+    that comes together with a half-degree angle isn't tessellation, it's
+    an edge. With "texture > 1.5 AND angle > 0.2 degrees" on test4 the
+    false cuts inside a planar face are ZERO and the true cuts 573.
+    This matters for TANGENT edges (plane-fillet, where the dihedral is
+    nearly zero and no angular criterion sees them): those are exactly the
+    ones a loose-tolerance Phase A used to erase, flattening the fillet
+    into the plane and taking away from Phase C the surface to recognize.
     """
     nE = len(e_faces)
     bar = np.zeros(nE, dtype=bool)
@@ -1058,30 +1075,31 @@ def texture_barrier(V, fv, nrm, areas, e_faces, size_cut: float = 1.5, ang_min_d
     return bar
 
 
-# ⚠️ ang_max 6 gradi: con -a 0.05 su un raccordo r=4 la sola distanza fonderebbe
-# faccette fino a 18 gradi l'una dall'altra e il raccordo diventerebbe un
-# poligono a spigoli vivi. Le facce davvero complanari differiscono di
-# frazioni di grado, quindi il tetto angolare non toglie niente di vero.
+# ⚠️ ang_max 6 degrees: with -a 0.05 on an r=4 fillet, distance alone would
+# merge facets up to 18 degrees apart from each other and the fillet would
+# turn into a sharp-edged polygon. Truly coplanar faces differ by fractions
+# of a degree, so the angular ceiling doesn't remove anything real.
 def planar_clusters(V, fv, nrm, areas, e_faces, lin_tol: float, ang_max_deg: float = 6.0, narrow_frac: float = 0.5, barrier=None):
     """
-    Etichetta di gruppo planare per ogni faccia (union-find).
-    Due criteri, entrambi obbligatori:
-      1. locale : sin(angolo fra le normali) x estensione massima <= 2 lin_tol,
-                  cioe' la deviazione REALE che l'angolo produce sulla faccia
-                  grande. Una faccetta minuscola e rumorosa passa, una
-                  striscia lunga 38 mm inclinata di 0.03 gradi no;
-      2. globale: tutti i vertici del gruppo unito entro lin_tol dal piano medio.
-    Con lin_tol = 0.01 si uniscono anche le facce di una superficie bombata di
-    10 micron: e' la scelta dell'utente, e la tolleranza risultante viene
-    ricalcolata e dichiarata.
+    Planar-group label for every face (union-find).
+    Two criteria, both mandatory:
+      1. local : sin(angle between the normals) x max extent <= 2 lin_tol,
+                 i.e. the REAL deviation the angle produces on the large
+                 face. A tiny, noisy facet passes, a 38 mm-long strip
+                 tilted 0.03 degrees doesn't;
+      2. global: all vertices of the merged group within lin_tol of the
+                 group's mean plane.
+    With lin_tol = 0.01 you also merge the faces of a surface bulging by 10
+    microns: that's the user's choice, and the resulting tolerance is
+    recomputed and reported.
     """
     nF = len(fv)
     planar = [n is not None for n in nrm]
     N = np.array([n if n is not None else np.zeros(3) for n in nrm])
     cent = np.array([V[idx].mean(axis=0) if idx else np.zeros(3) for idx in fv])
     Lmax = np.array([float(np.linalg.norm(V[idx].max(axis=0) - V[idx].min(axis=0))) if idx else 0.0 for idx in fv])
-    # faccia "stretta": area molto minore del quadrato della sua estensione.
-    # La sua normale vale poco, il criterio locale non si applica.
+    # "narrow" face: area much smaller than the square of its extent.
+    # Its normal is barely meaningful, so the local criterion doesn't apply.
     narrow = np.array([a < 0.05 * L * L for a, L in zip(areas, np.maximum(Lmax, 1e-9))])
     narrow_tol = narrow_frac * lin_tol
     pairs = [(fs[0], fs[1]) for k, fs in enumerate(e_faces) if len(fs) == 2 and planar[fs[0]] and planar[fs[1]] and (barrier is None or not barrier[k])]
@@ -1103,8 +1121,8 @@ def planar_clusters(V, fv, nrm, areas, e_faces, lin_tol: float, ang_max_deg: flo
         ang = np.degrees(np.arccos(np.clip(cosd, -1.0, 1.0)))
         sin_a = np.sqrt(np.maximum(0.0, 1.0 - cosd**2))
         dev_loc = sin_a * np.maximum(Lmax[pa[:, 0]], Lmax[pa[:, 1]])
-        # coppie ammesse SOLO perche' una delle due facce e' una scheggia:
-        # vanno verificate col piano ai minimi quadrati, non con la media.
+        # pairs admitted ONLY because one of the two faces is a sliver:
+        # they must be checked against the least-squares plane, not the mean.
         slim = dev_loc > 2.0 * lin_tol
         for k in np.argsort(ang, kind="stable"):
             if ang[k] > ang_max_deg:
@@ -1122,24 +1140,23 @@ def planar_clusters(V, fv, nrm, areas, e_faces, lin_tol: float, ang_max_deg: flo
             cen = (csum_c[a_] + csum_c[c_]) / (carea[a_] + carea[c_])
             vs = np.fromiter(cverts[a_] | cverts[c_], dtype=np.int64)
             Q = V[vs]
-            # ⚠️ la normale MEDIA non e' il piano migliore: una scheggia lunga
-            # e stretta (0.3 x 47 mm) ha la normale mal determinata, e basta
-            # un grado per buttare via un'unione che ai minimi quadrati
-            # sarebbe entro il micron. Per quelle schegge si usa il piano ai
-            # minimi quadrati di TUTTI i vertici dell'unione, ma con una
-            # tolleranza molto piu' stretta: assorbire una scheggia non deve
-            # costare precisione al resto del pezzo.
+            # ⚠️ the AVERAGE normal isn't the best plane: a long, narrow
+            # sliver (0.3 x 47 mm) has a poorly determined normal, and one
+            # degree is enough to throw away a merge that would be within a
+            # micron by least squares. For those slivers we use the
+            # least-squares plane of ALL the union's vertices, but with a
+            # much tighter tolerance: absorbing a sliver must not cost the
+            # rest of the part any precision.
             if float(np.abs((Q - cen) @ nrm_).max()) > lin_tol or slim[k]:
-                # ⚠️ ANCHE DUE SCHEGGE GEMELLE. Il ripiego ai minimi quadrati
-                # nasce per assorbire una scheggia dentro una faccia grande,
-                # da cui il rapporto d'area. Ma la tassellatura di un raccordo
-                # produce COPPIE di strisce uguali (il quadrilatero e' svirgolato
-                # e i due triangoli restano separati per cinque millesimi di
-                # grado): sono complanari entro un decimo di micron e il
-                # rapporto d'area 1:1 le teneva divise, raddoppiando le facce
-                # del raccordo e rendendo la regione irregolare. Se entrambe
-                # sono strisce il ripiego vale lo stesso, con la sua
-                # tolleranza stretta.
+                # ⚠️ TWO TWIN SLIVERS TOO. The least-squares fallback exists to
+                # absorb a sliver inside a large face, hence the area ratio.
+                # But the tessellation of a fillet produces PAIRS of equal
+                # strips (the quadrilateral is warped and the two triangles
+                # stay separated by five thousandths of a degree): they are
+                # coplanar to within a tenth of a micron, and the 1:1 area
+                # ratio kept them apart, doubling the fillet's faces and
+                # making the region irregular. If both are slivers the
+                # fallback still applies, with its tight tolerance.
                 if min(carea[a_], carea[c_]) > 0.2 * max(carea[a_], carea[c_]) and not (narrow[pa[k, 0]] and narrow[pa[k, 1]]):
                     continue
                 cen2 = Q.mean(axis=0)
@@ -1172,20 +1189,20 @@ def _unify(shape, unify_edges: bool, unify_faces: bool, lin: float, ang_deg: flo
     if keep:
         for s in keep:
             u.KeepShape(s)
-    # ⚠️ Con tolleranze larghe (es. -a 0.05) UnifySameDomain puo' fallire
-    # ("Courbes non jointives") nel fondere spigoli quasi collineari: in quel
-    # caso si tiene la shape com'era, che e' comunque valida.
+    # ⚠️ With wide tolerances (e.g. -a 0.05) UnifySameDomain can fail
+    # ("Courbes non jointives") merging nearly-collinear edges: in that case
+    # the shape is kept as it was, which is still valid.
     try:
         u.Build()
         out = u.Shape()
     except Exception as e:
-        Log.warn(f"UnifySameDomain fallita ({e}): passo saltato, shape invariata.")
+        Log.warn(f"UnifySameDomain failed ({e}): step skipped, shape unchanged.")
         return shape
     return shape if (out is None or out.IsNull()) else out
 
 
 def copy_shape(shape):
-    """Copia PROFONDA: nuove facce, nuovi spigoli, nuovi vertici."""
+    """DEEP copy: new faces, new edges, new vertices."""
     cp = _BRepBuilderAPI.BRepBuilderAPI_Copy(shape)
     cp.Perform(shape)
     return cp.Shape()
@@ -1193,11 +1210,11 @@ def copy_shape(shape):
 
 def refit_face_planes(shape, lin_tol: float) -> int:
     """
-    ⚠️ UnifySameDomain da' alla faccia fusa il piano del PRIMO triangolo: su
-    un triangolo minuscolo la normale float32 sbaglia di 0.03 gradi e a 4 mm di
-    distanza i vertici escono di 2e-3 mm. Qui ogni faccia planare con piu' di
-    3 vertici riceve il piano ai minimi quadrati dei SUOI vertici (sul posto,
-    stessi spigoli, stesso verso).
+    ⚠️ UnifySameDomain gives the merged face the FIRST triangle's plane: on
+    a tiny triangle the float32 normal is off by 0.03 degrees and at 4 mm
+    away the vertices come out 2e-3 mm off. Here every planar face with
+    more than 3 vertices gets the least-squares plane of ITS OWN vertices
+    (in place, same edges, same orientation).
     """
     b = BRep_Builder()
     n = 0
@@ -1232,12 +1249,12 @@ def refit_face_planes(shape, lin_tol: float) -> int:
 
 def removable_vertices(shape, lin_tol: float):
     """
-    Vertici che stanno su uno spigolo DRITTO fra due sole facce e sono
-    allineati (entro lin_tol) con la catena: quelli che UnifySameDomain puo'
-    togliere. Il criterio e' la distanza dalla corda dell'intero tratto
-    accorpato, non l'angolo fra segmenti consecutivi (che su segmenti corti e'
-    solo rumore float32 e su segmenti lunghi deforma).
-    Ritorna (vertici da BLOCCARE, numero di rimovibili).
+    Vertices that sit on a STRAIGHT edge between just two faces and are
+    aligned (within lin_tol) with the chain: the ones UnifySameDomain can
+    remove. The criterion is the distance from the chord of the whole
+    merged stretch, not the angle between consecutive segments (which on
+    short segments is just float32 noise and on long segments deforms).
+    Returns (vertices to LOCK, number of removable ones).
     """
     ef, fmap, e_faces = face_edges_map(shape)
     ve = TopTools_IndexedMapOfShape()
@@ -1311,9 +1328,9 @@ def removable_vertices(shape, lin_tol: float):
 
 def recompute_tolerances(shape) -> float:
     """
-    Tolleranze RICALCOLATE dalla geometria vera (vertice-piano, vertice-curva,
-    curva-piano) invece di quelle gonfiate da UnifySameDomain. Impostate, non
-    solo alzate.
+    Tolerances RECOMPUTED from the real geometry (vertex-plane, vertex-curve,
+    curve-plane) instead of the ones UnifySameDomain inflated. Set, not just
+    raised.
     """
     emap, fmap, e_faces = face_edges_map(shape)
     vmap = TopTools_IndexedMapOfShape()
@@ -1347,8 +1364,8 @@ def recompute_tolerances(shape) -> float:
         try:
             c = bt_Curve(e, 0.0, 0.0)
             t0, t1 = bt_Range(e)
-            # ⚠️ uno spigolo DEGENERE (il punto-polo di una sfera, una cucitura
-            # che si chiude) non ha curva 3D: bt_Curve torna None, non solleva.
+            # ⚠️ a DEGENERATE edge (a sphere's pole point, a seam that closes
+            # up) has no 3D curve: bt_Curve returns None, it doesn't raise.
             curves.append(None if c is None else (c, float(t0), float(t1)))
         except Exception:
             curves.append(None)
@@ -1373,7 +1390,7 @@ def recompute_tolerances(shape) -> float:
                 ends.append(float(np.linalg.norm(P - np.array([q.X(), q.Y(), q.Z()]))))
             d = max(d, min(ends))
         tol = max(1e-7, 1.2 * d + 1e-9)
-        # ⚠️ vicino a facce CURVE la tolleranza serve alle pcurve: mai abbassarla
+        # ⚠️ near CURVED faces the tolerance is needed by the pcurves: never lower it
         if any(planes[i] is None for i in v_faces[j]):
             tol = max(tol, float(bt_Tolerance(v)))
         set_tolerance(v, tol)
@@ -1401,10 +1418,10 @@ def recompute_tolerances(shape) -> float:
     return worst
 
 
-def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, validate: bool = False, title: str = "FASE A — unione facce complanari", use_barrier: bool = True):
+def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, validate: bool = False, title: str = "PHASE A — merging coplanar faces", use_barrier: bool = True):
     Log.banner(title)
     before = shape_stats(shape)
-    Log.info(f"Ingresso : {before['faces']:,} facce · {before['edges']:,} edge · {before['verts']:,} vertici · {before['solids']} solid")
+    Log.info(f"Input    : {before['faces']:,} faces · {before['edges']:,} edges · {before['verts']:,} vertices · {before['solids']} solid")
     free0 = count_free_edges(shape)
     base_ok = is_valid(shape)
     originale = shape
@@ -1413,13 +1430,13 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
 
     def _attempt(block_pts):
         """
-        ⚠️ SI LAVORA SU UNA COPIA. refit_face_planes, ShapeFix e
-        recompute_tolerances modificano SUL POSTO piani, spigoli e vertici, e
-        sono gli stessi oggetti della shape di partenza: senza copia, dopo un
-        tentativo fallito e' rovinato anche l'originale (misurato: la shape di
-        ingresso, dopo il giro, usciva non valida anche lei) e il passo
-        indietro non esiste.
-        block_pts = punti dentro i gruppi planari da NON fondere.
+        ⚠️ WORKING ON A COPY. refit_face_planes, ShapeFix and
+        recompute_tolerances modify planes, edges and vertices IN PLACE,
+        and they're the same objects as the starting shape's: without a
+        copy, after a failed attempt the original is ruined too (measured:
+        the input shape, after the round trip, also came out invalid) and
+        there's no way to step back.
+        block_pts = points inside the planar groups NOT to merge.
         """
         work = copy_shape(originale) if base_ok else originale
         V, fv, nrm, areas, emap, fmap, e_faces = face_arrays(work)
@@ -1438,47 +1455,47 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
                 keep.append(emap.FindKey(k + 1))
         if block_pts is None:
             Log.info(
-                f"Gruppi planari (vertici entro {lt:.1e} mm dal piano): "
-                f"{len(np.unique(lab)):,} · spigoli bloccati {len(keep):,}"
-                f"{'' if bar is None else f' · di cui {int(bar.sum()):,} spigoli del CAD (trama)'}"
+                f"Planar groups (vertices within {lt:.1e} mm of the plane): "
+                f"{len(np.unique(lab)):,} · edges locked {len(keep):,}"
+                f"{'' if bar is None else f' · of which {int(bar.sum()):,} are CAD edges (texture)'}"
                 f"   [{time.perf_counter() - t0:.2f}s]"
             )
         m = _unify(work, False, True, lt, 6.0, keep=keep)
         nfix = refit_face_planes(m, lt)
         keep_v, nrem = removable_vertices(m, lt)
         if block_pts is None:
-            Log.info(f"Piani ri-fittati {nfix:,} · vertici collineari rimovibili {nrem:,}")
+            Log.info(f"Re-fitted planes {nfix:,} · removable collinear vertices {nrem:,}")
         m = _unify(m, True, False, lt, 30.0, keep=keep_v)
-        # ⚠️ UnifySameDomain lascia le facce fuse col wire marcato
-        # "UnorientableShape". ShapeFix_Shape lo sistema sul posto.
+        # ⚠️ UnifySameDomain leaves merged faces with the wire marked
+        # "UnorientableShape". ShapeFix_Shape fixes it in place.
         try:
             sf = ShapeFix_Shape(m)
             sf.SetPrecision(1e-7)
             sf.SetMaxTolerance(max(lt, 1e-6))
             sf.Perform()
             fixed = sf.Shape()
-            # ⚠️ MA PUO' ANCHE APRIRE IL GUSCIO: uno spigolo da 0.8 micron nel
-            # contorno lo toglie da UNA faccia e lo lascia nell'altra. Il wire
-            # "UnorientableShape" e' un fastidio, un guscio aperto e' un
-            # difetto: se apre, si tiene la forma non corretta.
+            # ⚠️ BUT IT CAN ALSO OPEN THE SHELL: a 0.8-micron edge in the
+            # contour removes it from ONE face and leaves it in the other.
+            # An "UnorientableShape" wire is a nuisance, an open shell is a
+            # defect: if it opens the shell, the uncorrected shape is kept.
             if fixed is not None and not fixed.IsNull():
                 if count_free_edges(fixed) <= count_free_edges(m):
                     m = fixed
                 else:
-                    Log.debug("ShapeFix apriva il guscio: scartato")
+                    Log.debug("ShapeFix was opening the shell: discarded")
         except Exception as e:
-            Log.debug(f"ShapeFix dopo Unify saltato: {e}")
+            Log.debug(f"ShapeFix after Unify skipped: {e}")
         stato["lt"] = lt
         return m
 
     merged = _attempt(None)
-    # ⚠️ LA FASE A NON PUO' PEGGIORARE IL SOLIDO. UnifySameDomain e ShapeFix
-    # sono robusti ma non infallibili: su una faccia a forma libera col
-    # contorno di centinaia di segmenti capita che la fusione lasci un wire
-    # che BRepCheck rifiuta. Riunire le facce e' estetica, un solido non
-    # valido e' un difetto. Ma buttare via TUTTA la fusione per una faccia
-    # sola e' sproporzionato: si riprova bloccando i soli gruppi planari da
-    # cui sono uscite le facce guaste, e solo se non basta si rinuncia.
+    # ⚠️ PHASE A MUST NOT MAKE THE SOLID WORSE. UnifySameDomain and ShapeFix
+    # are robust but not infallible: on a free-form face with a contour of
+    # hundreds of segments, the merge can occasionally leave a wire that
+    # BRepCheck rejects. Merging faces is cosmetic, an invalid solid is a
+    # defect. But throwing away the WHOLE merge for a single face is
+    # disproportionate: we retry, blocking only the planar groups the bad
+    # faces came from, and only give up if that isn't enough.
     if base_ok and not is_valid(merged):
         guasti = []
         for _ in range(1):
@@ -1492,14 +1509,14 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
             if not nuovi:
                 break
             guasti.extend(nuovi)
-            Log.debug(f"Fase A: {len(nuovi)} facce fuse non valide, si riprova lasciando stare i loro gruppi ({len(guasti)} in tutto)")
+            Log.debug(f"Phase A: {len(nuovi)} invalid merged faces, retrying leaving their groups alone ({len(guasti)} total)")
             merged = _attempt(guasti)
             if is_valid(merged):
                 break
         if not is_valid(merged):
-            Log.warn("Fase A: la fusione rendeva il solido non valido, lasciata la forma di partenza")
+            Log.warn("Phase A: the merge made the solid invalid, kept the starting shape")
             after0 = shape_stats(originale)
-            Log.ok(f"Uscita   : {after0['faces']:,} facce (nessuna fusione)   [{time.perf_counter() - t0:.2f}s]")
+            Log.ok(f"Output   : {after0['faces']:,} faces (no merge)   [{time.perf_counter() - t0:.2f}s]")
             return originale, before, after0
     worst = recompute_tolerances(merged)
     merged = ensure_solid(merged)
@@ -1508,26 +1525,26 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
     after = shape_stats(merged)
     free1 = count_free_edges(merged)
     red_f = 100.0 * (1 - after["faces"] / max(1, before["faces"]))
-    Log.ok(f"Uscita   : {after['faces']:,} facce · {after['edges']:,} edge · {after['verts']:,} vertici   [{dt:.2f}s]   riduzione facce -{red_f:.1f}%")
-    Log.info(f"Spigoli liberi: {free1:,} (in ingresso {free0:,}) · tolleranza max ricalcolata {worst:.1e} mm")
+    Log.ok(f"Output   : {after['faces']:,} faces · {after['edges']:,} edges · {after['verts']:,} vertices   [{dt:.2f}s]   face reduction -{red_f:.1f}%")
+    Log.info(f"Free edges: {free1:,} (input {free0:,}) · recomputed max tolerance {worst:.1e} mm")
     if free1 > free0:
-        Log.warn("La Fase A ha aperto il guscio in qualche punto (mesh non manifold li').")
+        Log.warn("Phase A opened up the shell somewhere (mesh non-manifold there).")
     if validate:
         ok = is_valid(merged)
-        (Log.ok if ok else Log.warn)(f"BRepCheck dopo Fase A: {'OK' if ok else 'NON valida'}")
+        (Log.ok if ok else Log.warn)(f"BRepCheck after Phase A: {'OK' if ok else 'NOT valid'}")
     return merged, before, after
 
 
 # =============================================================================
-# 5. PRIMITIVE: fit algebrico + raffinamento non lineare (dal motore precedente)
+# 5. PRIMITIVES: algebraic fit + nonlinear refinement (from the previous engine)
 # =============================================================================
 
 
 def taubin_circle(x: np.ndarray, y: np.ndarray, iters: int = 40, eps: float = 1e-12) -> Tuple[float, float, float]:
-    """Fit di cerchio ai minimi quadrati (Taubin). Ritorna (cx, cy, r)."""
+    """Least-squares circle fit (Taubin). Returns (cx, cy, r)."""
     n = x.size
     if n < 3:
-        raise ValueError("servono almeno 3 punti")
+        raise ValueError("need at least 3 points")
     mx, my = x.mean(), y.mean()
     u, v = x - mx, y - my
     z = u * u + v * v
@@ -1567,7 +1584,7 @@ def taubin_circle(x: np.ndarray, y: np.ndarray, iters: int = 40, eps: float = 1e
             break
 
     det = xn * xn - xn * Mz + Cov_xy
-    if abs(det) < eps:  # degenere -> Kasa
+    if abs(det) < eps:  # degenerate -> Kasa
         A = np.column_stack([u, v, np.ones(n)])
         sol, *_ = np.linalg.lstsq(A, z, rcond=None)
         cx, cy = sol[0] / 2.0, sol[1] / 2.0
@@ -1588,33 +1605,33 @@ def ortho_frame(axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return u, v
 
 
-# --- 5.2  primitive geometriche ---------------------------------------------
+# --- 5.2  geometric primitives ------------------------------------------------
 
-PLANE, AXIAL, SPHERE, TORUS = "piano", "assiale", "sfera", "toro"
-FREE = "libera"  # superficie a forma libera (B-spline) — vedi 5.4bis
+PLANE, AXIAL, SPHERE, TORUS = "plane", "axial", "sphere", "torus"
+FREE = "free"  # free-form surface (B-spline) — see 5.4bis
 
 
 @dataclass
 class Prim:
     """
-    kind == PLANE  : center (punto), axis (normale)
-    kind == AXIAL  : center (punto sull'asse a t=0), axis, r0, slope
-                     raggio(t) = r0 + slope*t   ->  slope==0 cilindro, else cono
+    kind == PLANE  : center (point), axis (normal)
+    kind == AXIAL  : center (point on the axis at t=0), axis, r0, slope
+                     radius(t) = r0 + slope*t   ->  slope==0 cylinder, else cone
     kind == SPHERE : center, r0
     """
 
     kind: str
     center: np.ndarray
     axis: Optional[np.ndarray] = None
-    r0: float = 0.0  # TORUS: raggio MAGGIORE (asse del tubo)
+    r0: float = 0.0  # TORUS: MAJOR radius (tube's axis)
     slope: float = 0.0
-    r1: float = 0.0  # TORUS: raggio MINORE (del tubo)
+    r1: float = 0.0  # TORUS: MINOR radius (of the tube)
     rms: float = 1e30
-    free: Optional["FreeForm"] = None  # FREE: la superficie a forma libera
+    free: Optional["FreeForm"] = None  # FREE: the free-form surface
 
-    # --- geometria ----------------------------------------------------------
+    # --- geometry -------------------------------------------------------------
     def _tr(self, P: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Coordinate cilindriche: (t assiale, rho radiale, versore radiale)."""
+        """Cylindrical coordinates: (axial t, radial rho, radial unit vector)."""
         d = P - self.center
         t = d @ self.axis
         rad = d - np.outer(t, self.axis)
@@ -1623,7 +1640,7 @@ class Prim:
         return t, rho, uh
 
     def dist(self, P: np.ndarray) -> np.ndarray:
-        """Distanza (con segno) dei punti dalla superficie."""
+        """(Signed) distance of the points from the surface."""
         if self.kind == FREE:
             return self.free.dist(P)
         if self.kind == PLANE:
@@ -1634,11 +1651,11 @@ class Prim:
             t, rho, _ = self._tr(P)
             return np.hypot(rho - self.r0, t) - self.r1
         t, rho, _ = self._tr(P)
-        # per il cono la distanza vera e' la deviazione radiale * cos(semiangolo)
+        # for the cone, the true distance is the radial deviation * cos(semi-angle)
         return (rho - (self.r0 + self.slope * t)) / math.hypot(1.0, self.slope)
 
     def normal_at(self, P: np.ndarray) -> np.ndarray:
-        """Normale (non orientata) della primitiva nei punti dati."""
+        """(Unoriented) normal of the primitive at the given points."""
         if self.kind == FREE:
             return self.free.normal_at(P)
         if self.kind == PLANE:
@@ -1656,17 +1673,17 @@ class Prim:
 
     def label(self) -> str:
         if self.kind == FREE:
-            return "LIBERA"
+            return "FREE"
         if self.kind == PLANE:
-            return "PIANO"
+            return "PLANE"
         if self.kind == SPHERE:
-            return "SFERA"
+            return "SPHERE"
         if self.kind == TORUS:
-            return "TORO"
-        return "CILIND" if abs(self.slope) < 1e-3 else "CONO"
+            return "TORUS"
+        return "CYL" if abs(self.slope) < 1e-3 else "CONE"
 
 
-# --- 5.3  fit delle primitive ------------------------------------------------
+# --- 5.3  primitive fitting ---------------------------------------------------
 
 
 def fit_plane(P: np.ndarray) -> Optional[Prim]:
@@ -1700,17 +1717,17 @@ def fit_sphere(P: np.ndarray) -> Optional[Prim]:
 
 def _cone_algebraic(px, py, t, max_slope: float):
     """
-    Cono con asse gia' noto, in forma chiusa.
+    Cone with a known axis, in closed form.
 
-    ⚠️ IL CERCHIO UNICO NON VA BENE. Proiettando un cono sul piano ortogonale
-    all'asse i punti stanno su cerchi di raggio DIVERSO (uno per ogni quota):
-    fitne uno solo sposta il centro, i raggi escono sbagliati e la conicita'
-    stimata per regressione e' fuori di un ordine di grandezza (-0.07 invece
-    di -1). Qui si usa l'equazione del cono
+    ⚠️ A SINGLE CIRCLE WON'T DO. Projecting a cone onto the plane
+    orthogonal to the axis, the points sit on circles of DIFFERENT radius
+    (one per height): fitting just one shifts the center, the radii come
+    out wrong and the taper estimated by regression is off by an order of
+    magnitude (-0.07 instead of -1). Here we use the cone's equation
         (x-cx)^2 + (y-cy)^2 = (r0 + s t)^2
-    che, sviluppata, e' LINEARE nelle incognite (cx, cy, A, B, C) con
-    A = cx^2+cy^2-r0^2, B = 2 r0 s, C = s^2. Da C e B si ricavano conicita' e
-    raggio, segno compreso.
+    which, expanded, is LINEAR in the unknowns (cx, cy, A, B, C) with
+    A = cx^2+cy^2-r0^2, B = 2 r0 s, C = s^2. Taper and radius, sign
+    included, are recovered from C and B.
     """
     if len(t) < 6 or float(t.max() - t.min()) < 1e-9:
         return None
@@ -1736,14 +1753,14 @@ def _cone_algebraic(px, py, t, max_slope: float):
 
 def _cone_rings(px, py, t, max_slope: float):
     """
-    Cono con asse noto, ricavato dagli ANELLI.
+    Cone with a known axis, derived from RINGS.
 
-    ⚠️ Una fascia tassellata con UNA SOLA FILA di faccette ha i vertici su due
-    sole quote: la forma algebrica del cono diventa singolare (con due valori
-    di t la colonna t^2 e' combinazione lineare di t e della costante) e la
-    conicita' esce a caso. Pero' quei due anelli sono proprio cio' che serve:
-    un cerchio per anello da' centro e raggio, e due raggi a due quote danno
-    la conicita' esatta.
+    ⚠️ A band tessellated with a SINGLE ROW of facets has vertices at only
+    two heights: the cone's algebraic form becomes singular (with two
+    values of t, the t^2 column is a linear combination of t and the
+    constant) and the taper comes out random. But those two rings are
+    exactly what's needed: one circle per ring gives center and radius, and
+    two radii at two heights give the exact taper.
     """
     n = len(t)
     if n < 6:
@@ -1762,9 +1779,9 @@ def _cone_rings(px, py, t, max_slope: float):
             cur.append(i)
     groups.append(cur)
     groups = [g for g in groups if len(g) >= 3]
-    # ⚠️ serve per le fasce a una o due file di faccette: con molti anelli il
-    # fit normale ha gia' tutti i dati che gli servono, e qui si pagherebbe un
-    # fit di cerchio per anello a ogni chiamata.
+    # ⚠️ needed for bands with one or two rows of facets: with many rings the
+    # normal fit already has all the data it needs, and here we'd pay for a
+    # circle fit per ring on every call.
     if not 2 <= len(groups) <= 4:
         return None
     cs = []
@@ -1793,7 +1810,7 @@ def _cone_rings(px, py, t, max_slope: float):
 
 
 def _axial_on_axis(P: np.ndarray, axis: np.ndarray, force_cyl: bool, max_slope: float) -> Optional[Prim]:
-    """Raggio e conicita' ai minimi quadrati attorno a un asse dato."""
+    """Least-squares radius and taper around a given axis."""
     O = P.mean(axis=0)
     u, v = ortho_frame(axis)
     Q = P - O
@@ -1811,9 +1828,9 @@ def _axial_on_axis(P: np.ndarray, axis: np.ndarray, force_cyl: bool, max_slope: 
             variants.append((cx, cy, float(r0), float(slope)))
     except Exception:
         pass
-    # ⚠️ scorciatoia: se il primo tentativo gia' aderisce ai punti non c'e'
-    # niente da guadagnare a provare le altre due forme, che costano un
-    # sistema lineare e un paio di fit di cerchio per ogni chiamata.
+    # ⚠️ shortcut: if the first attempt already hugs the points there's
+    # nothing to gain by trying the other two forms, which cost a linear
+    # system and a couple of circle fits per call.
     good = float(np.ptp(np.hypot(px, py)) + (t.max() - t.min())) * 1e-5 + 1e-12
     if variants and not force_cyl:
         cx0, cy0, r00, s0 = variants[0]
@@ -1832,8 +1849,8 @@ def _axial_on_axis(P: np.ndarray, axis: np.ndarray, force_cyl: bool, max_slope: 
     for cx, cy, r0, slope in variants:
         if not np.isfinite(r0) or abs(slope) > max_slope:
             continue
-        # origine al centro dei dati: cosi' il raggio di riferimento e' quello
-        # vero della fascia, non quello (magari negativo) al vertice del cono
+        # origin at the data's center: this way the reference radius is the
+        # band's real one, not the (maybe negative) one at the cone's apex
         cen = O + cx * u + cy * v + tm * axis
         rm = float(r0 + slope * tm)
         if not np.isfinite(rm) or rm <= 1e-6:
@@ -1847,29 +1864,30 @@ def _axial_on_axis(P: np.ndarray, axis: np.ndarray, force_cyl: bool, max_slope: 
 
 def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.0, ratio_1d: float = 0.05) -> Optional[Prim]:
     """
-    Cilindro o cono.
+    Cylinder or cone.
 
-    Le normali soddisfano  n·a = s  costante  (s = 0 cilindro, s = sin(alfa) cono):
-    cioe' i punti {n_i} nello spazio delle normali stanno su un PIANO. Il fit e'
-    quindi l'autovettore minimo della covarianza delle normali CENTRATE.
-    Centrare e' obbligatorio: senza, archi parziali e coni sbagliano asse.
+    The normals satisfy  n·a = s  constant  (s = 0 cylinder, s = sin(alpha)
+    cone): i.e. the points {n_i} in normal-space lie on a PLANE. The fit is
+    therefore the smallest eigenvector of the CENTERED normals' covariance.
+    Centering is mandatory: without it, partial arcs and cones get the axis
+    wrong.
 
-    ⚠️ CASO DEGENERE. Un intorno PICCOLO di cilindro ha le normali quasi
-    COLLINEARI (stanno su un arco cortissimo). Infiniti piani contengono una
-    retta, quindi l'autovettore minimo e' arbitrario e l'asse esce a caso.
-    In quel caso si risolve la degenerazione scegliendo l'interpretazione
-    cilindro (s = 0): l'asse deve essere ortogonale sia alla normale media sia
-    alla direzione di spread, quindi  a = n_medio x w.
+    ⚠️ DEGENERATE CASE. A SMALL cylinder neighborhood has nearly COLLINEAR
+    normals (they sit on a very short arc). Infinitely many planes contain
+    a line, so the smallest eigenvector is arbitrary and the axis comes out
+    random. In that case the degeneracy is resolved by picking the
+    cylinder interpretation (s = 0): the axis must be orthogonal to both
+    the mean normal and the spread direction, so  a = mean_n x w.
 
-    ⚠️ MA NON SEMPRE. Uno SMUSSO CURVO (cono a 45 gradi attorno a uno spigolo
-    arrotondato) ha anche lui le normali su un arco corto, eppure il suo asse
-    e' determinato benissimo: la componente delle normali lungo l'asse e'
-    COSTANTE, e l'autovettore minimo la trova. Se si forza il cilindro, l'asse
-    esce ortogonale a quello vero e il fit sbaglia di centesimi; poi una sfera
-    passante per i due cerchi di bordo "spiega" la fascia meglio del finto
-    cilindro, e al posto dello smusso si ritrova una calotta. Quindi nel caso
-    degenere si provano ENTRAMBE le interpretazioni e si tiene quella che
-    aderisce di piu' ai punti.
+    ⚠️ BUT NOT ALWAYS. A CURVED CHAMFER (a 45-degree cone around a rounded
+    edge) also has its normals on a short arc, yet its axis is very well
+    determined: the normals' component along the axis is CONSTANT, and the
+    smallest eigenvector finds it. If the cylinder is forced, the axis
+    comes out orthogonal to the true one and the fit is off by hundredths;
+    then a sphere through the two boundary circles "explains" the band
+    better than the fake cylinder, and a cap turns up in place of the
+    chamfer. So in the degenerate case BOTH interpretations are tried and
+    the one that hugs the points more closely is kept.
     """
     if len(P) < 6 or len(N) < 3:
         return None
@@ -1880,23 +1898,23 @@ def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.
     evals, evecs = np.linalg.eigh(M)
 
     if evals[2] <= 1e-16:
-        return None  # normali tutte identiche
+        return None  # all normals identical
 
     cands = []
     if evals[1] <= ratio_1d * evals[2]:
-        # --- spread 1D: degenere ---
+        # --- 1D spread: degenerate ---
         spread = evecs[:, 2]
         a = np.cross(nb, spread)
         na = np.linalg.norm(a)
         if na > 1e-9:
-            cands.append((a / na, True))  # interpretazione cilindro
+            cands.append((a / na, True))  # cylinder interpretation
         n0 = np.linalg.norm(evecs[:, 0])
         if n0 > 1e-9:
-            cands.append((evecs[:, 0] / n0, False))  # interpretazione cono
+            cands.append((evecs[:, 0] / n0, False))  # cone interpretation
     else:
-        # --- spread 2D: il fit di piano nello spazio delle normali e' valido ---
+        # --- 2D spread: the plane fit in normal-space is valid ---
         if evals[0] / evals[1] > 0.15:
-            return None  # spread 3D -> sfera, non assiale
+            return None  # 3D spread -> sphere, not axial
         n0 = np.linalg.norm(evecs[:, 0])
         if n0 < 1e-9:
             return None
@@ -1912,20 +1930,21 @@ def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.
 
 def fit_axial_rev(P: np.ndarray, Nrep: np.ndarray, Wp: np.ndarray) -> Optional[Prim]:
     """
-    Cono/cilindro con l'asse preso da revolution_axis invece che dalla
-    covarianza delle normali.
+    Cone/cylinder with the axis taken from revolution_axis instead of the
+    normals' covariance.
 
-    ⚠️ SMUSSO CURVO, UNA SOLA FILA DI FACCETTE. Uno smusso a 45 gradi attorno
-    a uno spigolo arrotondato e' un CONO, ma tassellato ha i vertici solo sui
-    due cerchi di bordo e le normali su un arco corto: la covarianza delle
-    normali e' degenere (spread 1D), fit_axial ripiega sul cilindro e
-    sbaglia l'asse di brutto. Allora la stessa superficie viene "spiegata"
-    benissimo anche da una SFERA che passa per i due cerchi, e il pezzo si
-    riempie di calotte sferiche al posto degli smussi. Le posizioni pero'
-    l'informazione ce l'hanno: n . (a x (p - c)) = 0 e' lineare in (a, a x c)
-    e da' l'asse senza casi degeneri. Da li' bastano due minimi quadrati per
-    raggio e conicita'. Il verdetto finale lo da' comunque la deviazione
-    delle normali, che sul cono e' un terzo di quella della sfera.
+    ⚠️ CURVED CHAMFER, A SINGLE ROW OF FACETS. A 45-degree chamfer around a
+    rounded edge is a CONE, but tessellated it has vertices only on the two
+    boundary circles and normals on a short arc: the normals' covariance is
+    degenerate (1D spread), fit_axial falls back to the cylinder and gets
+    the axis badly wrong. Then the same surface also gets "explained" very
+    well by a SPHERE through the two circles, and the part fills up with
+    spherical caps in place of the chamfers. The positions do carry the
+    information, though: n . (a x (p - c)) = 0 is linear in (a, a x c) and
+    gives the axis with no degenerate cases. From there, two least-squares
+    fits are enough for radius and taper. The final verdict is still given
+    by the normals' deviation, which on the cone is a third of the
+    sphere's.
     """
     ra = revolution_axis(P, Nrep, Wp)
     if ra is None:
@@ -1945,9 +1964,9 @@ def fit_axial_rev(P: np.ndarray, Nrep: np.ndarray, Wp: np.ndarray) -> Optional[P
         return None
     if not (np.isfinite(r0) and np.isfinite(slope)) or abs(slope) > 3.0:
         return None
-    # ⚠️ il punto di riferimento dell'asse puo' cadere oltre il vertice del
-    # cono, e li' il "raggio a t=0" e' NEGATIVO: non e' un fit sbagliato, e'
-    # solo un'origine scomoda. Si riporta l'origine in mezzo ai dati.
+    # ⚠️ the axis's reference point can fall beyond the cone's apex, and
+    # there the "radius at t=0" is NEGATIVE: it's not a wrong fit, it's just
+    # an inconvenient origin. The origin is moved to the middle of the data.
     tm = 0.5 * float(t.min() + t.max())
     c = c + tm * a
     r0 = float(r0 + slope * tm)
@@ -1960,13 +1979,14 @@ def fit_axial_rev(P: np.ndarray, Nrep: np.ndarray, Wp: np.ndarray) -> Optional[P
 
 def revolution_axis(P: np.ndarray, N: np.ndarray, W: np.ndarray):
     """
-    Asse di una superficie di rivoluzione, in forma chiusa.
+    Axis of a surface of revolution, in closed form.
 
-    Per QUALSIASI superficie di rivoluzione (cilindro, cono, sfera, toro) la
-    normale in un punto non ha componente tangenziale:  n . (a x (p - c)) = 0.
-    Scritta come  a.(p x n) = (a x c).n , e' LINEARE e omogenea in (a, a x c):
-    l'asse esce dalla SVD, senza inneschi ne' casi degeneri. E' molto piu'
-    robusta della covarianza delle normali su strisce sottili.
+    For ANY surface of revolution (cylinder, cone, sphere, torus) the
+    normal at a point has no tangential component:  n . (a x (p - c)) = 0.
+    Written as  a.(p x n) = (a x c).n , it's LINEAR and homogeneous in
+    (a, a x c): the axis comes out of the SVD, with no seeding and no
+    degenerate cases. It's much more robust than the normals' covariance
+    on thin strips.
     """
     if len(P) < 6:
         return None
@@ -1985,15 +2005,15 @@ def revolution_axis(P: np.ndarray, N: np.ndarray, W: np.ndarray):
 
 def fit_torus(P: np.ndarray, N: np.ndarray, W: np.ndarray) -> Optional[Prim]:
     """
-    Toro: il RACCORDO LUNGO UNO SPIGOLO CURVO.
+    Torus: the FILLET ALONG A CURVED EDGE.
 
-    ⚠️ Senza questa primitiva un pezzo meccanico vero non si converte. Ogni
-    smusso o raccordo attorno a un foro, a un mozzo o a un bordo arrotondato e'
-    un TORO, non un cilindro: sui suoi triangoli il miglior cilindro sbaglia di
-    un decimo di millimetro e la regione viene espulsa a ogni passata. Restano
-    tassellati proprio i bordi tondi, che sono quelli che si vedono.
-    Nel piano meridiano (rho, z) il profilo del toro e' un CERCHIO: asse dalla
-    SVD, poi cerchio di Taubin sul profilo.
+    ⚠️ Without this primitive a real mechanical part won't convert. Every
+    chamfer or fillet around a hole, a hub or a rounded edge is a TORUS,
+    not a cylinder: on its triangles the best cylinder is off by a tenth of
+    a millimeter and the region gets expelled every pass. What stays
+    tessellated are exactly the round edges, which are the ones you see.
+    In the meridian plane (rho, z) the torus's profile is a CIRCLE: axis
+    from the SVD, then a Taubin circle on the profile.
     """
     q = revolution_axis(P, N, W)
     if q is None:
@@ -2011,42 +2031,43 @@ def fit_torus(P: np.ndarray, N: np.ndarray, W: np.ndarray) -> Optional[Prim]:
     if r <= 1e-9 or R <= 1e-9:
         return None
     if R < 0.15 * r or R > 60.0 * r:
-        return None  # degenera in sfera o in cilindro
+        return None  # degenerates into a sphere or a cylinder
     p = Prim(TORUS, c + z0 * a, a, float(R), 0.0, float(r))
     p.rms = float(np.sqrt(np.mean(p.dist(P) ** 2)))
     return p
 
 
-# --- 5.4bis  la superficie a FORMA LIBERA ------------------------------------
-# ⚠️ PERCHE' SERVE. Uno smusso o un raccordo che corre lungo uno spigolo CURVO
-# non e' un cono ne' un toro: e' una superficie di raccordo che il CAD scrive
-# come B-spline. Il fit a primitive la spezza in decine di cilindretti
-# osculatori da 10 gradi, ognuno col contorno frastagliato: sono proprio le
-# "facce con troppi lati" che si vedono nel pezzo finito. Qui la macchia viene
-# presa INTERA e approssimata con una B-spline tensoriale ai minimi quadrati.
-# Non e' un compromesso sulla precisione: a differenza di una quadrica, una
-# B-spline ha tanti gradi di liberta' quanti ne servono, e su queste macchie
-# arriva a un centesimo della tolleranza con cui i cilindretti passavano a
-# fatica. Una faccia sola al posto di quaranta, e piu' vicina alla mesh.
+# --- 5.4bis  the FREE-FORM surface --------------------------------------------
+# ⚠️ WHY IT'S NEEDED. A chamfer or fillet running along a CURVED edge is
+# neither a cone nor a torus: it's a blending surface that the CAD writes
+# as a B-spline. The primitive fit splits it into dozens of 10-degree
+# osculating little cylinders, each with a jagged outline: those are
+# exactly the "faces with too many sides" you see in the finished part.
+# Here the patch is taken WHOLE and approximated with a least-squares
+# tensor B-spline. It's not a compromise on precision: unlike a quadric, a
+# B-spline has as many degrees of freedom as it needs, and on these
+# patches it reaches a hundredth of the tolerance the little cylinders were
+# barely passing with. One face instead of forty, and closer to the mesh.
 #
-# La superficie e' un CAMPO DI ALTEZZE sopra un piano di base:
+# The surface is a HEIGHT FIELD over a base plane:
 #     S(u, v) = C + u*X + v*Y + h(u, v)*Z
-# quindi (u, v) sono coordinate cartesiane sul piano di base e la parametriz-
-# zazione coincide con quella che SurfParam usa per le quadriche. Vale solo per
-# macchie che sul piano di base non si ripiegano: il controllo e' l'inclinazione
-# delle normali (oltre ~70 gradi la macchia si rifiuta e resta tassellata).
+# so (u, v) are Cartesian coordinates on the base plane and the
+# parametrization matches the one SurfParam uses for quadrics. It only
+# holds for patches that don't fold back onto the base plane: the check is
+# the normals' tilt (past ~70 degrees the patch is rejected and stays
+# tessellated).
 
 _BS_DEG = 3
 
 
 def _bs_knots(t0: float, t1: float, n: int, deg: int = _BS_DEG) -> np.ndarray:
-    """Nodi clamped uniformi per n poli di grado deg (vettore completo)."""
+    """Uniform clamped knots for n poles of degree deg (full vector)."""
     inner = np.linspace(t0, t1, n - deg + 1)
     return np.concatenate([np.full(deg, t0), inner, np.full(deg, t1)])
 
 
 def _bs_basis(t: np.ndarray, kv: np.ndarray, n: int, deg: int = _BS_DEG) -> np.ndarray:
-    """Matrice (len(t), n) delle basi B-spline (ricorrenza di Cox-de Boor)."""
+    """(len(t), n) matrix of B-spline basis functions (Cox-de Boor recurrence)."""
     t = np.clip(np.asarray(t, float), kv[0], kv[-1])
     N = np.zeros((len(t), n + deg))
     idx = np.clip(np.searchsorted(kv, t, side="right") - 1, deg, n - 1)
@@ -2064,7 +2085,7 @@ def _bs_basis(t: np.ndarray, kv: np.ndarray, n: int, deg: int = _BS_DEG) -> np.n
 
 
 def _bs_greville(kv: np.ndarray, n: int, deg: int = _BS_DEG) -> np.ndarray:
-    """Ascisse di Greville: coi poli messi li' la B-spline riproduce t."""
+    """Greville abscissae: with the poles placed there the B-spline reproduces t."""
     return np.array([kv[i + 1 : i + deg + 1].mean() for i in range(n)])
 
 
@@ -2079,13 +2100,13 @@ def _d2_matrix(n: int) -> np.ndarray:
 
 @dataclass
 class FreeForm:
-    """Campo di altezze B-spline su un piano: S(u,v) = C + uX + vY + h(u,v)Z."""
+    """B-spline height field over a plane: S(u,v) = C + uX + vY + h(u,v)Z."""
 
     C: np.ndarray
     X: np.ndarray
     Y: np.ndarray
     Z: np.ndarray
-    poles: np.ndarray  # (nu, nv): altezze dei poli
+    poles: np.ndarray  # (nu, nv): pole heights
     ku: np.ndarray
     kv: np.ndarray
 
@@ -2111,12 +2132,12 @@ class FreeForm:
 
     def dist(self, P: np.ndarray) -> np.ndarray:
         """
-        Distanza PERPENDICOLARE (con segno) dalla superficie.
-        ⚠️ Lo scarto lungo Z andrebbe bene solo per una macchia piatta: su una
-        striscia inclinata di 70 gradi sovrastima di tre volte, e un confronto
-        fra due superfici misurate cosi' non vuol dire niente. Si corregge col
-        coseno della pendenza locale, che e' esatto al primo ordine - e a noi
-        servono i micron su pendenze che cambiano piano.
+        (Signed) PERPENDICULAR distance from the surface.
+        ⚠️ The deviation along Z would only be fine for a flat patch: on a
+        strip tilted 70 degrees it overestimates threefold, and a
+        comparison between two surfaces measured that way means nothing.
+        It's corrected with the cosine of the local slope, which is exact
+        to first order - and we need microns on slopes that change plane.
         """
         d = np.atleast_2d(P) - self.C
         u, v = d @ self.X, d @ self.Y
@@ -2131,7 +2152,7 @@ class FreeForm:
         return n / np.maximum(np.linalg.norm(n, axis=1), 1e-12)[:, None]
 
     def geom(self):
-        """Geom_BSplineSurface con la STESSA parametrizzazione (poli sulle Greville)."""
+        """Geom_BSplineSurface with the SAME parametrization (poles at the Greville points)."""
         nu, nv = self.poles.shape
         gu = _bs_greville(self.ku, nu)
         gv = _bs_greville(self.kv, nv)
@@ -2156,9 +2177,9 @@ class FreeForm:
 
 
 def _free_tame(ff: "FreeForm", x, y, z, ngrid: int = 25) -> bool:
-    """La superficie non si impenna FRA i dati: si campiona una griglia e si
-    guardano solo i nodi che hanno dati vicini (fuori dalla macchia la spline
-    e' libera di andare dove vuole, li' non la usa nessuno)."""
+    """The surface doesn't rear up BETWEEN the data points: a grid is
+    sampled and only the nodes with nearby data are checked (outside the
+    patch the spline is free to go wherever, nobody uses it there)."""
     ex, ey = float(np.ptp(x)), float(np.ptp(y))
     hz = float(np.ptp(z))
     gx = np.linspace(x.min(), x.max(), ngrid)
@@ -2176,21 +2197,22 @@ def _free_tame(ff: "FreeForm", x, y, z, ngrid: int = 25) -> bool:
 
 def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.ndarray] = None, check_tol: Optional[float] = None, max_tilt_deg: float = 70.0) -> Optional[Prim]:
     """
-    B-spline ai minimi quadrati su una nuvola di punti con normali.
+    Least-squares B-spline over a point cloud with normals.
 
-    tol       : scarto massimo ammesso sui VERTICI della mesh.
-    check     : punti INTERNI alle faccette (baricentri e punti medi dei lati).
-    check_tol : quanto possono stare lontani.
+    tol       : maximum deviation allowed on the mesh's VERTICES.
+    check     : points INSIDE the facets (centroids and side midpoints).
+    check_tol : how far those are allowed to be.
 
-    ⚠️ SUI VERTICI NON SI CAPISCE NIENTE. Una B-spline con abbastanza poli
-    passa per tutti i vertici e fra un vertice e l'altro fa quello che vuole:
-    su una macchia di test4, 19x17 poli danno 9e-05 sui vertici e 7.6e-02
-    (settantacinque volte la tolleranza) in mezzo. Le due manopole sono la
-    FITTEZZA della rete e la REGOLARIZZAZIONE, e non vanno nella stessa
-    direzione: piu' poli avvicinano i vertici e fanno ondeggiare, piu'
-    regolarizzazione liscia e allontana. Qui si provano tutte e due e si tiene
-    la combinazione che passa l'esame anche NEGLI SPAZI VUOTI, la piu' rada
-    possibile. Se nessuna passa si torna None: meglio tassellato che inventato.
+    ⚠️ THE VERTICES TELL YOU NOTHING. A B-spline with enough poles passes
+    through every vertex and does whatever it wants between one vertex and
+    the next: on a test4 patch, 19x17 poles give 9e-05 on the vertices and
+    7.6e-02 (seventy-five times the tolerance) in between. The two knobs
+    are the grid's DENSITY and the REGULARIZATION, and they don't pull the
+    same way: more poles bring the vertices closer and make it wobble, more
+    regularization smooths and pushes it away. Here both are tried and the
+    combination that passes the test even IN THE EMPTY SPACES is kept, the
+    sparsest one possible. If none passes, None is returned: better
+    tessellated than invented.
     """
     P = np.unique(np.round(np.asarray(P, float), 9), axis=0)
     if len(P) < 30:
@@ -2204,7 +2226,7 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
         Z = -Z
     ct = Nrep @ Z
     if float(np.quantile(ct, 0.02)) < math.cos(math.radians(max_tilt_deg)):
-        return None  # la macchia si ripiega
+        return None  # the patch folds back on itself
     X, Y = ortho_frame(Z)
     C = P.mean(axis=0)
     d = P - C
@@ -2215,11 +2237,11 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
     x0, x1 = x.min() - 0.06 * ex, x.max() + 0.06 * ex
     y0, y1 = y.min() - 0.06 * ey, y.max() + 0.06 * ey
     nmax2 = max(16, len(P) // 2)
-    # ⚠️ LA RETE VA PROPORZIONATA ALLA MACCHIA. Una griglia QUADRATA su una
-    # striscia 1.4 x 4.3 mm mette i poli a 0.16 mm attraverso, dove i dati
-    # stanno a 0.3: sotto-determinata, e la spline ondeggia. Con le celle
-    # quadrate - stessi gradi di liberta', distribuiti bene - la stessa
-    # macchia si fitta a 2.6e-04 senza un'onda.
+    # ⚠️ THE GRID MUST BE SCALED TO THE PATCH. A SQUARE grid on a 1.4 x 4.3
+    # mm strip puts the poles 0.16 mm apart crosswise, where the data sits
+    # 0.3 mm apart: under-determined, and the spline wobbles. With square
+    # cells - same degrees of freedom, well distributed - the same patch
+    # fits to 2.6e-04 with no wave.
     rat = math.sqrt(max(ex, 1e-9) / max(ey, 1e-9))
     best = None
     for n in (5, 7, 9, 11, 14, 18):
@@ -2268,20 +2290,22 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
 
 def normal_deviation(prim: Prim, P: np.ndarray, Nrep: np.ndarray) -> float:
     """
-    Scarto angolare medio (gradi) fra le normali delle facce e la normale che
-    la primitiva prevede nei loro baricentri.
+    Mean angular deviation (degrees) between the faces' normals and the
+    normal the primitive predicts at their centroids.
 
-    ⚠️ E' IL DISCRIMINANTE PRINCIPALE, piu' della distanza dei punti.
-    Esempio reale: una parete di foro tassellata in strisce alte quanto tutto
-    il pezzo ha i vertici solo sui due bordi. Quei punti giacciono ESATTAMENTE
-    sia su un cilindro sia su una sfera (r = sqrt(50^2+250^2)), e il residuo
-    posizionale non sa decidere: vince il rumore in virgola mobile. Le normali
-    invece sono orizzontali, mentre la sfera le vorrebbe inclinate di 79 gradi.
+    ⚠️ THIS IS THE MAIN DISCRIMINANT, more than the points' distance.
+    Real example: a hole wall tessellated in strips as tall as the whole
+    part has vertices only on the two edges. Those points lie EXACTLY on
+    both a cylinder and a sphere (r = sqrt(50^2+250^2)), and the
+    positional residual can't decide: floating-point noise wins. The
+    normals, though, are horizontal, while the sphere would want them
+    tilted 79 degrees.
 
-    ⚠️ Si valuta sui VERTICI, non sul baricentro della faccia. Nel caso sopra
-    il baricentro della striscia cade sull'equatore della sfera, dove anche la
-    sfera ha normale orizzontale: il confronto li' non distingue nulla. Sui
-    vertici (ai due bordi) la sfera sbaglia di 79 gradi e viene scartata.
+    ⚠️ It's evaluated on the VERTICES, not the face's centroid. In the
+    case above, the strip's centroid falls on the sphere's equator, where
+    the sphere's normal is also horizontal: the comparison there
+    distinguishes nothing. On the vertices (at the two edges) the sphere
+    is off by 79 degrees and gets rejected.
     """
     if len(P) == 0:
         return 0.0
@@ -2292,13 +2316,13 @@ def normal_deviation(prim: Prim, P: np.ndarray, Nrep: np.ndarray) -> float:
 
 def rank_primitives(P, Nrep, N, W, allow_sphere=True, allow_cone=True, flat_slope: float = 1e-3, max_ndev: float = 25.0, allow_torus: bool = True) -> List[Prim]:
     """
-    Tutte le primitive plausibili, ORDINATE per residuo (penalita' progressiva
-    per preferire i modelli piu' semplici).
+    All plausible primitives, SORTED by residual (progressive penalty to
+    prefer the simpler models).
 
-    ⚠️ Ritorna una LISTA, non il solo vincitore. Su un intorno piccolo il
-    residuo e' quasi identico per primitive diverse: una parete di foro puo'
-    sembrare una sfera. Se la prima scelta cresce male, il chiamante deve
-    poter ripiegare sulla seconda invece di sprecare le facce.
+    ⚠️ Returns a LIST, not just the winner. On a small neighborhood the
+    residual is nearly identical for different primitives: a hole wall can
+    look like a sphere. If the first choice grows badly, the caller must
+    be able to fall back to the second instead of wasting the faces.
     """
     cands = []
     pl = fit_plane(P)
@@ -2307,8 +2331,8 @@ def rank_primitives(P, Nrep, N, W, allow_sphere=True, allow_cone=True, flat_slop
     ax = fit_axial(P, N, W)
     span_ = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
     if ax is None or ax.rms > 1e-4 * span_:
-        # fascia sottile: l'asse dalle normali e' degenere, si prova quello
-        # di rivoluzione (vedi fit_axial_rev)
+        # thin band: the axis from the normals is degenerate, try the
+        # revolution one instead (see fit_axial_rev)
         alt = fit_axial_rev(P, Nrep, np.ones(len(P)))
         if alt is not None and (ax is None or alt.rms < ax.rms):
             ax = alt
@@ -2322,11 +2346,11 @@ def rank_primitives(P, Nrep, N, W, allow_sphere=True, allow_cone=True, flat_slop
         sp = fit_sphere(P)
         if sp:
             cands.append((sp.rms * 1.10, sp))
-    # ⚠️ il toro va fittato sui punti, non sulle facce: servono le normali
-    #    ripetute per vertice (Nrep), non una per faccia.
+    # ⚠️ the torus must be fitted on points, not faces: it needs the
+    #    per-vertex repeated normals (Nrep), not one per face.
     tr = fit_torus(P, Nrep, np.ones(len(P))) if allow_torus else None
     if tr:
-        cands.append((tr.rms * 1.25, tr))  # penalita': vince solo se serve
+        cands.append((tr.rms * 1.25, tr))  # penalty: only wins if it must
     keep = []
     for sc, pr in cands:
         nd = normal_deviation(pr, P, Nrep)
@@ -2336,7 +2360,7 @@ def rank_primitives(P, Nrep, N, W, allow_sphere=True, allow_cone=True, flat_slop
     return [c[1] for c in keep]
 
 
-_ALIVE: List[object] = []  # builder OCC da tenere vivi (SWIG/pybind: riferimenti)
+_ALIVE: List[object] = []  # OCC builders to keep alive (SWIG/pybind: references)
 
 
 def _keep(obj):
@@ -2346,22 +2370,23 @@ def _keep(obj):
 
 _EDGE_ERR = (
     "ok",
-    "proiezione del punto fallita",
-    "parametro fuori intervallo",
-    "punti diversi su curva chiusa",
-    "parametro infinito",
-    "punto e parametro incoerenti",
-    "retta per punti coincidenti",
+    "point projection failed",
+    "parameter out of range",
+    "different points on a closed curve",
+    "infinite parameter",
+    "inconsistent point and parameter",
+    "line through coincident points",
 )
 
 
 def _mk_vertex(p: np.ndarray, tol: float):
     """
-    Vertice con tolleranza ESPLICITA.
-    BRepBuilderAPI_MakeVertex usa Precision::Confusion() = 1e-7 mm. I nodi
-    ricalcolati stanno sulle curve a meno del rumore della mesh (~1e-5 mm su un
-    pezzo da 500 mm): con 1e-7 ogni MakeEdge fallisce con "punto e parametro
-    incoerenti". La tolleranza va dimensionata sullo scarto vero.
+    Vertex with an EXPLICIT tolerance.
+    BRepBuilderAPI_MakeVertex uses Precision::Confusion() = 1e-7 mm. The
+    recomputed nodes sit on the curves within the mesh's noise (~1e-5 mm on
+    a 500 mm part): with 1e-7, every MakeEdge fails with "inconsistent
+    point and parameter". The tolerance has to be sized to the real
+    deviation.
     """
     v = TopoDS_Vertex()
     BRep_Builder().MakeVertex(v, _mk_pnt(p), float(max(tol, 1e-7)))
@@ -2372,7 +2397,7 @@ def _mk_dir(v: np.ndarray):
     v = np.asarray(v, dtype=float)
     n = np.linalg.norm(v)
     if n < 1e-12:
-        raise ValueError("direzione nulla")
+        raise ValueError("null direction")
     v = v / n
     return gp_Dir(float(v[0]), float(v[1]), float(v[2]))
 
@@ -2382,27 +2407,28 @@ def _mk_pnt(p: np.ndarray):
     return gp_Pnt(float(p[0]), float(p[1]), float(p[2]))
 
 
-# --- 5C.1  raffinamento non lineare delle primitive (Levenberg-Marquardt) ----
+# --- 5C.1  nonlinear primitive refinement (Levenberg-Marquardt) ---------------
 #
-# ⚠️ E' QUI CHE NASCEVA IL DISASTRO PRECEDENTE.
-# Il fit algebrico (covarianza delle normali + Taubin) e' solo un INNESCO: su
-# un arco di 90 gradi sbaglia il raggio di 0.1 mm e l'asse di 1e-4 rad. Con
-# quell'errore il cilindro non e' piu' tangente al piano e ogni booleana
-# degenera. La minimizzazione vera della distanza ortogonale porta il residuo
-# al livello del rumore della mesh (1e-5 mm), cioe' al valore nominale esatto.
+# ⚠️ THIS IS WHERE THE PREVIOUS DISASTER USED TO COME FROM.
+# The algebraic fit (normals' covariance + Taubin) is only a SEED: on a
+# 90-degree arc it gets the radius wrong by 0.1 mm and the axis by 1e-4
+# rad. With that error the cylinder is no longer tangent to the plane and
+# every boolean degenerates. The true minimization of the orthogonal
+# distance brings the residual down to the mesh's noise level (1e-5 mm),
+# i.e. the exact nominal value.
 
 LM_MAX_PTS = 900
-LM_MAX_SLOPE = 3.0  # = max_slope dei fitter: atan(3) = 71.6 gradi
+LM_MAX_SLOPE = 3.0  # = the fitters' max_slope: atan(3) = 71.6 degrees
 
 
 def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters: int = 80) -> "Prim":
-    """Minimizza la distanza ortogonale punti-superficie. Ritorna una Prim nuova."""
+    """Minimizes the orthogonal points-to-surface distance. Returns a new Prim."""
     if prim is None or len(P) < 4:
         return prim
     if prim.kind == PLANE:
-        return prim  # SVD e' gia' ottimale per il piano
+        return prim  # SVD is already optimal for the plane
     P_all = P
-    if len(P) > LM_MAX_PTS:  # su regioni enormi il campione basta
+    if len(P) > LM_MAX_PTS:  # on huge regions the sample is enough
         sel = np.linspace(0, len(P) - 1, LM_MAX_PTS).astype(int)
         P = P[sel]
         if W is not None:
@@ -2488,17 +2514,17 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
             break
 
     out = build(x)
-    # ⚠️ IL LM PUO' SCAPPARE VERSO IL CONO DEGENERE, e lo script moriva.
-    # Il residuo di un cono e'  (rho - r0 - s*t) / hypot(1, s):  per s -> oo il
-    # cono diventa un PIANO e il costo continua a scendere, quindi il minimo
-    # non e' dove ci si aspetta. Su test9 il LM e' arrivato a s = 77.8
-    # (semiangolo 89.26 gradi) con raggio di riferimento NEGATIVO (-0.81); OCC
-    # si rifiuta di costruire una Geom_ConicalSurface con raggio < 0 e alzava
-    # Standard_ConstructionError, che nessuno catturava: fine della corsa e di
-    # tutto il lavoro gia' fatto. I fitter cercano il cono dentro
-    # |pendenza| <= max_slope con raggio positivo: il raffinamento non ha
-    # nessun diritto di uscire da quella finestra. Se esce, il raffinamento
-    # e' da buttare, non la primitiva di partenza.
+    # ⚠️ LM CAN RUN AWAY TOWARD THE DEGENERATE CONE, and the script used to
+    # die. A cone's residual is  (rho - r0 - s*t) / hypot(1, s):  as s -> oo
+    # the cone becomes a PLANE and the cost keeps dropping, so the minimum
+    # isn't where you'd expect. On test9, LM reached s = 77.8 (semi-angle
+    # 89.26 degrees) with a NEGATIVE reference radius (-0.81); OCC refuses
+    # to build a Geom_ConicalSurface with radius < 0 and raised
+    # Standard_ConstructionError, which nothing caught: end of the run and
+    # of all the work already done. The fitters search for the cone within
+    # |slope| <= max_slope with a positive radius: the refinement has no
+    # right to leave that window. If it does, the refinement gets thrown
+    # away, not the starting primitive.
     if out is not None and out.kind == AXIAL and out.slope != 0.0:
         if not (np.isfinite(out.r0) and np.isfinite(out.slope) and out.r0 > 1e-9 and abs(out.slope) <= LM_MAX_SLOPE):
             out = prim
@@ -2525,25 +2551,25 @@ def _refit(region, verts, norms, areas, kind) -> Optional[Prim]:
     return fit_axial(P, N[ok], W[ok])
 
 
-# --- 5.7  segmentazione completa --------------------------------------------
+# --- 5.7  full segmentation ----------------------------------------------------
 
 
 def refit_exact(faces_idx, verts, norms, areas, kind) -> Optional["Prim"]:
-    """_refit() seguito dal raffinamento LM."""
+    """_refit() followed by the LM refinement."""
     p = _refit(set(faces_idx), verts, norms, areas, kind)
     P = np.vstack([verts[i] for i in faces_idx])
     Wt = np.concatenate([np.full(len(verts[i]), max(areas[i], 1e-12) / max(len(verts[i]), 1)) for i in faces_idx])
     q = lm_refine(p, P, Wt) if p is not None else None
-    # ⚠️ seconda strada per cilindri e coni: se il fit dalle normali e' assente
-    # o scadente (fascia sottile, normali su un arco corto) si riprova con
-    # l'asse di rivoluzione, che su quelle fasce e' l'unico che tiene.
+    # ⚠️ second path for cylinders and cones: if the normals-based fit is
+    # missing or poor (thin band, normals on a short arc), retry with the
+    # revolution axis, which on those bands is the only one that holds up.
     if kind == AXIAL:
         span = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) or 1.0
         dq = float(np.abs(q.dist(P)).max()) if q is not None else math.inf
-        # ⚠️ soglia larga apposta: la seconda strada costa una SVD e un LM in
-        # piu' per ogni fit, e serve solo quando il primo e' andato male
-        # davvero (sulle fasce sottili sbaglia di un centesimo, non di un
-        # micron). Con 1e-5 si pagava il doppio su ogni pezzo.
+        # ⚠️ deliberately wide threshold: the second path costs an extra SVD
+        # and LM per fit, and is only needed when the first one really went
+        # wrong (on thin bands it's off by a hundredth, not a micron). At
+        # 1e-5 every part paid double.
         if dq > 1e-4 * span:
             Nr = np.vstack([np.tile(norms[i], (len(verts[i]), 1)) for i in faces_idx])
             r = fit_axial_rev(P, Nr, Wt)
@@ -2553,11 +2579,11 @@ def refit_exact(faces_idx, verts, norms, areas, kind) -> Optional["Prim"]:
                     q = r
     if q is None:
         return None
-    # ⚠️ CONICITA' SOTTO IL RUMORE: un foro alesato esce spesso come cono con
-    # rastremazione di qualche centesimo di micron (ø7.9999-8.0000). Diventa
-    # una CONICAL_SURFACE invece di una CYLINDRICAL_SURFACE, e la faccia si
-    # comporta male con i vicini. Se la variazione di raggio lungo la regione
-    # non supera il residuo del fit, e' rumore: si azzera.
+    # ⚠️ TAPER BELOW THE NOISE: a reamed hole often comes out as a cone with
+    # a taper of a few hundredths of a micron (ø7.9999-8.0000). It becomes
+    # a CONICAL_SURFACE instead of a CYLINDRICAL_SURFACE, and the face
+    # misbehaves with its neighbors. If the radius variation along the
+    # region doesn't exceed the fit's residual, it's noise: zeroed out.
     if q is not None and q.kind == AXIAL and q.slope != 0.0:
         t = (P - q.center) @ q.axis
         span = float(t.max() - t.min())
@@ -2569,33 +2595,36 @@ def refit_exact(faces_idx, verts, norms, areas, kind) -> Optional["Prim"]:
     return q
 
 
-# --- 5C.1b  estrazione GLOBALE delle primitive (RANSAC alla Schnabel) --------
+# --- 5C.1b  GLOBAL primitive extraction (Schnabel-style RANSAC) ---------------
 #
-# ⚠️ PERCHE' SERVE, E PERCHE' NON BASTA FAR CRESCERE DAI SEMI.
-# La crescita da seme decide il tipo di primitiva guardando due anelli di
-# triangoli e poi si porta dietro quella scelta. Su un pezzo vero produce
-# decine di regioni minuscole (cilindri da 3-5 facce con copertura del 3%):
-# sono le "zone troppo dense" che si vedono nel modello convertito.
-# Il RANSAC globale ragiona al contrario: propone una primitiva da un pugno di
-# facce vicine e poi conta QUANTE facce dell'intero pezzo la sostengono. Vince
-# la primitiva col supporto piu' grande, che per costruzione e' quella grande e
-# vera, non il frammento. E' l'idea alla base di CGAL Shape Detection
-# (Efficient RANSAC di Schnabel), qui in numpy per non aggiungere dipendenze.
+# ⚠️ WHY IT'S NEEDED, AND WHY GROWING FROM SEEDS ISN'T ENOUGH.
+# Seed growth decides the primitive's type by looking at two rings of
+# triangles and then carries that choice forward. On a real part it
+# produces dozens of tiny regions (3-5-facet cylinders with 3% coverage):
+# these are the "overly dense zones" you see in the converted model.
+# Global RANSAC reasons the other way around: it proposes a primitive from
+# a handful of nearby faces and then counts HOW MANY faces of the whole
+# part support it. The primitive with the biggest support wins, which by
+# construction is the large, true one, not the fragment. It's the idea
+# behind CGAL Shape Detection (Schnabel's Efficient RANSAC), here in numpy
+# to avoid adding dependencies.
 
 
 def refit_best(faces_idx, verts, norms, areas, current_kind: Optional[str] = None) -> Optional["Prim"]:
     """
-    Rimette in discussione il TIPO di primitiva, non solo i suoi parametri.
+    Reopens the question of the primitive's TYPE, not just its parameters.
 
-    ⚠️ E' LA RAGIONE PER CUI I RACCORDI TONDI RESTAVANO TASSELLATI.
-    Il tipo viene scelto sul SEME, cioe' su due anelli di triangoli: la' piano,
-    cilindro, sfera e toro si equivalgono e vince quasi sempre il piu' semplice.
-    Poi la regione cresce fino a diventare una fascia toroidale di 300 facce...
-    e continua a essere rifittata COME SFERA, perche' _refit conserva il kind.
-    Il residuo resta cento volte sopra il gate, la purga la sbriciola a ogni
-    passata e quelle facce non diventano mai una superficie.
-    Qui, a regione cresciuta, si riprovano TUTTI i tipi e si tiene il migliore
-    (con penalita' di complessita': a parita' di residuo vince il piu' semplice).
+    ⚠️ THIS IS WHY ROUND FILLETS STAYED TESSELLATED.
+    The type is chosen at the SEED, i.e. on two rings of triangles: there,
+    plane, cylinder, sphere and torus are all equivalent and the simplest
+    one almost always wins. Then the region grows into a 300-facet
+    toroidal band... and keeps getting refitted AS A SPHERE, because
+    _refit preserves the kind. The residual stays a hundred times above
+    the gate, the purge crumbles it every pass and those facets never
+    become a surface.
+    Here, once the region has grown, ALL types are tried again and the
+    best one is kept (with a complexity penalty: at equal residual the
+    simpler one wins).
     """
     idx = list(faces_idx)
     if len(idx) < 3:
@@ -2633,27 +2662,27 @@ def refit_best(faces_idx, verts, norms, areas, current_kind: Optional[str] = Non
             continue
         d = p2.dist(P)
         rms = float(np.sqrt(np.mean(d**2)))
-        # piccolo bonus a chi era gia' il tipo scelto: evita oscillazioni
+        # small bonus for whatever was already the chosen type: avoids oscillation
         s = rms * pen * (0.95 if p2.kind == current_kind else 1.0)
         if s < bs:
             best, bs = p2, s
     return best
 
 
-# --- 5C.2b  fusione delle regioni co-superficie ------------------------------
+# --- 5C.2b  merging co-surface regions -----------------------------------------
 #
-# ⚠️ SENZA QUESTO IL MODELLO SI SPACCA. La crescita parte da semi diversi e un
-# raccordo lungo finisce spesso in DUE regioni con la stessa identica primitiva.
-# Diventerebbero due facce cilindriche sovrapposte separate da uno spigolo
-# inesistente. Qui le regioni adiacenti che giacciono sulla STESSA superficie
-# vengono riunite e rifittate.
+# ⚠️ WITHOUT THIS THE MODEL FALLS APART. Growth starts from different seeds
+# and a long fillet often ends up as TWO regions with the exact same
+# primitive. They'd become two overlapping cylindrical faces separated by
+# a nonexistent edge. Here, neighboring regions lying on the SAME surface
+# are merged and refitted.
 
 
 def prims_same(pa: "Prim", pb: "Prim", tol_len: float, cos_ang: float) -> bool:
     if pa is None or pb is None or pa.kind != pb.kind:
         return False
     if pa.kind == FREE:
-        return False  # due forme libere non si fondono mai a occhio
+        return False  # two free-form shapes never merge on sight
     if pa.kind == PLANE:
         if float(pa.axis @ pb.axis) < cos_ang:
             return False
@@ -2674,7 +2703,7 @@ def prims_same(pa: "Prim", pb: "Prim", tol_len: float, cos_ang: float) -> bool:
 
 
 # =============================================================================
-# 6. CURVE ANALITICHE e intersezioni superficie-superficie
+# 6. ANALYTIC CURVES and surface-surface intersections
 # =============================================================================
 class _Curve:
     period = None
@@ -2708,7 +2737,7 @@ class CLine(_Curve):
         return Geom_Line(_mk_pnt(self.p), _mk_dir(self.d))
 
     def label(self):
-        return "retta"
+        return "line"
 
 
 @dataclass
@@ -2733,15 +2762,15 @@ class CCircle(_Curve):
         return Geom_Circle(ax2, float(self.r))
 
     def label(self):
-        return f"cerchio r={self.r:.4f}"
+        return f"circle r={self.r:.4f}"
 
 
 @dataclass
 class CEllipse(_Curve):
     c: np.ndarray
     n: np.ndarray
-    u: np.ndarray  # asse MAGGIORE
-    v: np.ndarray  # asse minore
+    u: np.ndarray  # MAJOR axis
+    v: np.ndarray  # minor axis
     a: float
     b: float
     period = 2.0 * math.pi
@@ -2759,22 +2788,22 @@ class CEllipse(_Curve):
         return Geom_Ellipse(ax2, float(self.a), float(self.b))
 
     def label(self):
-        return f"ellisse {self.a:.4f}x{self.b:.4f}"
+        return f"ellipse {self.a:.4f}x{self.b:.4f}"
 
 
 @dataclass
 class CHyperbola(_Curve):
     """
-    Ramo di iperbole, parametrizzato come Geom_Hyperbola:
+    Hyperbola branch, parametrized like Geom_Hyperbola:
         P(t) = c + a*cosh(t)*u + b*sinh(t)*v
-    `u` punta al VERTICE del ramo rappresentato (l'altro ramo e' la stessa
-    curva con u cambiato di segno).  Non e' periodica.
+    `u` points toward the VERTEX of the represented branch (the other
+    branch is the same curve with u flipped in sign). Not periodic.
     """
 
     c: np.ndarray
     n: np.ndarray
-    u: np.ndarray  # asse trasverso, verso il vertice
-    v: np.ndarray  # asse coniugato
+    u: np.ndarray  # transverse axis, toward the vertex
+    v: np.ndarray  # conjugate axis
     a: float
     b: float
     period = None
@@ -2783,10 +2812,10 @@ class CHyperbola(_Curve):
         P = np.atleast_2d(P)
         d = P - self.c
         t = np.arcsinh((d @ self.v) / max(self.b, 1e-12))
-        # ⚠️ il punto piu' vicino NON e' quello con la stessa ordinata: su un
-        # ramo ripido la differenza vale decine di micron, cioe' piu' della
-        # tolleranza con cui si giudica la curva. Tre passi di Newton su
-        # (P - S(t)) . S'(t) = 0 bastano e non costano nulla.
+        # ⚠️ the closest point is NOT the one with the same ordinate: on a
+        # steep branch the difference is tens of microns, i.e. more than
+        # the tolerance the curve is judged by. Three Newton steps on
+        # (P - S(t)) . S'(t) = 0 are enough and cost nothing.
         for _ in range(3):
             ch, sh = np.cosh(t), np.sinh(t)
             S = self.c + (self.a * ch)[:, None] * self.u + (self.b * sh)[:, None] * self.v
@@ -2808,7 +2837,7 @@ class CHyperbola(_Curve):
         return Geom_Hyperbola(ax2, float(self.a), float(self.b))
 
     def label(self):
-        return f"iperbole {self.a:.4f}x{self.b:.4f}"
+        return f"hyperbola {self.a:.4f}x{self.b:.4f}"
 
 
 def _hyperbola(c, n, u, a: float, b: float) -> Optional[CHyperbola]:
@@ -2834,10 +2863,11 @@ def _circle(c, n, r) -> CCircle:
 
 def _ellipse(c, n, u, a: float, b: float) -> Optional[CEllipse]:
     """
-    ⚠️ Ortonormalizzazione OBBLIGATORIA prima di costruire l'ellisse.
-    Geom_Ellipse pretende asse maggiore >= minore e ricava Y = Z x X: se il
-    versore minore passato qui fosse l'opposto, il parametro Python e quello
-    OCC avrebbero segno opposto e il trim prenderebbe l'arco sbagliato.
+    ⚠️ Orthonormalization is MANDATORY before building the ellipse.
+    Geom_Ellipse requires the major axis >= minor and derives Y = Z x X: if
+    the minor unit vector passed here were the opposite one, the Python
+    parameter and OCC's would have opposite signs and the trim would take
+    the wrong arc.
     """
     n = np.asarray(n, float)
     nn = np.linalg.norm(n)
@@ -2856,20 +2886,21 @@ def _ellipse(c, n, u, a: float, b: float) -> Optional[CEllipse]:
     return CEllipse(np.asarray(c, float), n, u, np.cross(n, u), float(a), float(b))
 
 
-# --- 5C.6a  il cono: sezioni piane e cerchi coassiali ------------------------
-# ⚠️ IL CONO ERA IL BUCO NERO DELLE INTERSEZIONI. Fino a qui l'unica sezione
-# calcolata era cono x piano ORTOGONALE all'asse (un cerchio). Ma una svasatura
-# o uno smusso conico confina quasi sempre con qualcos'altro: il foro che
-# svasa (cilindro coassiale), il raccordo che lo chiude (toro coassiale), la
-# parete di un'asola che lo taglia (piano PARALLELO all'asse -> iperbole), una
-# faccia inclinata (piano obliquo -> ellisse). Senza queste curve il bordo
-# restava la spezzata della mesh, e quando il ripiego "curva per i vertici"
-# inventava un cerchio fuori dal cono la faccia usciva SelfIntersectingWire e
-# la svasatura tornava tassellata.
+# --- 5C.6a  the cone: planar sections and coaxial circles ---------------------
+# ⚠️ THE CONE USED TO BE THE BLACK HOLE OF INTERSECTIONS. Until now the only
+# section computed was cone x plane ORTHOGONAL to the axis (a circle). But
+# a countersink or a conical chamfer almost always borders something else:
+# the counterbore it flares from (coaxial cylinder), the fillet that
+# closes it off (coaxial torus), a slot's wall cutting across it (plane
+# PARALLEL to the axis -> hyperbola), a tilted face (oblique plane ->
+# ellipse). Without these curves the boundary stayed the mesh's polyline,
+# and when the "circle through the vertices" fallback invented a circle
+# outside the cone, the face came out SelfIntersectingWire and the
+# countersink went back to being tessellated.
 
 
 def _cone_frame(cone: "Prim"):
-    """(apice, asse orientato verso l'apertura, semiangolo) del cono."""
+    """(apex, axis oriented toward the opening, semi-angle) of the cone."""
     a = cone.axis / np.linalg.norm(cone.axis)
     sg = 1.0 if cone.slope > 0 else -1.0
     a = sg * a
@@ -2880,13 +2911,15 @@ def _cone_frame(cone: "Prim"):
 
 def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"]:
     """
-    Sezione di un cono con un piano qualunque: cerchio, ellisse o iperbole.
-    Nel piano, con origine nella proiezione dell'apice e x lungo la proiezione
-    dell'asse, la conica e'   (sin^2(psi) - cos^2(alpha)) x^2 - cos^2(alpha) y^2
-                              + 2 D cos(psi) sin(psi) x + D^2 (cos^2(psi) - cos^2(alpha)) = 0
-    con psi = angolo fra normale del piano e asse, D = distanza apice-piano.
-    Il segno di (sin^2(psi) - cos^2(alpha)) decide: <0 ellisse, >0 iperbole,
-    ~0 parabola (si lascia perdere: caso di misura nulla, resta la spezzata).
+    Section of a cone with an arbitrary plane: circle, ellipse or
+    hyperbola. In the plane, with the origin at the apex's projection and
+    x along the axis's projection, the conic is
+        (sin^2(psi) - cos^2(alpha)) x^2 - cos^2(alpha) y^2
+        + 2 D cos(psi) sin(psi) x + D^2 (cos^2(psi) - cos^2(alpha)) = 0
+    with psi = angle between the plane's normal and the axis, D =
+    apex-to-plane distance. The sign of (sin^2(psi) - cos^2(alpha))
+    decides: <0 ellipse, >0 hyperbola, ~0 parabola (skipped: a
+    measure-zero case, stays the polyline).
     """
     apex, a, alpha = _cone_frame(cone)
     n = plane.axis / np.linalg.norm(plane.axis)
@@ -2894,14 +2927,14 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
     if n @ a < 0.0:
         n, D = -n, -D
     if abs(D) <= max(10.0 * tol, 1e-9):
-        return []  # piano per l'apice: degenere
+        return []  # plane through the apex: degenerate
     cps = float(n @ a)
     W = n - cps * a
     sps = float(np.linalg.norm(W))
     ca, sa = math.cos(alpha), math.sin(alpha)
     out: List[_Curve] = []
-    P0 = apex + D * n  # piede dell'apice sul piano
-    if sps < 1e-9:  # piano ORTOGONALE -> cerchio
+    P0 = apex + D * n  # apex's foot on the plane
+    if sps < 1e-9:  # ORTHOGONAL plane -> circle
         r = abs(D) * sa / ca
         if r > 10.0 * tol:
             out.append(_circle(P0, n, r))
@@ -2912,7 +2945,7 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
         return []  # parabola
     x0 = -D * cps * sps / A2
     C = P0 + x0 * E1
-    if A2 < 0.0:  # ELLISSE
+    if A2 < 0.0:  # ELLIPSE
         ax = abs(D) * ca * sa / abs(A2)
         ay = abs(D) * sa / math.sqrt(-A2)
         if min(ax, ay) > 10.0 * tol:
@@ -2920,8 +2953,9 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
             if el is not None:
                 out.append(el)
         return out
-    # IPERBOLE: due rami, uno per falda. Si emettono entrambi e sceglie il
-    # residuo sui vertici (il ramo sbagliato sta sull'altra falda, lontano).
+    # HYPERBOLA: two branches, one per nappe. Both are emitted and the
+    # residual on the vertices decides (the wrong branch sits on the other
+    # nappe, far away).
     ax = abs(D) * ca * sa / A2
     ay = abs(D) * sa / math.sqrt(A2)
     if min(ax, ay) <= 10.0 * tol:
@@ -2930,7 +2964,7 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
         hy = _hyperbola(C, n, sgn * E1, ax, ay)
         if hy is None:
             continue
-        # tiene solo il ramo sulla falda REALE del cono (quella coi raggi > 0)
+        # keeps only the branch on the cone's REAL nappe (the one with radii > 0)
         vtx = hy.point(np.array([0.0]))[0]
         if float((vtx - apex) @ a) > 0.0:
             out.append(hy)
@@ -2938,7 +2972,7 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
 
 
 def _coax_t(pa: "Prim", pb: "Prim", tol: float):
-    """Se pb e' coassiale a pa: (t del centro di pb sull'asse di pa, segno assi)."""
+    """If pb is coaxial with pa: (t of pb's center on pa's axis, axes' sign)."""
     a = pa.axis / np.linalg.norm(pa.axis)
     if pb.kind == SPHERE:
         d = pb.center - pa.center
@@ -2959,27 +2993,27 @@ def _coax_t(pa: "Prim", pb: "Prim", tol: float):
 
 def _cone_coax_circles(cone: "Prim", other: "Prim", tol: float) -> List["_Curve"]:
     """
-    Cono x superficie di rivoluzione COASSIALE -> cerchi, nei punti dove i due
-    profili raggio(t) si incontrano.  Copre svasatura-foro, smusso-smusso,
-    smusso-raccordo e smusso-calotta, che sono il pane quotidiano di un pezzo
-    tornito o forato.
+    Cone x COAXIAL surface of revolution -> circles, at the points where the
+    two radius(t) profiles meet. Covers countersink-hole, chamfer-chamfer,
+    chamfer-fillet and chamfer-cap, which are everyday cases on a turned or
+    drilled part.
     """
     co = _coax_t(cone, other, tol)
     if co is None:
         return []
     tc, sg = co
     a = cone.axis / np.linalg.norm(cone.axis)
-    s, r0 = cone.slope, cone.r0  # raggio(t) = r0 + s*t
+    s, r0 = cone.slope, cone.r0  # radius(t) = r0 + s*t
     roots: List[float] = []
     if other.kind == AXIAL:
         s2 = other.slope * sg
-        b0 = other.r0 - s2 * tc  # raggio(t) = b0 + s2*t
+        b0 = other.r0 - s2 * tc  # radius(t) = b0 + s2*t
         den = s - s2
         if abs(den) < 1e-9:
-            return []  # profili paralleli
+            return []  # parallel profiles
         roots.append((b0 - r0) / den)
     elif other.kind in (SPHERE, TORUS):
-        # (K + s t)^2 + (t - tc)^2 = rr^2   con K = r0 - Rmaggiore, rr = raggio
+        # (K + s t)^2 + (t - tc)^2 = rr^2   with K = r0 - Rmajor, rr = radius
         K = r0 if other.kind == SPHERE else r0 - other.r0
         rr = other.r0 if other.kind == SPHERE else other.r1
         qa = s * s + 1.0
@@ -2989,7 +3023,7 @@ def _cone_coax_circles(cone: "Prim", other: "Prim", tol: float) -> List["_Curve"
         if disc < 0.0:
             if disc < -(4.0 * qa * max(tol, 1e-9) * rr):
                 return []
-            disc = 0.0  # tangenza
+            disc = 0.0  # tangency
         sq = math.sqrt(disc)
         roots.append((-qb + sq) / (2.0 * qa))
         if sq > 1e-12:
@@ -3004,26 +3038,26 @@ def _cone_coax_circles(cone: "Prim", other: "Prim", tol: float) -> List["_Curve"
     return out
 
 
-# --- 5C.6  intersezione ESATTA fra due primitive -----------------------------
+# --- 5C.6  EXACT intersection between two primitives ---------------------------
 
 
 def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
     """
-    Curve di intersezione analitiche fra due primitive.
-    Ritorna TUTTE le soluzioni possibili (0, 1 o 2): sara' il confronto con i
-    vertici della mesh a scegliere quella giusta.
+    Analytic intersection curves between two primitives.
+    Returns ALL possible solutions (0, 1 or 2): the comparison against the
+    mesh's vertices will pick the right one.
     """
     if pa is None or pb is None:
         return []
     if pa.kind == FREE or pb.kind == FREE:
-        return []  # forma libera: nessuna curva esatta
+        return []  # free-form: no exact curve
     ka, kb = pa.kind, pb.kind
     if (ka, kb) in ((AXIAL, PLANE), (SPHERE, PLANE), (SPHERE, AXIAL), (TORUS, PLANE), (TORUS, AXIAL), (TORUS, SPHERE)):
         pa, pb = pb, pa
         ka, kb = pa.kind, pb.kind
     out: List[_Curve] = []
     try:
-        # ---------- piano x piano -> retta ----------
+        # ---------- plane x plane -> line ----------
         if ka == PLANE and kb == PLANE:
             d = np.cross(pa.axis, pb.axis)
             nd = np.linalg.norm(d)
@@ -3035,7 +3069,7 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
             p = np.linalg.solve(A, rhs)
             out.append(CLine(p, d))
 
-        # ---------- piano x sfera -> cerchio ----------
+        # ---------- plane x sphere -> circle ----------
         elif ka == PLANE and kb == SPHERE:
             h = float((pb.center - pa.center) @ pa.axis)
             if abs(h) > pb.r0 + tol:
@@ -3045,24 +3079,24 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                 return []
             out.append(_circle(pb.center - h * pa.axis, pa.axis, rr))
 
-        # ---------- piano x cilindro/cono ----------
+        # ---------- plane x cylinder/cone ----------
         elif ka == PLANE and kb == AXIAL:
-            # ⚠️ Nessun ramo esclusivo: si generano TUTTE le interpretazioni
-            # plausibili e sara' il residuo sui vertici a scegliere. Un asse
-            # fittato e' parallelo al piano a meno di 1e-6 rad, mai a meno di
-            # 1e-9: un test rigido sceglierebbe l'ellisse con semiasse di 4e6 mm
-            # al posto della retta di tangenza.
+            # ⚠️ No exclusive branch: ALL plausible interpretations are
+            # generated and the residual on the vertices will choose. A
+            # fitted axis is parallel to the plane to within 1e-6 rad,
+            # never within 1e-9: a rigid test would pick the ellipse with a
+            # 4e6 mm semi-axis instead of the tangency line.
             n, a = pa.axis, pb.axis
             cph = float(a @ n)
-            if abs(cph) > 1.0 - 1e-6:  # piano ORTOGONALE
+            if abs(cph) > 1.0 - 1e-6:  # ORTHOGONAL plane
                 tstar = float((pa.center - pb.center) @ n) / cph
                 r = pb.r0 + pb.slope * tstar
                 if r > 10 * tol:
                     out.append(_circle(pb.center + tstar * a, a, r))
-            if abs(pb.slope) >= 1e-9:  # CONO: conica generica
+            if abs(pb.slope) >= 1e-9:  # CONE: generic conic
                 out += _cone_plane_curves(pb, pa, tol)
             if abs(pb.slope) < 1e-9:
-                if abs(cph) < 1e-2:  # piano ~PARALLELO
+                if abs(cph) < 1e-2:  # ~PARALLEL plane
                     h = float((pb.center - pa.center) @ n)
                     foot = pb.center - h * n
                     w = np.cross(n, a)
@@ -3070,11 +3104,11 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                     if nw > 1e-12 and abs(h) <= pb.r0 * 1.02 + tol:
                         w /= nw
                         s = math.sqrt(max(pb.r0**2 - h**2, 0.0))
-                        out.append(CLine(foot, a))  # TANGENZA
+                        out.append(CLine(foot, a))  # TANGENCY
                         if s > max(tol, 1e-9):
                             out.append(CLine(foot + s * w, a))
                             out.append(CLine(foot - s * w, a))
-                if 1e-9 < abs(cph) < 1.0 - 1e-9:  # piano OBLIQUO
+                if 1e-9 < abs(cph) < 1.0 - 1e-9:  # OBLIQUE plane
                     tstar = float((pa.center - pb.center) @ n) / cph
                     c = pb.center + tstar * a
                     umaj = a - cph * n
@@ -3085,11 +3119,11 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                         if el is not None:
                             out.append(el)
 
-        # ---------- piano x toro ----------
+        # ---------- plane x torus ----------
         elif ka == PLANE and kb == TORUS:
             n, a = pa.axis, pb.axis
             cph = float(a @ n)
-            if abs(cph) > 1.0 - 1e-6:  # piano ORTOGONALE all'asse
+            if abs(cph) > 1.0 - 1e-6:  # plane ORTHOGONAL to the axis
                 t = float((pa.center - pb.center) @ n) / cph
                 if abs(t) <= pb.r1 + tol:
                     s = math.sqrt(max(pb.r1**2 - t**2, 0.0))
@@ -3097,7 +3131,7 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                     for rr in (pb.r0 + s, pb.r0 - s):
                         if rr > 10 * tol:
                             out.append(_circle(ctr, a, rr))
-            elif abs(cph) < 1e-2:  # piano MERIDIANO
+            elif abs(cph) < 1e-2:  # MERIDIAN plane
                 h = float((pb.center - pa.center) @ n)
                 if abs(h) <= max(tol, 1e-6):
                     w = np.cross(n, a)
@@ -3107,23 +3141,23 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                         for sg in (+1.0, -1.0):
                             out.append(_circle(pb.center + sg * pb.r0 * w, n, pb.r1))
 
-        # ---------- cilindro x toro ----------
+        # ---------- cylinder x torus ----------
         elif ka == AXIAL and kb == TORUS:
             if abs(pa.slope) > 1e-9:
                 return _cone_coax_circles(pa, pb, tol)
             d = pb.center - pa.center
             t0 = float(d @ pa.axis)
             off = d - t0 * pa.axis
-            # ⚠️ RACCORDO DRITTO CHE CONTINUA NEL RACCORDO D'ANGOLO: assi
-            # ORTOGONALI, stesso raggio del tubo, asse del cilindro a distanza
-            # R dal centro del toro. Le due superfici sono tangenti lungo il
-            # meridiano del toro: un cerchio di raggio r nel piano ortogonale
-            # all'asse del cilindro passante per il centro del toro. Senza
-            # questo caso il confine restava la scaletta della mesh.
+            # ⚠️ A STRAIGHT FILLET CONTINUING INTO A CORNER FILLET: ORTHOGONAL
+            # axes, same tube radius, cylinder axis at distance R from the
+            # torus center. The two surfaces are tangent along the torus's
+            # meridian: a circle of radius r in the plane orthogonal to the
+            # cylinder's axis, passing through the torus's center. Without
+            # this case the boundary stayed the mesh's staircase.
             if abs(float(pa.axis @ pb.axis)) < 1e-3:
                 rt = pb.r1
                 if abs(pa.r0 - rt) <= max(tol, 1e-3 * pa.r0) and abs(float(np.linalg.norm(off)) - pb.r0) <= max(10.0 * tol, 1e-3 * pb.r0):
-                    cj = pa.center + t0 * pa.axis  # punto dell'asse del cilindro piu' vicino a C
+                    cj = pa.center + t0 * pa.axis  # point of the cylinder's axis closest to C
                     out.append(_circle(cj, pa.axis, pa.r0))
                 return out
             if float(np.linalg.norm(off)) > max(tol, 1e-6):
@@ -3137,7 +3171,7 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
             for sg in (0.0,) if s <= max(tol, 1e-9) else (+1.0, -1.0):
                 out.append(_circle(pa.center + (t0 + sg * s) * pa.axis, pa.axis, pa.r0))
 
-        # ---------- toro x toro (coassiali) -> cerchi ----------
+        # ---------- torus x torus (coaxial) -> circles ----------
         elif ka == TORUS and kb == TORUS:
             if abs(float(pa.axis @ pb.axis)) < 1.0 - 1e-6:
                 return []
@@ -3145,9 +3179,9 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
             t0 = float(d @ pa.axis)
             if float(np.linalg.norm(d - t0 * pa.axis)) > max(tol, 1e-6):
                 return []
-            return []  # quartica: se ne occupa il fit sui punti
+            return []  # quartic: handled by the point-based fit
 
-        # ---------- cilindro x sfera (coassiali) -> cerchi ----------
+        # ---------- cylinder x sphere (coaxial) -> circles ----------
         elif ka == AXIAL and kb == SPHERE:
             if abs(pa.slope) > 1e-9:
                 return _cone_coax_circles(pa, pb, tol)
@@ -3156,9 +3190,9 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
             off = float(np.linalg.norm(d - t0 * pa.axis))
             if off > max(tol, 1e-6):
                 return []
-            # ⚠️ sqrt(rs^2 - rc^2) e' inutilizzabile come test di tangenza:
-            # con rs e rc uguali a meno di 1e-6 mm il radicando e' -8e-6 e il
-            # ramo tangente non scatta mai. Il confronto va fatto sui RAGGI.
+            # ⚠️ sqrt(rs^2 - rc^2) is unusable as a tangency test: with rs
+            # and rc equal to within 1e-6 mm, the radicand is -8e-6 and the
+            # tangent branch never fires. The comparison must be on the RADII.
             dr = pb.r0 - pa.r0
             if abs(dr) <= max(tol, 1e-3 * pa.r0):
                 out.append(_circle(pa.center + t0 * pa.axis, pa.axis, pa.r0))
@@ -3168,7 +3202,7 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                     out.append(_circle(pa.center + (t0 + h) * pa.axis, pa.axis, pa.r0))
                     out.append(_circle(pa.center + (t0 - h) * pa.axis, pa.axis, pa.r0))
 
-        # ---------- sfera x sfera -> cerchio ----------
+        # ---------- sphere x sphere -> circle ----------
         elif ka == SPHERE and kb == SPHERE:
             d = pb.center - pa.center
             dd = float(np.linalg.norm(d))
@@ -3180,19 +3214,19 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                 return []
             out.append(_circle(pa.center + x * (d / dd), d / dd, math.sqrt(max(rr2, 0.0))))
 
-        # ---------- cilindro x cilindro (assi paralleli) -> rette ----------
+        # ---------- cylinder x cylinder (parallel axes) -> lines ----------
         elif ka == AXIAL and kb == AXIAL:
             if abs(pa.slope) > 1e-9 or abs(pb.slope) > 1e-9:
-                # almeno uno e' un cono: coassiali -> cerchi, altrimenti
-                # quartica e se ne occupa il fit sui punti
+                # at least one is a cone: coaxial -> circles, otherwise
+                # quartic, handled by the point-based fit
                 cn, ot = (pa, pb) if abs(pa.slope) > 1e-9 else (pb, pa)
                 return _cone_coax_circles(cn, ot, tol)
             if abs(float(pa.axis @ pb.axis)) < 1.0 - 1e-9:
-                # ⚠️ SPIGOLO VIVO FRA DUE RACCORDI. Dove due raccordi dello
-                # stesso raggio si incontrano senza sfera d'angolo, i due
-                # cilindri hanno assi INCIDENTI: l'intersezione non e' una
-                # quartica ma DUE ELLISSI piane (Steinmetz). Senza questo caso
-                # quello spigolo resta poligonale e la faccia non chiude.
+                # ⚠️ SHARP EDGE BETWEEN TWO FILLETS. Where two fillets of the
+                # same radius meet with no corner sphere, the two cylinders
+                # have INTERSECTING axes: the intersection isn't a quartic
+                # but TWO planar ELLIPSES (Steinmetz). Without this case,
+                # that edge stays polygonal and the face doesn't close.
                 if abs(pa.r0 - pb.r0) > max(tol, 1e-3 * pa.r0):
                     return []
                 a1 = pa.axis
@@ -3252,16 +3286,16 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                 out.append(CLine(base + y * ey, a))
                 out.append(CLine(base - y * ey, a))
     except Exception as e:
-        Log.debug(f"intersezione {ka}x{kb} fallita: {e}")
+        Log.debug(f"intersection {ka}x{kb} failed: {e}")
         return []
     return out
 
 
-# --- 5C.7  fit di ripiego (quando l'intersezione analitica non e' disponibile)
+# --- 5C.7  fallback fit (when the analytic intersection isn't available) ------
 
 
 def fit_curve(P: np.ndarray, tol: float, arc_tol: Optional[float] = None) -> Optional[_Curve]:
-    """Retta o cerchio per i vertici (tol sui vertici, arc_tol sull'arco fra i vertici)."""
+    """Line or circle through the vertices (tol on the vertices, arc_tol on the arc between them)."""
     if arc_tol is None:
         arc_tol = tol
     if len(P) < 2:
@@ -3292,15 +3326,17 @@ def fit_curve(P: np.ndarray, tol: float, arc_tol: Optional[float] = None) -> Opt
 
 def arc_deviation(cv: _Curve, P: np.ndarray, dens: int = 6) -> float:
     """
-    Scarto dell'ARCO PERCORSO dalla spezzata dei vertici, non solo dei vertici.
+    Deviation of the ARC TRAVELED from the vertices' polyline, not just the
+    vertices.
 
-    ⚠️ E' IL CONTROLLO CHE MANCAVA, ED E' LA CAUSA DELLE CURVE CHE SPORGONO.
-    Giudicare una curva solo NEI VERTICI e' come giudicare un ponte guardando i
-    piloni: un'ellisse con semiasse di 889 mm su un pezzo da 49 mm puo' passare
-    esattamente per tutti i vertici di una catena corta e poi, FRA un vertice e
-    l'altro, allontanarsi di millimetri fuori dal pezzo. Qui la curva viene
-    campionata fitta lungo tutto l'arco e confrontata con la spezzata dei
-    vertici: se se ne stacca, e' bocciata.
+    ⚠️ THIS IS THE CHECK THAT WAS MISSING, AND IT'S WHY CURVES USED TO
+    STICK OUT. Judging a curve only AT THE VERTICES is like judging a
+    bridge by looking at the piers: an ellipse with an 889 mm semi-axis on
+    a 49 mm part can pass exactly through every vertex of a short chain and
+    then, BETWEEN one vertex and the next, drift millimeters outside the
+    part. Here the curve is sampled densely along the whole arc and
+    compared against the vertices' polyline: if it strays from it, it's
+    rejected.
     """
     P = np.atleast_2d(P)
     if len(P) < 2:
@@ -3329,9 +3365,9 @@ def arc_deviation(cv: _Curve, P: np.ndarray, dens: int = 6) -> float:
 
 def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 0.0, arc_tol: Optional[float] = None) -> Optional[_Curve]:
     """
-    tol     : scarto max dei VERTICI dalla curva.
-    arc_tol : scarto max dell'ARCO dalla spezzata dei vertici (deve ammettere la
-              freccia delle corde della mesh, altrimenti nessun cerchio passa).
+    tol     : max deviation of the VERTICES from the curve.
+    arc_tol : max deviation of the ARC from the vertices' polyline (must
+              allow for the mesh chords' sag, otherwise no circle fits).
     """
     if arc_tol is None:
         arc_tol = tol
@@ -3342,7 +3378,7 @@ def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 
             if big is None:
                 big = getattr(cv, "r", None)
             if big is not None and float(big) > 20.0 * scale:
-                continue  # primitiva enorme: artefatto del fit
+                continue  # huge primitive: a fit artifact
         try:
             s = float(np.abs(cv.dist(P)).max())
         except Exception:
@@ -3358,19 +3394,19 @@ def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 
     return best
 
 
-# --- 5C.8  nodi: posizione esatta come intersezione delle curve incidenti ----
+# --- 5C.8  nodes: exact position as the intersection of the incident curves ---
 
 
 # =============================================================================
-# 7. INDICE TOPOLOGICO della shape corrente
+# 7. TOPOLOGY INDEX of the current shape
 # =============================================================================
 
 
 class Topo:
     """
-    Facce, spigoli, vertici della shape con indici interi stabili finche' la
-    shape non cambia. Si ricostruisce (costa ~0.1 s su 5.000 facce) dopo ogni
-    sostituzione accettata.
+    Faces, edges, vertices of the shape with integer indices stable as long
+    as the shape doesn't change. Rebuilt (costs ~0.1 s on 5,000 faces)
+    after every accepted replacement.
     """
 
     __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "vmap", "nV", "vpos", "adj", "planar")
@@ -3391,8 +3427,8 @@ class Topo:
 
         self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar = {}, {}, {}, {}, {}, {}
         for i, f in enumerate(self.faces):
-            # ⚠️ le facce non toccate dall'ultima sostituzione sono le stesse
-            # (IsSame): i loro dati si copiano dall'indice precedente
+            # ⚠️ faces untouched by the last replacement are the same
+            # (IsSame): their data is copied from the previous index
             if prev is not None:
                 k = prev.fmap.FindIndex(f) - 1
                 if k >= 0 and prev.faces[k].Orientation() == f.Orientation():
@@ -3419,9 +3455,10 @@ class Topo:
         ef, _, e_faces = face_edges_map(shape)
         self.emap = ef
         self.nE = _size(ef)
-        # ⚠️ la mappa restituisce ogni spigolo con l'orientamento del PRIMO uso
-        # incontrato: qui li si normalizza a FORWARD, cosi' "fwd" vuol dire
-        # sempre "da FirstVertex a LastVertex" e Reversed() fa quel che dice.
+        # ⚠️ the map returns every edge with the orientation of the FIRST
+        # use encountered: here they're normalized to FORWARD, so "fwd"
+        # always means "from FirstVertex to LastVertex" and Reversed() does
+        # what it says.
         self.edges = [td_Edge(ef.FindKey(k).Oriented(TopAbs_FORWARD)) for k in range(1, self.nE + 1)]
         self.e_faces = [sorted(fs) for fs in e_faces]
         self.f_edges = [[] for _ in range(self.nF)]
@@ -3457,14 +3494,14 @@ def plane_prim_of_face(topo: Topo, i: int) -> Optional["Prim"]:
 
 
 # =============================================================================
-# 8. SEGMENTAZIONE: regioni di faccette che stanno su UNA primitiva curva
+# 8. SEGMENTATION: regions of facets lying on ONE curved primitive
 # =============================================================================
 #
-# Crescita da seme guidata dal modello (come nel motore precedente), ma con un
-# ciclo "raffina -> ricresci" e una purga finale alla tolleranza STRETTA: una
-# regione entra in gioco solo se OGNI suo vertice sta sulla superficie a meno
-# del rumore della mesh. Le facce che non reggono restano libere, e libere
-# restano: non si forza niente.
+# Model-guided seed growth (as in the previous engine), but with a
+# "refine -> regrow" cycle and a final purge at the TIGHT tolerance: a
+# region only enters play if EVERY one of its vertices lies on the surface
+# within the mesh's noise. Faces that don't hold up stay free, and stay
+# free: nothing is forced.
 
 
 @dataclass
@@ -3473,21 +3510,21 @@ class Region:
     faces: List[int]
     rms: float = 0.0
     max_res: float = 0.0
-    sag: float = 0.0  # scarto max faccetta-superficie (freccia delle corde)
-    repeated: bool = False  # la stessa primitiva compare altrove nel pezzo
-    closed_u: bool = False  # chiusa a 360 gradi attorno all'asse
-    concave: bool = False  # materiale all'ESTERNO della superficie (foro)
+    sag: float = 0.0  # max facet-to-surface deviation (chord sag)
+    repeated: bool = False  # the same primitive appears elsewhere in the part
+    closed_u: bool = False  # closed 360 degrees around the axis
+    concave: bool = False  # material on the OUTSIDE of the surface (a hole)
     t_lo: float = 0.0
     t_hi: float = 0.0
-    coverage: float = 0.0  # frazione dell'angolo giro coperta
-    status: str = ""  # esito della conversione
+    coverage: float = 0.0  # fraction of the full angle covered
+    status: str = ""  # conversion outcome
     note: str = ""
 
     def label(self) -> str:
         p = self.prim
         if p.kind == FREE:
             ff = p.free
-            return f"{'LIBERA':<6} {f'{ff.poles.shape[0]}x{ff.poles.shape[1]} poli':<22} {'CONCAVO' if self.concave else 'CONVESSO':<8} {'--':>5} {len(self.faces):>5} facce"
+            return f"{'FREE':<6} {f'{ff.poles.shape[0]}x{ff.poles.shape[1]} poles':<22} {'CONCAVE' if self.concave else 'CONVEX':<8} {'--':>5} {len(self.faces):>5} faces"
         if p.kind == SPHERE:
             dim = f"ø{2 * p.r0:.4f}"
         elif p.kind == TORUS:
@@ -3496,13 +3533,13 @@ class Region:
             dim = f"ø{2 * p.r0:.4f}"
         else:
             dim = f"ø{2 * (p.r0 + p.slope * self.t_lo):.4f}-{2 * (p.r0 + p.slope * self.t_hi):.4f}"
-        kind = "CONCAVO" if self.concave else "CONVESSO"
+        kind = "CONCAVE" if self.concave else "CONVEX"
         cl = "360°" if self.closed_u else f"{self.coverage * 360:.0f}°"
-        return f"{p.label():<6} {dim:<22} {kind:<8} {cl:>5} {len(self.faces):>5} facce"
+        return f"{p.label():<6} {dim:<22} {kind:<8} {cl:>5} {len(self.faces):>5} faces"
 
 
 def _ring(seed: int, adj, taken, rings: int = 2, cap: int = 80, norms=None, cos_smooth: float = None) -> List[int]:
-    """Anelli completi di adiacenza attorno al seme, solo attraverso spigoli lisci."""
+    """Complete adjacency rings around the seed, only through smooth edges."""
     out, seen, frontier = [seed], {seed}, [seed]
     for _ in range(max(1, rings)):
         nxt = []
@@ -3576,7 +3613,7 @@ def largest_component(faces_idx, adj) -> List[int]:
 
 
 def sag_points(topo: Topo, faces: List[int]) -> np.ndarray:
-    """Punti INTERNI delle faccette: baricentri e punti medi dei lati."""
+    """INTERIOR points of the facets: centroids and side midpoints."""
     pts = []
     for i in faces:
         V = topo.verts[i]
@@ -3592,7 +3629,7 @@ def sag_points(topo: Topo, faces: List[int]) -> np.ndarray:
 
 
 def region_sag(prim: "Prim", topo: Topo, faces: List[int]) -> float:
-    """Freccia: distanza max fra i punti INTERNI delle faccette e la superficie."""
+    """Sag: max distance between the facets' INTERIOR points and the surface."""
     pts = []
     for i in faces:
         V = topo.verts[i]
@@ -3641,7 +3678,7 @@ def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
         dd = C - prim.center
         dd = dd / np.maximum(np.linalg.norm(dd, axis=1), 1e-12)[:, None]
         m = (dd * W[:, None]).sum(axis=0) / W.sum()
-        R.coverage = float(1.0 - np.linalg.norm(m))  # 0 = calotta piccola, 1 = sfera intera
+        R.coverage = float(1.0 - np.linalg.norm(m))  # 0 = small cap, 1 = full sphere
         R.closed_u = False
     return R
 
@@ -3672,24 +3709,24 @@ def prim_radius(p: "Prim") -> float:
 
 class Segmenter:
     """
-    Regioni di faccette che stanno ESATTAMENTE su cilindri/coni/sfere/tori.
-    only_cyl: cerca solo cilindri (Fase B).
+    Regions of facets sitting EXACTLY on cylinders/cones/spheres/tori.
+    only_cyl: only searches for cylinders (Phase B).
     """
 
-    # ⚠️ seed_smooth = 20 gradi: l'intorno del seme attraversa solo spigoli
-    # quasi lisci. Con 50 gradi entravano le faccette degli SMUSSI a 45 gradi
-    # accanto a una striscia di cilindro, il fit del seme era spazzatura e le
-    # estremita' arrotondate del pezzo non venivano mai riconosciute.
+    # ⚠️ seed_smooth = 20 degrees: the seed's neighborhood only crosses
+    # nearly-smooth edges. At 50 degrees, the 45-degree CHAMFER facets next
+    # to a cylinder strip got pulled in, the seed's fit was garbage, and
+    # the part's rounded ends never got recognized.
     #
-    # ⚠️ MA 20 GRADI E' UNA SOGLIA SULLA TASSELLATURA, NON SULLA GEOMETRIA.
-    # Fra due faccette di uno STESSO raccordo l'angolo e' il passo con cui e'
-    # stato tassellato: fine sulle mesh buone (5-15 gradi), ma un raccordo
-    # diviso in 8 strisce su 180 gradi fa passi di 22.5 e resta INTERAMENTE
-    # fuori: nessun vicino, nessuna candidata, la superficie non si vede
-    # nemmeno. Per questo la soglia e' una scala: si prova stretta, e solo se
-    # il seme non produce NESSUNA candidata si riapre fino a seed_smooth_wide.
-    # Il tetto resta sotto i 45 gradi degli smussi, che e' il caso da cui la
-    # soglia stretta ci difende.
+    # ⚠️ BUT 20 DEGREES IS A TESSELLATION THRESHOLD, NOT A GEOMETRIC ONE.
+    # Between two facets of the SAME fillet, the angle is just the step it
+    # was tessellated at: fine on good meshes (5-15 degrees), but a fillet
+    # split into 8 strips over 180 degrees has 22.5-degree steps and stays
+    # ENTIRELY outside: no neighbor, no candidate, the surface isn't even
+    # visible. That's why the threshold is a ladder: try it tight first,
+    # and only if the seed produces NO candidate at all does it reopen up
+    # to seed_smooth_wide. The ceiling stays under the 45 degrees of
+    # chamfers, which is the case the tight threshold protects us from.
     def __init__(
         self,
         topo,
@@ -3711,8 +3748,8 @@ class Segmenter:
     ):
         self.topo = topo
         self.threads = max(1, int(threads))
-        # parametri esatti del costruttore: servono per ricostruire lo stesso
-        # Segmenter dentro i processi di lavoro
+        # exact constructor parameters: needed to rebuild the same
+        # Segmenter inside the worker processes
         self._kw = dict(
             tol_fit=tol_fit,
             tol_grow=tol_grow,
@@ -3742,24 +3779,24 @@ class Segmenter:
         self.max_radius = 1.5 * diag
         self.taken = [False] * topo.nF
 
-    # --- criteri -----------------------------------------------------------------
+    # --- criteria ------------------------------------------------------------------
     def face_tol(self, p, i) -> float:
         """
-        Quanto puo' distare dalla superficie una faccetta, DATA LA SUA GROSSOLANITA'.
+        How far a facet can be from the surface, GIVEN HOW COARSE IT IS.
 
-        ⚠️ UNA FACCETTA NON SA PIU' DI QUANTO LA SUA CORDA GLI PERMETTE. Una
-        faccetta che taglia un raccordo R1.5 a passi di 22 gradi sta gia' due-
-        tre centesimi sotto la superficie vera: pretendere che i suoi VERTICI
-        cadano entro un micron da quella superficie e' chiedere alla mesh una
-        precisione che non ha. Su test7 e' esattamente quello che succedeva
-        agli spigoli verticali degli scomparti: il cono con la sveglia di
-        sformo (r 1.585 in basso, 1.495 in alto) lasciava un residuo di un
-        centesimo - un TERZO della freccia delle faccette stesse - e la
-        regione veniva svuotata, lasciando sette strisce piane al posto di una
-        faccia conica.
-        Quindi la soglia e' la piu' larga fra quella assoluta e META' della
-        freccia della faccetta, e non supera mai la tolleranza di crescita,
-        che resta la definizione di "vicino" per tutto il resto del codice.
+        ⚠️ A FACET KNOWS NO MORE THAN ITS CHORD LETS IT. A facet cutting an
+        R1.5 fillet in 22-degree steps is already two or three hundredths
+        below the true surface: demanding that its VERTICES land within a
+        micron of that surface is asking the mesh for a precision it
+        doesn't have. On test7 that's exactly what was happening to the
+        compartments' vertical edges: the cone with the draft angle
+        (r 1.585 at the bottom, 1.495 at the top) left a residual of a
+        hundredth - a THIRD of the facets' own sag - and the region kept
+        getting emptied out, leaving seven flat strips in place of one
+        conical face.
+        So the threshold is the wider of the absolute one and HALF the
+        facet's sag, and it never exceeds the growth tolerance, which
+        stays the definition of "close" for the rest of the code.
         """
         V = self.topo.verts[i]
         if V.shape[0] < 3:
@@ -3778,7 +3815,7 @@ class Segmenter:
         return bool(V.size) and float(np.abs(p.dist(V)).max()) <= self.face_tol(p, i)
 
     def _excess(self, p, reg):
-        """residuo di ogni faccetta MISURATO NELLA SUA PROPRIA soglia (1.0 = al limite)."""
+        """residual of each facet MEASURED IN ITS OWN threshold (1.0 = at the limit)."""
         topo = self.topo
         out = []
         for i in reg:
@@ -3795,26 +3832,27 @@ class Segmenter:
 
     def is_flat(self, reg) -> bool:
         """
-        Regione indistinguibile da un piano: non e' una lavorazione curva.
-        Il segnale di curvatura (scarto dal piano) deve superare di netto la
-        tolleranza, altrimenti e' rumore che un cilindro enorme "spiega" per caso.
+        Region indistinguishable from a plane: not a curved feature.
+        The curvature signal (deviation from the plane) has to clearly
+        exceed the tolerance, otherwise it's noise that a huge cylinder
+        "explains" by chance.
         """
         P = np.vstack([self.topo.verts[i] for i in reg])
         pl = fit_plane(P)
         return pl is not None and float(np.abs(pl.dist(P)).max()) <= 3.0 * self.tol_fit
 
-    # --- scelta del tipo -----------------------------------------------------------
+    # --- type choice -----------------------------------------------------------------
     def choose_prim(self, faces: List[int], max_ndev: float = 15.0) -> Optional["Prim"]:
         """
-        Rimette in discussione il TIPO di primitiva su una regione cresciuta,
-        provando PRIMA LA PIU' SEMPLICE e fermandosi alla prima che regge
-        (cilindro < cono < sfera < toro).
+        Reopens the question of the primitive's TYPE on a grown region,
+        trying THE SIMPLEST FIRST and stopping at the first one that holds
+        up (cylinder < cone < sphere < torus).
 
-        ⚠️ Una parete di foro tassellata a strisce ha i vertici SOLO sui due
-        cerchi di bordo: quei punti stanno esattamente anche su una sfera. Il
-        residuo non distingue, le NORMALI si': la sfera le vorrebbe inclinate
-        di decine di gradi. Per questo ogni candidata passa anche il controllo
-        delle normali.
+        ⚠️ A hole wall tessellated in strips has vertices ONLY on the two
+        boundary circles: those points also lie exactly on a sphere. The
+        residual can't tell them apart, the NORMALS can: the sphere would
+        want them tilted by tens of degrees. That's why every candidate
+        also has to pass the normals check.
         """
         topo = self.topo
         idx = list(faces)
@@ -3860,17 +3898,18 @@ class Segmenter:
                     return tr
         return fallback[0][1] if fallback[0] else None
 
-    # --- semi ------------------------------------------------------------------------
+    # --- seeds ---------------------------------------------------------------------
     def seed_candidates(self, seed: List[int]):
         """
-        Primitive candidate dall'intorno del seme, ROBUSTE ai vicini estranei.
+        Candidate primitives from the seed's neighborhood, ROBUST to
+        unrelated neighbors.
 
-        ⚠️ L'intorno attraversa gli spigoli lisci, quindi su un raccordo
-        (tangente per definizione ai suoi vicini) raccoglie anche faccette di
-        ALTRE superfici e magari la faccia piana grande accanto: il fit su quel
-        miscuglio e' spazzatura e il seme muore. Qui si tolgono le facce
-        grandi, si fitta, si tengono le faccette entro la tolleranza di
-        crescita e si rifitta sulle sole "inlier".
+        ⚠️ The neighborhood crosses smooth edges, so on a fillet (tangent
+        by definition to its neighbors) it also picks up facets from OTHER
+        surfaces, maybe even the big planar face next to it: the fit on
+        that mixture is garbage and the seed dies. Here the large faces are
+        removed, a fit is made, the facets within the growth tolerance are
+        kept and it's refitted on the "inliers" alone.
         """
         topo = self.topo
         med = float(np.median([topo.areas[i] for i in seed]))
@@ -3890,10 +3929,11 @@ class Segmenter:
             P, Nrep, N, W, self.allow_sphere and not self.only_cyl, self.allow_cone and not self.only_cyl, max_ndev=60.0, allow_torus=self.allow_torus and not self.only_cyl
         )
         raw = [c for c in raw if c.kind != PLANE]
-        # ⚠️ i fit algebrici su 4-10 faccette sbagliano anche del 40% sul raggio:
-        # senza un raffinamento LM la sfera vera non entra mai in tolleranza e
-        # il seme muore. Qui ogni candidata (piu' una sfera e un cilindro
-        # tentati comunque) viene raffinata sulle sole inlier, tre volte.
+        # ⚠️ algebraic fits on 4-10 facets can be off by 40% on the radius:
+        # without an LM refinement, the true sphere never gets within
+        # tolerance and the seed dies. Here every candidate (plus a sphere
+        # and a cylinder tried regardless) gets refined on the inliers
+        # alone, three times.
         extra = []
         if not self.only_cyl and self.allow_sphere and not any(c.kind == SPHERE for c in raw):
             sp0 = fit_sphere(P)
@@ -3934,15 +3974,15 @@ class Segmenter:
         out.sort(key=lambda t: (-len(t[1]), _rank(t[0])))
         return out[:3]
 
-    # --- consolidamento ---------------------------------------------------------------
+    # --- consolidation -------------------------------------------------------------
     def settle(self, reg, prim):
-        """raffina -> ricresci -> purga stretta, finche' la regione e' stabile."""
+        """refine -> regrow -> tight purge, until the region is stable."""
         topo = self.topo
         reg = list(reg)
         p = prim
         last_n = 0
         if self.is_flat(reg):
-            return None, "piatta"
+            return None, "flat"
         for _ in range(6):
             if len(reg) > 1.25 * last_n or last_n == 0:
                 p2 = self.choose_prim(reg)
@@ -3952,9 +3992,9 @@ class Segmenter:
                 if p2 is not None and prim_radius(p2) > self.max_radius:
                     p2 = None
             if not self.kind_ok(p2) and len(reg) >= 6:
-                # ⚠️ regione contaminata da faccette di superfici vicine (tipico
-                # con la tolleranza di crescita sulle strisce lunghe): si tiene
-                # la meta' che il fit del SEME spiega meglio e si riprova
+                # ⚠️ region contaminated by facets from neighboring surfaces
+                # (typical with the growth tolerance on long strips): keep
+                # the half the SEED's fit explains better and try again
                 res = self._excess(p, reg)
                 cut = max(1.0, float(np.median(res)))
                 trimmed = largest_component([i for i, r_ in zip(reg, res) if r_ <= cut], topo.adj)
@@ -3962,11 +4002,12 @@ class Segmenter:
                     reg = trimmed
                     p2 = self.choose_prim(reg)
             if not self.kind_ok(p2):
-                return None, "nessuna primitiva regge"
+                return None, "no primitive holds up"
             p = p2
-            # ⚠️ REGIONE CONTAMINATA: la crescita dal seme sbagliato ha preso
-            # anche faccette di superfici vicine e il fit e' un compromesso.
-            # Si tiene la meta' migliore, si rifitta e si riparte da li'.
+            # ⚠️ CONTAMINATED REGION: growth from the wrong seed also
+            # picked up facets from neighboring surfaces and the fit is a
+            # compromise. The better half is kept, refitted, and restarted
+            # from there.
             res = self._excess(p, reg)
             if res.max() > 1.0 and len(reg) >= 6:
                 cut = max(1.0, float(np.median(res)))
@@ -3979,39 +4020,40 @@ class Segmenter:
             reg2, _ = grow_region(reg, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False)
             keep = largest_component([i for i in reg2 if self.within(p, i)], topo.adj)
             if len(keep) < self.min_faces:
-                return None, f"troppo piccola ({len(keep)} facce entro tolleranza)"
+                return None, f"too small ({len(keep)} faces within tolerance)"
             if set(keep) == set(reg):
                 break
             reg = keep
         p = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind)
         if not self.kind_ok(p) or prim_radius(p) > self.max_radius:
-            return None, "fit finale non valido"
+            return None, "final fit invalid"
         if abs(p.slope) < 1e-9:
             p.slope = 0.0
         if not all(self.within(p, i) for i in reg):
             keep = largest_component([i for i in reg if self.within(p, i)], topo.adj)
             if len(keep) < self.min_faces:
-                return None, "troppo piccola dopo il fit finale"
+                return None, "too small after the final fit"
             reg = keep
         if self.is_flat(reg):
-            return None, "piatta"
+            return None, "flat"
         return reg, p
 
     def try_seed(self, s: int):
-        """(prim, facce) dalla faccia seme s, oppure (None, motivo)."""
+        """(prim, faces) from seed face s, or (None, reason)."""
         topo = self.topo
-        # ⚠️ INTORNO ADATTIVO. Su una mesh finissima (faccette da 0.03 mm su un
-        # raggio di 5 mm) due anelli di vicini sono piatti entro tolleranza:
-        # la curvatura non si vede e il seme muore ("nessuna candidata"). Si
-        # allarga l'intorno finche' la curvatura emerge o si esaurisce.
-        # ⚠️ NON BASTA UNA CANDIDATA: SERVE APPOGGIO. Una primitiva fittata su
-        # tre strisce che coprono venti gradi d'arco ha il raggio sbagliato di
-        # qualche centesimo, e la crescita si ferma subito: il raccordo esce
-        # spezzato in due o tre facce invece che intero (e' esattamente cosa
-        # succedeva agli spigoli verticali di test7). Per questo, finche' il
-        # miglior appoggio resta sotto MIN_SUPPORT faccette, si continua ad
-        # allargare - prima gli anelli, poi la soglia di lisciatura - e alla
-        # fine si prova per prima la candidata con piu' appoggio.
+        # ⚠️ ADAPTIVE NEIGHBORHOOD. On a very fine mesh (0.03 mm facets on a
+        # 5 mm radius) two rings of neighbors are flat within tolerance:
+        # the curvature isn't visible and the seed dies ("no candidate").
+        # The neighborhood widens until the curvature emerges or it runs out.
+        # ⚠️ ONE CANDIDATE ISN'T ENOUGH: IT NEEDS SUPPORT. A primitive fitted
+        # on three strips spanning twenty degrees of arc has a radius wrong
+        # by a few hundredths, and growth stops right away: the fillet comes
+        # out split into two or three faces instead of whole (this is
+        # exactly what was happening to test7's vertical edges). So, as
+        # long as the best support stays under MIN_SUPPORT facets, the
+        # search keeps widening - first the rings, then the smoothing
+        # threshold - and in the end the candidate with the most support is
+        # tried first.
         MIN_SUPPORT = 6
         cands = []
         for cs in (self.cos_seed, self.cos_seed_wide):
@@ -4030,13 +4072,13 @@ class Segmenter:
             if max((len(inl) for _, inl in cands), default=0) >= MIN_SUPPORT or cs == self.cos_seed_wide:
                 break
         if not cands:
-            return None, "nessuna candidata sul seme"
+            return None, "no candidate on the seed"
         cands.sort(key=lambda t: (-len(t[1]), _rank(t[0])))
         why = ""
         for prim, inl in cands:
             reg, p2 = grow_region(inl, prim, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang)
             if len(reg) < self.min_faces:
-                why = "crescita insufficiente"
+                why = "insufficient growth"
                 continue
             keep, pk = self.settle(reg, p2)
             if keep is None:
@@ -4045,8 +4087,8 @@ class Segmenter:
             return (pk, keep), ""
         return None, why
 
-    # --- ciclo principale --------------------------------------------------------------
-    # --- ciclo dei semi, in sequenza ---------------------------------------------
+    # --- main loop -----------------------------------------------------------------
+    # --- seed loop, sequential ------------------------------------------------------
     def _seed_loop(self, order, tries) -> Tuple[list, int]:
         topo = self.topo
         found: List[Tuple["Prim", List[int]]] = []
@@ -4065,21 +4107,23 @@ class Segmenter:
             found.append((pk, keep))
         return found, tried
 
-    # --- ciclo dei semi, su piu' processi ------------------------------------------
+    # --- seed loop, on multiple processes --------------------------------------------
     def _seed_loop_parallel(self, order, tries, pool) -> Tuple[list, int]:
         """
-        Stessa ricerca, ma i semi sono divisi fra i processi: ognuno fa il suo
-        goloso sulla propria fetta (marcandosi le faccette che prende, cosi'
-        non ripassa venti volte sulla stessa regione) e poi il processo
-        principale accetta le regioni UNA ALLA VOLTA, dalla piu' grande.
+        Same search, but the seeds are split across the processes: each one
+        runs its own greedy pass on its own slice (marking the facets it
+        takes, so it doesn't pass over the same region twenty times), and
+        then the main process accepts the regions ONE AT A TIME, largest
+        first.
 
-        ⚠️ La crescita dal seme legge quali faccette sono gia' prese: in
-        parallelo ognuno lavora su una FOTOGRAFIA di quell'elenco, quindi due
-        processi possono rivendicare le stesse faccette. Il controllo e' qui:
-        una regione che ne tocca di gia' assegnate viene buttata e il suo seme
-        torna in coda per il giro dopo, con l'elenco aggiornato. Alla fine i
-        semi rimasti si fanno in sequenza, cosi' il risultato non dipende dal
-        numero di processi piu' di quanto non dipenda dall'ordine dei semi.
+        ⚠️ Seed growth reads which facets are already taken: in parallel,
+        each process works on a SNAPSHOT of that list, so two processes can
+        claim the same facets. The check is here: a region that touches
+        facets already assigned is thrown away and its seed goes back in
+        the queue for the next round, with the updated list. In the end,
+        the remaining seeds are done sequentially, so the result doesn't
+        depend on the number of processes any more than it depends on seed
+        order.
         """
         import pickle
         import tempfile
@@ -4098,9 +4142,9 @@ class Segmenter:
                 if len(pending) < 24:
                     break
                 taken_b = bytes(1 if t else 0 for t in self.taken)
-                # fette alternate: ogni processo vede semi sparsi su tutto il
-                # pezzo, cosi' due processi raramente inseguono la stessa
-                # regione, e il carico resta bilanciato
+                # interleaved slices: each process sees seeds scattered
+                # across the whole part, so two processes rarely chase the
+                # same region, and the load stays balanced
                 n = min(_POOL_N or self.threads, max(1, len(pending) // 8))
                 tasks = [(key, path, taken_b, pending[i::n]) for i in range(n)]
                 try:
@@ -4108,10 +4152,10 @@ class Segmenter:
                     for part in pool.map(_worker_seeds, tasks):
                         res.extend(part)
                 except Exception as ex:
-                    Log.warn(f"processi di lavoro non disponibili ({type(ex).__name__}: {ex}): si prosegue su un solo core")
+                    Log.warn(f"worker processes unavailable ({type(ex).__name__}: {ex}): continuing on a single core")
                     break
-                # prima le regioni piu' grandi: in caso di sovrapposizione
-                # vince quella che il ciclo sequenziale avrebbe trovato prima
+                # larger regions first: in case of overlap, the one the
+                # sequential loop would have found first wins
                 res.sort(key=lambda t: (t[1] is None, -sum(topo.areas[i] for i in t[2]) if t[1] is not None else 0.0))
                 for s, prim, keep in res:
                     tried += 1
@@ -4119,7 +4163,7 @@ class Segmenter:
                         tries[s] += 2
                         continue
                     if any(self.taken[i] for i in keep):
-                        continue  # conflitto: si riprova dopo
+                        continue  # conflict: retried later
                     for i in keep:
                         self.taken[i] = True
                     found.append((prim, keep))
@@ -4134,8 +4178,9 @@ class Segmenter:
     @staticmethod
     def _pinch_count(topo, rf) -> int:
         """
-        Vertici dove il bordo della regione si STROZZA: piu' di due spigoli di
-        bordo nello stesso punto. E' un anello interno che tocca quello esterno.
+        Vertices where the region's boundary PINCHES: more than two
+        boundary edges at the same point. It's an inner ring touching the
+        outer one.
         """
         rset = set(rf)
         cnt: Dict[int, int] = defaultdict(int)
@@ -4149,17 +4194,17 @@ class Segmenter:
 
     def _worth_merging(self, pa: "Prim", pb: "Prim", tol_len: float) -> bool:
         """
-        Vale la pena PROVARE a fondere queste due? La parola definitiva la da'
-        il rifit dell'unione: questo e' solo il filtro che evita di provarle
-        tutte.
-        ⚠️ prims_equal DA SOLO E' TROPPO SEVERO PER DUE PEZZI DELLA STESSA
-        PARETE. Chiede assi entro 0,05 gradi, ma un cilindro fittato su dieci
-        faccette che coprono 20 gradi ha il suo asse incerto di qualche decimo:
-        i due pezzi del cilindro R=3 di test4 escono a 0,14 e 0,28 gradi l'uno
-        dall'altro e non si fondevano. Qui si allarga a un grado e al 2% del
-        raggio - abbastanza per l'incertezza del fit, troppo poco per unire due
-        pareti diverse (nelle zone di raccordo a forma libera i "cilindri"
-        vicini stanno a 2-13 gradi).
+        Is it worth TRYING to merge these two? The final word is given by
+        the union's refit: this is only the filter that avoids trying them
+        all.
+        ⚠️ prims_equal ALONE IS TOO STRICT FOR TWO PIECES OF THE SAME WALL.
+        It asks for axes within 0.05 degrees, but a cylinder fitted on ten
+        facets spanning 20 degrees has its axis uncertain by a few tenths
+        of a degree: the two pieces of test4's R=3 cylinder come out 0.14
+        and 0.28 degrees apart from each other and wouldn't merge. Here it
+        widens to one degree and 2% of the radius - enough for the fit's
+        uncertainty, too little to merge two different walls (in free-form
+        fillet zones the neighboring "cylinders" sit at 2-13 degrees).
         """
         if prims_equal(pa, pb, tol_len):
             return True
@@ -4190,13 +4235,14 @@ class Segmenter:
 
     def _merge_cosurface(self, found, tag: str = ""):
         """
-        Regioni CONFINANTI che giacciono sulla STESSA superficie: una sola.
-        ⚠️ SENZA QUESTO IL MODELLO SI SPACCA: la crescita parte da semi diversi
-        e una parete lunga finisce spesso in due regioni con la stessa identica
-        primitiva, che nel file diventano due facce separate da uno spigolo che
-        nel CAD non c'e'.
-        Si rifitta l'unione e si accetta solo se la superficie unica spiega
-        TUTTI i vertici entro tol_fit: se non li spiega, erano due davvero.
+        NEIGHBORING regions lying on the SAME surface: made into one.
+        ⚠️ WITHOUT THIS THE MODEL FALLS APART: growth starts from different
+        seeds and a long wall often ends up as two regions with the exact
+        same primitive, which in the file become two faces separated by an
+        edge that doesn't exist in the CAD.
+        The union is refitted and accepted only if the single surface
+        explains ALL the vertices within tol_fit: if it doesn't, they truly
+        were two.
         """
         topo = self.topo
         tol_len = max(50.0 * self.tol_fit, 1e-5 * self.diag)
@@ -4224,29 +4270,32 @@ class Segmenter:
                     if abs(p.slope) < 1e-9:
                         p.slope = 0.0
                     p = self._snap_cylinder(p, union)
-                    # ⚠️ IL METRO E' tol_grow, NON tol_fit. tol_fit e' la soglia
-                    # per dire "questa faccetta e' su questa superficie": la
-                    # distanza fra due pezzi della STESSA parete fittati
-                    # separatamente e' un'altra cosa. Un arco di venti gradi ha
-                    # il fit mal condizionato - raggio e centro si compensano -
-                    # e i suoi vertici stanno a un micron dal cilindro che
-                    # spiega tutto il resto: con tol_fit la fusione non scattava
-                    # quasi mai (su test4 zero volte) e il cilindro R=3 restava
-                    # spezzato in tre facce con tre schegge in mezzo, dove il
-                    # CAD ha UNA faccia. tol_grow e' gia' la definizione di
-                    # "vicino" con cui le regioni sono cresciute, ed e' stretta
-                    # abbastanza: un gradino vero fra due alesaggi (2 centesimi)
-                    # la sfonda di sei volte e resta due facce.
+                    # ⚠️ THE YARDSTICK IS tol_grow, NOT tol_fit. tol_fit is
+                    # the threshold for saying "this facet is on this
+                    # surface": the distance between two pieces of the SAME
+                    # wall fitted separately is a different matter. A
+                    # twenty-degree arc has a poorly conditioned fit -
+                    # radius and center trade off against each other - and
+                    # its vertices sit a micron from the cylinder that
+                    # explains everything else: with tol_fit the merge
+                    # almost never fired (zero times on test4) and the R=3
+                    # cylinder stayed split into three faces with three
+                    # slivers in between, where the CAD has ONE face.
+                    # tol_grow is already the definition of "close" the
+                    # regions grew by, and it's tight enough: a real step
+                    # between two bores (2 hundredths) blows through it
+                    # sixfold and stays two faces.
                     P = np.vstack([topo.verts[i] for i in union])
                     if float(np.abs(p.dist(P)).max()) > self.tol_grow:
                         continue
-                    # ⚠️ E NON DEVE STROZZARSI. Fondendo quattro pezzetti di
-                    # sfera da 0,015 mm2 usciva una faccia con l'anello interno
-                    # che tocca quello esterno in un vertice: BRepCheck in
-                    # memoria la accetta, ma dopo il giro di scrittura e
-                    # rilettura STEP diventa "IntersectingWires" e il pezzo non
-                    # e' piu' valido (misurato su test8). Se l'unione strozza
-                    # dove i pezzi non strozzavano, si lasciano separati.
+                    # ⚠️ AND IT MUST NOT PINCH. Merging four little sphere
+                    # fragments of 0.015 mm2 used to produce a face whose
+                    # inner ring touches the outer one at a vertex:
+                    # BRepCheck accepts it in memory, but after the STEP
+                    # write-and-reread round trip it becomes
+                    # "IntersectingWires" and the part is no longer valid
+                    # (measured on test8). If the union pinches where the
+                    # pieces didn't, they're left separate.
                     if self._pinch_count(topo, union) > max(
                         self._pinch_count(topo, ra), self._pinch_count(topo, rb)
                     ):
@@ -4259,7 +4308,7 @@ class Segmenter:
                     break
             found = [(p, rf) for p, rf in found if p is not None]
         if tag and len(found) < n0:
-            Log.debug(f"Fusione co-superficie ({tag}): {n0} -> {len(found)} regioni")
+            Log.debug(f"Co-surface merge ({tag}): {n0} -> {len(found)} regions")
         return found
 
     def run(self) -> List[Region]:
@@ -4273,30 +4322,31 @@ class Segmenter:
             found, tried = self._seed_loop_parallel(order, tries, pool)
         else:
             found, tried = self._seed_loop(order, tries)
-        Log.debug(f"Semi: {tried:,} provati in {time.perf_counter() - t_seed:.2f}s ({'1 processo' if pool is None else f'{_POOL_N} processi'})")
+        Log.debug(f"Seeds: {tried:,} tried in {time.perf_counter() - t_seed:.2f}s ({'1 process' if pool is None else f'{_POOL_N} processes'})")
 
-        # ⚠️ PRIMA DI FONDERE, RADDRIZZARE. Due semi sulla stessa parete di
-        # foro escono come due CONI con semiangolo 0.03 e 0.35 gradi: sono la
-        # stessa superficie, ma prims_equal li vede diversi e non li fonde, e
-        # nel file finiscono due facce dove il CAD ne ha una (misurato su
-        # test4: un cilindro da 13.7 mm2 spezzato in due coni da 10.4 e 2.4).
-        # Snap a cilindro PRIMA del confronto e si fondono da soli.
+        # ⚠️ STRAIGHTEN BEFORE MERGING. Two seeds on the same hole wall come
+        # out as two CONES with semi-angle 0.03 and 0.35 degrees: it's the
+        # same surface, but prims_equal sees them as different and doesn't
+        # merge them, and the file ends up with two faces where the CAD has
+        # one (measured on test4: a 13.7 mm2 cylinder split into two cones
+        # of 10.4 and 2.4). Snapping to a cylinder BEFORE the comparison
+        # makes them merge on their own.
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
-        found = self._merge_cosurface(found, "dopo i semi")
+        found = self._merge_cosurface(found, "after the seeds")
 
         found = self.relabel(found)
         regions = [describe_region(p, topo, rf) for p, rf in found]
-        # ⚠️ faccette che coprono piu' di 30 gradi ciascuna non sono una
-        # tassellatura di quella superficie: e' un fit casuale su 4 facce
+        # ⚠️ facets each covering more than 30 degrees aren't a tessellation
+        # of that surface: it's a random fit on 4 faces
         regions = [R for R in regions if not (R.prim.kind in (AXIAL, TORUS) and R.coverage > 0 and R.coverage * 360.0 / max(len(R.faces), 1) > 30.0)]
 
-        # ⚠️ frammenti: un "cilindro" di 5 faccette che copre 7 gradi, o un
-        # toro con raggio maggiore di 0.3 mm, non e' una lavorazione: e' un fit
-        # casuale su rumore, e convertito produce una scaglia curva fra facce
-        # lisce (gli artefatti a scalino). Restano tassellati.
+        # ⚠️ fragments: a 5-facet "cylinder" covering 7 degrees, or a torus
+        # with a major radius under 0.3 mm, isn't a real feature: it's a
+        # random fit on noise, and converted it produces a curved chip
+        # between smooth faces (the step artifacts). They stay tessellated.
         def _fragment(R):
-            # ⚠️ una fascia stretta ma LUNGA (60 faccette su 10 gradi) e' un
-            # raccordo vero: il numero di faccette conta quanto la copertura
+            # ⚠️ a narrow but LONG band (60 facets over 10 degrees) is a
+            # real fillet: the facet count matters as much as the coverage
             if R.prim.kind in (AXIAL, TORUS) and not R.closed_u and R.coverage * 360.0 < 15.0 and len(R.faces) < 12:
                 return True
             if R.prim.kind == TORUS and (R.prim.r0 < 0.3 * R.prim.r1 or (len(R.faces) < 6 and R.coverage * 360.0 < 30.0)):
@@ -4306,32 +4356,34 @@ class Segmenter:
             return False
 
         regions = [R for R in regions if not _fragment(R)]
-        # ⚠️ IL RECUPERO VA FATTO SULLA MAPPA FINALE. Le regioni buttate dai
-        # filtri (frammenti, fit casuali) tengono occupate le loro faccette
-        # fino a qui: recuperare prima dei filtri vuol dire trovarle ancora
-        # prenotate da una regione che poi sparisce, e lasciarle sciolte.
+        # ⚠️ RECOVERY MUST BE DONE ON THE FINAL MAP. Regions thrown out by
+        # the filters (fragments, random fits) keep their facets occupied
+        # up to here: recovering before the filters would mean finding
+        # them still claimed by a region that then disappears, leaving
+        # them unclaimed.
         found = self._absorb_free([(R.prim, list(R.faces)) for R in regions])
         found = self._wedged(found)
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
-        # ⚠️ E SI RIFONDE. La prima passata guarda le regioni COME ESCONO DAI
-        # SEMI: due pezzi della stessa parete separati da qualche faccetta
-        # sciolta non si toccano nemmeno, e passano indenni. Solo dopo il
-        # recupero delle sciolte (_absorb_free) e il secondo raddrizzamento a
-        # cilindro diventano confinanti e confrontabili. Misurato su test4:
-        # il cilindro R=3 usciva spezzato in due facce da 10.5 e 2.4 mm2 con
-        # tre schegge in mezzo, e nel CAD e' UNA faccia sola.
-        found = self._merge_cosurface(found, "dopo il recupero")
+        # ⚠️ AND IT MERGES AGAIN. The first pass looks at the regions AS
+        # THEY COME OUT OF THE SEEDS: two pieces of the same wall separated
+        # by a few unclaimed facets don't even touch, and pass unscathed.
+        # Only after the unclaimed facets are recovered (_absorb_free) and
+        # the second straightening to a cylinder do they become neighbors
+        # and comparable. Measured on test4: the R=3 cylinder came out
+        # split into two faces of 10.5 and 2.4 mm2 with three slivers in
+        # between, and in the CAD it's ONE single face.
+        found = self._merge_cosurface(found, "after recovery")
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
         regions = self._blend_patches(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
-        Log.info(f"Semi provati {tried:,} · regioni curve trovate {len(regions)} · faccette coinvolte {sum(len(R.faces) for R in regions):,} / {nF:,}")
+        Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
 
     def _face_scale(self, i) -> float:
-        """Estensione della faccia: distanza mediana FRA TUTTI i suoi vertici.
-        ⚠️ NON la lunghezza dei lati: una faccia piana grande col contorno
-        finemente segmentato (il bordo sagomato di una piastra) avrebbe lati
-        corti come una faccetta e sembrerebbe fine quanto lei."""
+        """Face extent: median distance BETWEEN ALL its vertices.
+        ⚠️ NOT the side lengths: a large planar face with a finely
+        segmented outline (a plate's shaped edge) would have sides as
+        short as a facet's and would look just as fine."""
         V = self.topo.verts[i]
         if V.shape[0] < 2:
             return 1e-12
@@ -4344,16 +4396,17 @@ class Segmenter:
     @staticmethod
     def _bridges(nF: int, adj):
         """
-        Spigoli-PONTE del grafo delle faccette (Tarjan, iterativo).
-        ⚠️ SERVONO PERCHE' IL SEGNALE DELLA TRAMA E' GIA' QUASI PERFETTO.
-        Misurato su test4 contro il file CAD vero: la regola "diedro > 30
-        oppure trama > 1.5" trova 1.285 dei 1.323 spigoli del CAD con 18 falsi
-        su 7.200. Quelli che sfuggono hanno tutti UNO SOLO spigolo di mesh:
-        sono contatti d'angolo, dove due facce del CAD si toccano quasi in un
-        punto. Geometricamente non si vedono (diedro 1-3 gradi, stessa trama),
-        ma topologicamente sono evidenti: sono ponti, e senza tagliarli venti
-        facce del CAD finivano in una sezione sola. Tagliandoli, le sezioni
-        che coprono piu' di una faccia originale scendono da 7 a 3.
+        BRIDGE edges of the facet graph (Tarjan, iterative).
+        ⚠️ THESE ARE NEEDED BECAUSE THE TEXTURE SIGNAL IS ALREADY NEARLY
+        PERFECT. Measured on test4 against the real CAD file: the rule
+        "dihedral > 30 or texture > 1.5" finds 1,285 of the CAD's 1,323
+        edges with 18 false positives out of 7,200. The ones that escape
+        all have a SINGLE mesh edge: they're corner contacts, where two CAD
+        faces touch almost at a point. Geometrically invisible (dihedral
+        1-3 degrees, same texture), but topologically obvious: they're
+        bridges, and without cutting them, twenty CAD faces ended up in a
+        single section. Cutting them, the sections spanning more than one
+        original face drop from 7 to 3.
         """
         disc = [-1] * nF
         low = [0] * nF
@@ -4389,17 +4442,17 @@ class Segmenter:
 
     def sections(self, ang_cut: float = 30.0, size_cut: float = 1.5):
         """
-        Le FACCE del CAD originale, ritagliate dalla mesh.
+        The original CAD's FACES, cut out from the mesh.
 
-        ⚠️ IL TASSELLATORE LAVORA UNA FACCIA ALLA VOLTA, e la mesh se lo
-        ricorda: dentro una faccia la trama e' uniforme, attraverso uno
-        spigolo del CAD cambia di colpo. Si taglia dove c'e' uno spigolo vivo
-        (diedro grande) oppure dove cambia la trama, e quel che resta sono le
-        facce del pezzo di partenza. Misurato su test4 contro il file CAD
-        vero: le sezioni ritagliano ESATTAMENTE il cono della svasatura
-        (26.99 mm2), i cilindri (105.52, 60.31) e - quel che conta qui - le
-        superfici a forma libera (5.21 e 5.21) che il fit a quadriche copriva
-        con cinque sfere e un toro.
+        ⚠️ THE TESSELLATOR WORKS ONE FACE AT A TIME, and the mesh remembers
+        it: inside a face the texture is uniform, across a CAD edge it
+        changes abruptly. Cuts are made where there's a sharp edge (large
+        dihedral) or where the texture changes, and what's left are the
+        starting part's faces. Measured on test4 against the real CAD
+        file: the sections cut out EXACTLY the countersink's cone (26.99
+        mm2), the cylinders (105.52, 60.31) and - what matters here - the
+        free-form surfaces (5.21 and 5.21) that the quadric fit was
+        covering with five spheres and a torus.
         """
         topo = self.topo
         nF = topo.nF
@@ -4435,21 +4488,22 @@ class Segmenter:
 
     def _snap_cylinder(self, p, rf):
         """
-        ⚠️ IL CONO CHE E' UN CILINDRO. Il fit assiale ha un grado di liberta'
-        in piu' del cilindro e lo usa sempre: su una parete di foro esce un
-        cono con semiangolo di 0.02 gradi, cioe' un cilindro con una
-        rastremazione di mezzo micron su tutta la faccia. Geometricamente e'
-        la stessa superficie, ma nel file STEP e' un CONICAL_SURFACE dove il
-        CAD aveva un CYLINDRICAL_SURFACE, e chi apre il modello se ne accorge.
-        Si prova il cilindro: se spiega le faccette come il cono, vince lui.
-        (su test4: sei coni su nove tornano cilindri, e i tre che restano
-        sono i tre veri del pezzo, tutti a 45 gradi)
+        ⚠️ THE CONE THAT'S REALLY A CYLINDER. The axial fit has one more
+        degree of freedom than the cylinder and always uses it: on a hole
+        wall it comes out as a cone with a 0.02-degree semi-angle, i.e. a
+        cylinder with a half-micron taper over the whole face.
+        Geometrically it's the same surface, but in the STEP file it's a
+        CONICAL_SURFACE where the CAD had a CYLINDRICAL_SURFACE, and anyone
+        who opens the model notices. The cylinder is tried: if it explains
+        the facets as well as the cone, it wins. (on test4: six cones out
+        of nine turn back into cylinders, and the three that remain are
+        the part's three real ones, all at 45 degrees)
         """
         if p is None or p.kind != AXIAL or abs(p.slope) < 1e-12:
             return p
         try:
             if abs(p.slope) > 0.05:
-                return p  # rastremazione vera (>2.9 gradi)
+                return p  # real taper (>2.9 degrees)
             P = np.vstack([self.topo.verts[i] for i in rf])
             t = (P - p.center) @ p.axis
             rad = P - p.center - np.outer(t, p.axis)
@@ -4459,12 +4513,13 @@ class Segmenter:
                 q = Prim(AXIAL, q.center, q.axis, q.r0, 0.0)
             if all(self.within(q, i) for i in rf):
                 return q
-            # ⚠️ OPPURE: IL CILINDRO NON SPIEGA PEGGIO DEL CONO. Dopo una
-            # fusione il rifit dell'unione esce quasi sempre conico (il fit
-            # assiale ha un grado di liberta' in piu' e lo usa): un semiangolo
-            # di 0.04 gradi e' un cilindro, ma i suoi vertici stanno appena
-            # oltre face_tol e lo snap non scattava, lasciando nel file un
-            # CONICAL_SURFACE dove il CAD ha un CYLINDRICAL_SURFACE.
+            # ⚠️ OR: THE CYLINDER DOESN'T EXPLAIN IT WORSE THAN THE CONE.
+            # After a merge, the union's refit comes out conical almost
+            # every time (the axial fit has one more degree of freedom and
+            # uses it): a 0.04-degree semi-angle is a cylinder, but its
+            # vertices sit just past face_tol and the snap wouldn't fire,
+            # leaving a CONICAL_SURFACE in the file where the CAD has a
+            # CYLINDRICAL_SURFACE.
             d_cono = float(np.abs(p.dist(P)).max())
             d_cil = float(np.abs(q.dist(P)).max())
             if d_cil <= max(1.05 * d_cono, self.tol_fit):
@@ -4475,19 +4530,20 @@ class Segmenter:
 
     def _blend_patches(self, regions):
         """
-        ⚠️ LO SMUSSO CHE CORRE LUNGO UNO SPIGOLO CURVO. Dove il bordo da
-        smussare non e' ne' dritto ne' un arco di cerchio, la superficie di
-        raccordo non e' un cono ne' un toro: e' una superficie libera, e il
-        CAD la scrive come B-spline (si riconosce anche dalla tassellatura,
-        che li' e' dieci volte piu' fitta). Il fit a quadriche non puo' che
-        spezzarla in decine di cilindretti OSCULATORI da dieci gradi, ognuno
-        con un raggio diverso e un contorno frastagliato: sono le "facce con
-        troppi lati" che si vedono nel pezzo finito.
-        Qui quei frammenti vengono riconosciuti (fascia curva che copre pochi
-        gradi), raggruppati per contatto, ricuciti con le isole sciolte che si
-        portano dentro, e sostituiti da UNA superficie a forma libera. Il fit
-        deve stare nella STESSA tolleranza dei frammenti: se non ci sta, non si
-        tocca niente.
+        ⚠️ THE CHAMFER RUNNING ALONG A CURVED EDGE. Where the edge to be
+        chamfered is neither straight nor a circular arc, the blending
+        surface is neither a cone nor a torus: it's a free-form surface,
+        and the CAD writes it as a B-spline (also recognizable from the
+        tessellation, which there is ten times denser). A quadric fit
+        can't help but split it into dozens of ten-degree OSCULATING
+        little cylinders, each with a different radius and a jagged
+        outline: those are the "faces with too many sides" you see in the
+        finished part.
+        Here those fragments are recognized (a curved band covering a few
+        degrees), grouped by contact, stitched together with the loose
+        islands they pull in, and replaced by ONE free-form surface. The
+        fit must stay within the SAME tolerance as the fragments: if it
+        doesn't fit, nothing is touched.
         """
         if not self.allow_free or len(regions) < self.blend_min:
             return regions
@@ -4503,9 +4559,9 @@ class Segmenter:
             m = np.where(lab == c)[0]
             if len(m) < 4 * self.min_faces:
                 continue
-            # regioni che stanno QUASI TUTTE dentro questa sezione: solo quelle
-            # si possono sciogliere. Una regione a cavallo si lascia stare,
-            # altrimenti le si aprirebbe un buco.
+            # regions that lie ALMOST ENTIRELY inside this section: only
+            # those can be dissolved. A straddling region is left alone,
+            # otherwise a hole would open up in it.
             cnt, tot = {}, {}
             for i in m:
                 q = owner.get(i)
@@ -4523,39 +4579,41 @@ class Segmenter:
             faces = self._fill_islands(faces, owner)
             P = np.vstack([topo.verts[i] for i in faces])
             N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in faces])
-            # ⚠️ L'ESAME VERO SI DA' CONTRO LA MESH, NON CONTRO I FRAMMENTI.
-            # I punti-sonda presi sulle primitive dei frammenti sembravano una
-            # buona idea, ma su una macchia di raggio 1 mm coperta da sfere
-            # ø6 sono i frammenti a sbagliare, e la B-spline risultava
-            # bocciata mentre era PIU' vicina al pezzo di loro. La freccia -
-            # distanza dei punti INTERNI delle faccette dalla superficie - si
-            # misura allo stesso modo per tutti e dice quanto ci si stacca
-            # dalla mesh fra un vertice e l'altro: la superficie nuova deve
-            # solo non essere peggio di quelle che sostituisce.
+            # ⚠️ THE REAL TEST IS AGAINST THE MESH, NOT AGAINST THE
+            # FRAGMENTS. Probe points taken on the fragments' primitives
+            # seemed like a good idea, but on a 1 mm-radius patch covered
+            # by ø6 spheres, the fragments are the ones getting it wrong,
+            # and the B-spline was rejected while being CLOSER to the part
+            # than they were. The sag - distance of the facets' INTERIOR
+            # points from the surface - is measured the same way for
+            # everyone and tells you how far it strays from the mesh
+            # between one vertex and the next: the new surface only needs
+            # to not be worse than the ones it replaces.
             sag_old = max(region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro)
             pr = fit_free(P, N, self.tol_fit, check=sag_points(topo, faces), check_tol=2.0 * sag_old + 2.0 * self.tol_fit)
             if pr is None:
                 continue
-            # ⚠️ L'ESAME VERO SI DA' CONTRO LA MESH, NON CONTRO I FRAMMENTI.
-            # I punti-sonda presi sulle primitive dei frammenti sembravano una
-            # buona idea, ma su una macchia di raggio 1 mm coperta da sfere
-            # ø6 sono i frammenti a sbagliare: la sonda diceva 2e-03 mentre la
-            # B-spline era PIU' vicina al pezzo di loro. La freccia - distanza
-            # dei punti INTERNI delle faccette dalla superficie - si misura
-            # allo stesso modo per tutti, e dice quanto ci si stacca dalla
-            # mesh fra un vertice e l'altro: la superficie nuova non deve
-            # essere peggio di quelle che sostituisce.
+            # ⚠️ THE REAL TEST IS AGAINST THE MESH, NOT AGAINST THE
+            # FRAGMENTS. Probe points taken on the fragments' primitives
+            # seemed like a good idea, but on a 1 mm-radius patch covered
+            # by ø6 spheres the fragments are the ones getting it wrong:
+            # the probe said 2e-03 while the B-spline was CLOSER to the
+            # part than they were. The sag - distance of the facets'
+            # INTERIOR points from the surface - is measured the same way
+            # for everyone, and tells you how far it strays from the mesh
+            # between one vertex and the next: the new surface must not be
+            # worse than the ones it replaces.
             drop |= set(dentro)
             extra.append(describe_region(pr, topo, faces))
         if not extra:
             return regions
-        Log.debug(f"Macchie a forma libera: {len(extra)} sezioni (al posto di {len(drop)} frammenti)")
+        Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
         return [R for k, R in enumerate(regions) if k not in drop] + extra
 
     def _fill_islands(self, faces, owner, max_frac: float = 0.25):
-        """Faccette SCIOLTE completamente circondate dalla macchia: sono sue.
-        Senza, il contorno della faccia nuova avrebbe anelli interni da quattro
-        triangoli e OpenCascade la rifiuta (UnorientableShape)."""
+        """UNCLAIMED facets fully surrounded by the patch: they belong to
+        it. Without this, the new face's contour would have interior rings
+        of four triangles and OpenCascade rejects it (UnorientableShape)."""
         topo = self.topo
         gs = set(faces)
         seen, comps = set(), []
@@ -4581,26 +4639,27 @@ class Segmenter:
             if len(c) > cap:
                 continue
             if any(i in owner for i in c):
-                continue  # l'isola e' una regione vera: si lascia
+                continue  # the island is a real region: leave it
             gs |= set(c)
         return sorted(gs)
 
     def _belongs(self, p, i, base) -> bool:
         """
-        La faccetta i sta sulla superficie p, o e' comunque un'isola dentro base.
+        Facet i lies on surface p, or is at least an island inside base.
 
-        ⚠️ IL RUMORE DEI VERTICI NON E' LA FRECCIA DELLE CORDE. face_tol allarga
-        la soglia quando la faccetta e' GROSSOLANA, ma una striscia lunga e
-        sottile ha freccia quasi nulla e resta al micron secco: su test6 le
-        strisce del raccordo ø4 hanno i vertici 1.3 micron fuori dal cilindro
-        (tol_fit ne concede 0.63) e restavano fuori a decine, una accanto
-        all'altra, come schegge piane in mezzo a una faccia cilindrica. Quel
-        1.3 micron e' il rumore con cui il tassellatore ha scritto i vertici,
-        non una superficie diversa.
-        Per queste, e SOLO in recupero, conta la topologia: se la faccetta e'
-        circondata dalla regione (almeno due vicini dentro), guarda dalla
-        stessa parte entro 5 gradi ed e' entro la tolleranza di CRESCITA, e'
-        sua. Sono tre condizioni insieme: vicina, parallela e chiusa dentro.
+        ⚠️ VERTEX NOISE ISN'T THE SAME AS CHORD SAG. face_tol widens the
+        threshold when the facet is COARSE, but a long, thin strip has
+        almost no sag and stays at the bare micron: on test6 the ø4
+        fillet's strips have vertices 1.3 microns outside the cylinder
+        (tol_fit allows 0.63) and dozens stayed outside, one next to the
+        other, like flat slivers in the middle of a cylindrical face. That
+        1.3 micron is the noise the tessellator wrote the vertices with,
+        not a different surface.
+        For these, and ONLY during recovery, topology counts: if the facet
+        is surrounded by the region (at least two neighbors inside), faces
+        the same way within 5 degrees, and is within the GROWTH tolerance,
+        it's theirs. Three conditions together: close, parallel and closed
+        in.
         """
         V = self.topo.verts[i]
         if V.size == 0:
@@ -4617,22 +4676,23 @@ class Segmenter:
 
     def _wedged(self, found):
         """
-        Isole di faccette sciolte completamente circondate da superfici rifatte.
+        Islands of unclaimed facets fully surrounded by rebuilt surfaces.
 
-        ⚠️ SU UNA GIUNZIONE TANGENTE LA MESH NON STA NE' DI QUA NE' DI LA'.
-        Dove un raccordo ø4 incontra un cilindro ø8 a cui e' tangente, il
-        tassellatore mette una striscia che ha uno spigolo sul raccordo e
-        l'altro sul cilindro: non sta ESATTAMENTE su nessuna delle due (su
-        test6 e' fuori di 1.4 micron da entrambe, e la tolleranza ne concede
-        0.63). Nessuna delle due regioni la prende e resta una scheggia piana
-        lunga e sottile in mezzo a due facce analitiche - il difetto che si
-        vede su test6 e test2 vicino a foro, smusso e raccordo.
-        Qui si prendono i GRUPPI di faccette rimaste sciolte che non toccano
-        nessun'altra faccetta sciolta (quindi sono un'isola circondata da
-        superfici gia' rifatte), piccoli, e si danno alla regione confinante
-        che li spiega meglio - purche' li spieghi entro la tolleranza di
-        crescita e con le normali entro 5 gradi. Scegliere "l'una o l'altra"
-        e' indifferente a meno del micron; lasciarle sciolte no.
+        ⚠️ ON A TANGENT JOINT THE MESH SITS ON NEITHER SIDE. Where a ø4
+        fillet meets a ø8 cylinder it's tangent to, the tessellator puts a
+        strip with one edge on the fillet and the other on the cylinder: it
+        doesn't sit EXACTLY on either one (on test6 it's 1.4 microns off
+        from both, and the tolerance allows 0.63). Neither region claims
+        it, and it stays a long, thin flat sliver between two analytic
+        faces - the defect you see on test6 and test2 near a hole, chamfer
+        and fillet.
+        Here, GROUPS of facets left unclaimed that don't touch any other
+        unclaimed facet (so they're an island surrounded by already-rebuilt
+        surfaces), small ones, are picked up and handed to whichever
+        neighboring region explains them best - as long as it explains them
+        within the growth tolerance and with normals within 5 degrees.
+        Choosing "one or the other" doesn't matter beyond a micron; leaving
+        them unclaimed does.
         """
         topo = self.topo
         owner = {}
@@ -4703,24 +4763,24 @@ class Segmenter:
             found[k] = (p2, union)
             n_add += len(g)
         if n_add:
-            Log.debug(f"Schegge incastrate recuperate: +{n_add}")
+            Log.debug(f"Wedged slivers recovered: +{n_add}")
         return found
 
     def _absorb_free(self, found):
         """
-        Faccette rimaste libere che stanno sulla superficie di una regione.
+        Facets left unclaimed that lie on a region's surface.
 
-        ⚠️ CHI CRESCE PRIMA VINCE, E NON E' DETTO CHE SIA IL MIGLIORE.
-        L'ordine dei semi decide chi si prende cosa, e con piu' processi i
-        semi partono da una FOTOGRAFIA delle faccette gia' prese: due semi
-        sulla STESSA superficie crescono in parallelo, quello piu' piccolo
-        viene rifiutato al commit e le sue faccette restano orfane. Su test2
-        la fascia del raccordo ø1 usciva con 92 faccette invece di 117, e le
-        25 orfane diventavano strisce piane attorno ai fori - il difetto
-        "foro + smusso + raccordo". Qui, a mappa ferma, ogni regione riprova
-        a crescere sulle faccette ANCORA libere: si aggiunge solo, mai si
-        toglie, e la primitiva rifittata deve continuare a spiegare tutte le
-        faccette di partenza.
+        ⚠️ WHOEVER GROWS FIRST WINS, AND THAT ISN'T NECESSARILY THE BEST
+        ONE. Seed order decides who claims what, and with multiple
+        processes the seeds start from a SNAPSHOT of the facets already
+        claimed: two seeds on the SAME surface grow in parallel, the
+        smaller one gets rejected at commit and its facets stay orphaned.
+        On test2 the ø1 fillet's band came out with 92 facets instead of
+        117, and the 25 orphans turned into flat strips around the holes -
+        the "hole + chamfer + fillet" defect. Here, with the map frozen,
+        every region tries again to grow onto the facets STILL unclaimed:
+        only additions, never removals, and the refitted primitive must
+        keep explaining all the starting facets.
         """
         topo = self.topo
         taken = [False] * topo.nF
@@ -4741,8 +4801,8 @@ class Segmenter:
             p2 = refit_exact(union, topo.verts, topo.norms, topo.areas, p.kind)
             if p2 is None or prim_radius(p2) > self.max_radius:
                 continue
-            # ⚠️ le faccette di PARTENZA devono restare spiegate dalla primitiva
-            # rifittata: il recupero puo' solo aggiungere, mai peggiorare.
+            # ⚠️ the STARTING facets must stay explained by the refitted
+            # primitive: recovery can only add, never make things worse.
             if any(not self.within(p2, i) for i in rf):
                 continue
             keep = set(largest_component([i for i in union if self._belongs(p2, i, base)], topo.adj))
@@ -4755,20 +4815,20 @@ class Segmenter:
             for i in keep:
                 taken[i] = True
         if n_add:
-            Log.debug(f"Recupero faccette libere: +{n_add}")
+            Log.debug(f"Unclaimed facets recovered: +{n_add}")
         return found
 
     def relabel(self, found):
         """
-        Riassegnazione competitiva delle faccette di confine.
+        Competitive reassignment of boundary facets.
 
-        ⚠️ Due superfici TANGENTI (sfera d'angolo e raccordo) sono
-        indistinguibili vicino alla giunzione: la fila di triangolini sottili
-        della sfera sta entro tolleranza anche dal cilindro, e la prima
-        regione che cresce se la prende. Il confine fra le due regioni si
-        sposta di una fila e la curva di giunzione non e' piu' il cerchio
-        esatto. Qui ogni faccetta di confine va alla regione la cui
-        primitiva la spiega MEGLIO (residuo piu' basso), poi si rifitta.
+        ⚠️ Two TANGENT surfaces (a corner sphere and a fillet) are
+        indistinguishable near the joint: the sphere's row of thin little
+        triangles is within tolerance of the cylinder too, and the first
+        region to grow there claims it. The boundary between the two
+        regions shifts by one row and the joint curve is no longer the
+        exact circle. Here every boundary facet goes to the region whose
+        primitive explains it BEST (lowest residual), then it's refitted.
         """
         topo = self.topo
         if len(found) < 2:
@@ -4810,7 +4870,7 @@ class Segmenter:
                             p2.slope = 0.0
                         prims[k] = p2
         if moved_total:
-            Log.debug(f"Riassegnate {moved_total} faccette di confine fra regioni tangenti")
+            Log.debug(f"Reassigned {moved_total} boundary facets between tangent regions")
         out = []
         for k in range(len(found)):
             rf = largest_component(sorted(sets[k]), topo.adj)
@@ -4820,22 +4880,21 @@ class Segmenter:
 
 
 # =============================================================================
-# 8b-bis. SEMI IN PARALLELO
+# 8b-bis. PARALLEL SEEDS
 #
-# ⚠️ PERCHE' A PROCESSI E NON A THREAD. Le chiamate a OpenCascade e il codice
-# numpy di questo script tengono il GIL (misurato: otto calcoli di volume su
-# quattro thread costano quanto in sequenza), quindi i thread non fanno
-# guadagnare niente. Gli unici pezzi davvero parallelizzabili sono quelli che
-# lavorano solo su array numpy: la ricerca delle primitive dai semi, che e' la
-# fetta piu' grossa delle Fasi B e C. Le sostituzioni nel solido restano in
-# sequenza: modificano una struttura OCC condivisa e vanno verificate una alla
-# volta.
+# ⚠️ WHY PROCESSES AND NOT THREADS. The calls into OpenCascade and this
+# script's numpy code hold the GIL (measured: eight volume computations on
+# four threads cost as much as in sequence), so threads gain nothing. The
+# only pieces that are truly parallelizable are the ones working purely on
+# numpy arrays: the primitive search from the seeds, which is the biggest
+# slice of Phases B and C. The in-solid replacements stay sequential: they
+# modify a shared OCC structure and must be checked one at a time.
 # =============================================================================
 
 
 class TopoLite:
-    """I soli campi della topologia che servono alla segmentazione: numpy e
-    liste, quindi trasferibili a un altro processo."""
+    """Only the topology fields the segmentation needs: numpy and lists,
+    so it can be shipped to another process."""
 
     __slots__ = ("nF", "verts", "norms", "areas", "nverts", "planar", "adj")
 
@@ -4865,14 +4924,14 @@ _W_SEG = None
 
 def _seed_pool(threads: int, want: Optional[int] = None):
     """
-    Pool di processi, creato una volta sola e riusato da tutte le fasi.
+    Process pool, created once and reused by every phase.
 
-    ⚠️ QUANTI PROCESSI. Non "tutti quelli che ha la macchina": accendere un
-    interprete che importa OpenCascade costa quasi un secondo, e su un pezzo
-    da mezzo secondo di semi ventidue processi ci mettono piu' tempo a
-    partire di quanto ne facciano risparmiare (misurato: test3.stl 4.2 s con
-    quattro processi, 6.1 s con ventidue). Quindi il numero si proporziona al
-    lavoro da fare, con -j come tetto.
+    ⚠️ HOW MANY PROCESSES. Not "every one the machine has": spinning up an
+    interpreter that imports OpenCascade costs nearly a second, and on a
+    part with half a second of seed work, twenty-two processes take longer
+    to start than they save (measured: test3.stl 4.2 s with four
+    processes, 6.1 s with twenty-two). So the count is scaled to the work
+    at hand, with -j as the ceiling.
     """
     global _POOL, _POOL_N
     if threads is None or threads < 2:
@@ -4886,7 +4945,7 @@ def _seed_pool(threads: int, want: Optional[int] = None):
         _POOL = ProcessPoolExecutor(max_workers=k)
         _POOL_N = k
     except Exception as ex:
-        Log.warn(f"niente multiprocessing ({type(ex).__name__}: {ex}): si usa un solo core")
+        Log.warn(f"no multiprocessing available ({type(ex).__name__}: {ex}): using a single core")
         _POOL, _POOL_N = None, 0
     return _POOL
 
@@ -4897,12 +4956,12 @@ def _worker_boot():
 
 def warm_pool(threads: int, n_faces: int = 0) -> None:
     """
-    Accende i processi PRIMA che servano.
+    Starts the worker processes BEFORE they're needed.
 
-    ⚠️ Ogni processo di lavoro e' un interprete nuovo che deve importare
-    OpenCascade: quasi un secondo. Se li si accende quando servono, quel
-    secondo si paga tutto insieme e su un pezzo piccolo mangia il guadagno.
-    Accesi qui, bootano mentre la Fase A lavora su un core solo.
+    ⚠️ Every worker process is a fresh interpreter that has to import
+    OpenCascade: nearly a second. Starting them when needed means paying
+    that second all at once, and on a small part it eats the gain. Started
+    here, they boot up while Phase A works on a single core.
     """
     pool = _seed_pool(threads, want=n_faces // 5000)
     if pool is None:
@@ -4912,7 +4971,7 @@ def warm_pool(threads: int, n_faces: int = 0) -> None:
             pool.submit(_worker_boot)
     except Exception:
         pass
-    Log.debug(f"Processi di lavoro accesi: {_POOL_N}")
+    Log.debug(f"Worker processes started: {_POOL_N}")
 
 
 def close_pool() -> None:
@@ -4926,7 +4985,7 @@ def close_pool() -> None:
 
 
 def _worker_seeds(task):
-    """Prova una lista di semi su una fotografia delle faccette gia' prese."""
+    """Tries a list of seeds against a snapshot of the facets already claimed."""
     import pickle
 
     global _W_KEY, _W_SEG
@@ -4951,8 +5010,8 @@ def _worker_seeds(task):
             out.append((s, None, []))
             continue
         prim, keep = res
-        # ⚠️ il processo si segna quello che ha preso: senza questo rifarebbe
-        # la stessa regione partendo da ogni faccetta che ne fa parte
+        # ⚠️ the process marks what it took: without this it would redo the
+        # same region starting from every facet that's part of it
         for i in keep:
             seg.taken[i] = True
         out.append((s, prim, keep))
@@ -4994,25 +5053,26 @@ def segment_curved(
 
 
 # =============================================================================
-# 9. SUPERFICI ANALITICHE: parametrizzazione, pcurve, spigoli
+# 9. ANALYTIC SURFACES: parametrization, pcurves, edges
 # =============================================================================
 #
-# ⚠️ Le pcurve (curve nello spazio (u,v) della superficie) le calcoliamo NOI,
-# non il proiettore di OCC. Il proiettore riporta u in [0, 2pi): un bordo che
-# attraversa il seam (u = 0) viene spezzato, il wire non chiude nello spazio
-# dei parametri e la faccia esce non valida o, peggio, come COMPLEMENTO della
-# regione (una calotta di 18 mm2 che diventa una sfera intera). Campionando
-# la curva 3D, proiettando con la nostra parametrizzazione e SVOLGENDO u e v
-# lungo il wire, il seam non esiste piu': ogni wire e' continuo per costruzione.
+# ⚠️ We compute the pcurves (curves in the surface's (u,v) space) OURSELVES,
+# not OCC's projector. The projector reports u in [0, 2pi): a boundary
+# crossing the seam (u = 0) gets split, the wire doesn't close in parameter
+# space and the face comes out invalid or, worse, as the region's
+# COMPLEMENT (an 18 mm2 cap turning into a whole sphere). By sampling the
+# 3D curve, projecting with our own parametrization and UNWRAPPING u and v
+# along the wire, the seam no longer exists: every wire is continuous by
+# construction.
 
 
 class SurfParam:
-    """Parametrizzazione esplicita (identica a quella di Geom_*Surface)."""
+    """Explicit parametrization (identical to Geom_*Surface's)."""
 
     def __init__(self, prim: "Prim", ref: Optional[np.ndarray] = None, pole_axis: Optional[np.ndarray] = None):
-        # ⚠️ cono con semiangolo negativo: lo STEP lo scrive come
-        # SURFACE_OF_REVOLUTION generica. Si gira l'asse (e il segno della
-        # pendenza) su una COPIA: stessa geometria, semiangolo positivo.
+        # ⚠️ cone with a negative semi-angle: STEP writes it as a generic
+        # SURFACE_OF_REVOLUTION. The axis (and the slope's sign) is flipped
+        # on a COPY: same geometry, positive semi-angle.
         if prim.kind == AXIAL and prim.slope < 0:
             prim = Prim(AXIAL, prim.center.copy(), -prim.axis, prim.r0, -prim.slope)
         self.prim = prim
@@ -5113,7 +5173,7 @@ class SurfParam:
         return Geom_ConicalSurface(ax3, float(self.alpha), float(self.prim.r0))
 
     def iso_u_curve(self, u: float):
-        """Curva 3D a u costante (generatrice o meridiano): (Geom_Curve, param==v)."""
+        """3D curve at constant u (generatrix or meridian): (Geom_Curve, param==v)."""
         k = self.prim.kind
         if k == FREE:
             return None
@@ -5135,11 +5195,12 @@ class SurfParam:
 
 class CGeom(_Curve):
     """
-    Curva di intersezione GENERICA (B-spline di GeomAPI_IntSS) avvolta con
-    la stessa interfaccia delle curve analitiche: serve per il confine fra
-    due raccordi con angoli diversi o fra un raccordo e uno smusso tondo,
-    dove l'intersezione non e' ne' retta ne' cerchio. Senza questa il confine
-    restava la scaletta della mesh fra due facce lisce.
+    GENERIC intersection curve (a GeomAPI_IntSS B-spline) wrapped with the
+    same interface as the analytic curves: needed for the boundary between
+    two fillets at different angles, or between a fillet and a round
+    chamfer, where the intersection is neither a line nor a circle.
+    Without this the boundary stayed the mesh's staircase between two
+    smooth faces.
     """
 
     period = None
@@ -5170,11 +5231,11 @@ class CGeom(_Curve):
         return self.c
 
     def label(self):
-        return "intersezione"
+        return "intersection"
 
 
 def intersection_curves(surf_a, surf_b, tol: float) -> List[_Curve]:
-    """Curve di intersezione fra due Geom_Surface (GeomAPI_IntSS)."""
+    """Intersection curves between two Geom_Surface (GeomAPI_IntSS)."""
     out: List[_Curve] = []
     try:
         ss = _m("GeomAPI").GeomAPI_IntSS(surf_a, surf_b, float(tol))
@@ -5189,7 +5250,7 @@ def intersection_curves(surf_a, surf_b, tol: float) -> List[_Curve]:
 
 
 def _unwrap_to(vals: np.ndarray, start: float, period: float) -> np.ndarray:
-    """Svolge una sequenza periodica in modo che il primo valore sia vicino a start."""
+    """Unwraps a periodic sequence so the first value is close to start."""
     out = np.unwrap(vals, period=period)
     k = round((start - out[0]) / period)
     return out + k * period
@@ -5202,10 +5263,10 @@ def curve_points(curve, t0: float, t1: float, n: int) -> np.ndarray:
 
 def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, u_prev: Optional[float], v_prev: Optional[float], n: int = 25):
     """
-    Pcurve dello spigolo (curva 3D `curve` fra t0 e t1) sulla superficie sp.
-    Ritorna (Geom2d_Curve, (u_end, v_end) nel verso di percorrenza, deviazione).
-    u_prev/v_prev = fine dello spigolo precedente nel wire: la pcurve viene
-    svolta per partire di li'.
+    Pcurve of the edge (3D curve `curve` between t0 and t1) on surface sp.
+    Returns (Geom2d_Curve, (u_end, v_end) in the direction of travel, deviation).
+    u_prev/v_prev = end of the previous edge in the wire: the pcurve is
+    unwrapped to start from there.
     """
     P, ts = curve_points(curve, t0, t1, n)
     u, v = sp.uv(P)
@@ -5218,7 +5279,7 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
     u_end, v_end = float(u[-1]), float(v[-1])
     if not traverse_fwd:
         u, v = u[::-1], v[::-1]
-    # retta in (u,v) e lineare in t?  -> B-spline di grado 1 (esatta)
+    # a line in (u,v) and linear in t?  -> degree-1 B-spline (exact)
     lin_u = u[0] + (u[-1] - u[0]) * (ts - t0) / max(t1 - t0, 1e-300)
     lin_v = v[0] + (v[-1] - v[0]) * (ts - t0) / max(t1 - t0, 1e-300)
     if float(np.abs(lin_u - u).max()) < 1e-9 and float(np.abs(lin_v - v).max()) < 1e-9:
@@ -5243,7 +5304,7 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
         if not it.IsDone():
             return None, (u_end, v_end), math.inf
         c2d = it.Curve()
-    # deviazione "same parameter": |C3d(t) - S(pcurve(t))| su un campione fitto
+    # "same parameter" deviation: |C3d(t) - S(pcurve(t))| over a dense sample
     tt = np.linspace(t0, t1, 2 * n + 1)
     Q = np.array([[curve.Value(t).X(), curve.Value(t).Y(), curve.Value(t).Z()] for t in tt])
     uu = np.array([c2d.Value(t).X() for t in tt])
@@ -5253,7 +5314,7 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
 
 
 def edge_curve(edge):
-    """(Geom_Curve, t0, t1) dello spigolo, con la location applicata."""
+    """(Geom_Curve, t0, t1) of the edge, with the location applied."""
     e = td_Edge(edge)
     loc = TopLoc_Location()
     c = bt_Curve(e, loc, 0.0, 0.0)
@@ -5279,11 +5340,12 @@ def edge_is_analytic(edge) -> bool:
 
 def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmid: Optional[np.ndarray], closed: bool, Pnext: Optional[np.ndarray] = None):
     """
-    Spigolo analitico fra due vertici ESISTENTI (condivisi coi vicini).
-    Per un cerchio/ellisse l'arco giusto e' quello che passa dal vertice
-    intermedio della catena (Pmid). Ritorna (spigolo, fwd): fwd = True se lo
-    spigolo FORWARD va nel verso di percorrenza della catena (da V1).
-    Per una catena CHIUSA il verso si legge dal secondo vertice (Pnext).
+    Analytic edge between two EXISTING vertices (shared with the
+    neighbors). For a circle/ellipse the right arc is the one passing
+    through the chain's midpoint vertex (Pmid). Returns (edge, fwd): fwd =
+    True if the FORWARD edge follows the chain's direction of travel
+    (from V1). For a CLOSED chain the direction is read from the second
+    vertex (Pnext).
     """
     g = _keep(cv.to_geom())
     if closed:
@@ -5303,14 +5365,14 @@ def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmi
             tm = float(cv.param(Pmid[None, :])[0])
             while tm < t1:
                 tm += cv.period
-            if tm > t2:  # l'arco corto non passa da Pmid
+            if tm > t2:  # the short arc doesn't pass through Pmid
                 t1, t2 = t2 - cv.period, t1
                 V1, V2 = V2, V1
                 fwd_is_v1 = False
             else:
                 fwd_is_v1 = True
         else:
-            if t2 - t1 > math.pi:  # preferisci l'arco corto
+            if t2 - t1 > math.pi:  # prefer the short arc
                 t1, t2 = t2 - cv.period, t1
                 V1, V2 = V2, V1
                 fwd_is_v1 = False
@@ -5333,10 +5395,10 @@ def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmi
 
 def composed_edge_orientations(face, edge) -> List:
     """
-    Orientamenti dello spigolo nella faccia COMPOSTI con quelli di wire e
-    faccia (TopExp_Explorer restituisce solo quello memorizzato nel wire).
-    In un guscio coerente ogni spigolo e' FORWARD in una faccia e REVERSED
-    nell'altra, in senso composto.
+    Edge orientations in the face, COMPOSED with the wire's and the face's
+    (TopExp_Explorer only returns the one stored in the wire). In a
+    consistent shell, every edge is FORWARD in one face and REVERSED in the
+    other, in composed terms.
     """
     out = []
     f_rev = face.Orientation() == TopAbs_REVERSED
@@ -5363,30 +5425,30 @@ def grow_vertex_tolerance(V, dist: float) -> None:
 
 
 # =============================================================================
-# 10. MOTORE DI SOSTITUZIONE LOCALE (una regione alla volta, con rollback)
+# 10. LOCAL REPLACEMENT ENGINE (one region at a time, with rollback)
 # =============================================================================
 #
-# Per ogni regione:
-#   1. bordo -> catene (spigoli consecutivi con lo stesso vicino);
-#   2. ogni catena: se il vicino e' analitico e i vertici stanno sulla curva di
-#      intersezione esatta -> UNO spigolo analitico nuovo fra i vertici
-#      ESISTENTI; altrimenti si tengono gli spigoli poligonali cosi' come sono
-#      (condivisi col vicino tassellato, pcurve aggiunta sul posto);
-#   3. faccia nuova = superficie + wire (+ seam se chiusa a 360 gradi);
-#   4. controlli sulla faccia (validita', area);
-#   5. BRepTools_ReShape: facce della regione -> faccia nuova, catene -> spigoli
-#      nuovi anche nei vicini;
-#   6. controlli sul solido (spigoli liberi invariati, facce vicine valide,
-#      orientamento coerente, volume entro lo sfrido delle corde);
-#   7. se un controllo fallisce: la shape resta quella di prima.
+# For each region:
+#   1. boundary -> chains (consecutive edges with the same neighbor);
+#   2. each chain: if the neighbor is analytic and the vertices lie on the
+#      exact intersection curve -> ONE new analytic edge between the
+#      EXISTING vertices; otherwise the polygonal edges are kept as they
+#      are (shared with the tessellated neighbor, pcurve added in place);
+#   3. new face = surface + wire (+ seam if closed 360 degrees);
+#   4. checks on the face (validity, area);
+#   5. BRepTools_ReShape: region's faces -> new face, chains -> new edges in
+#      the neighbors too;
+#   6. checks on the solid (free edges unchanged, valid neighboring faces,
+#      consistent orientation, volume within the chords' slack);
+#   7. if a check fails: the shape stays as it was before.
 
 
 @dataclass
 class Chain:
-    edges: List[int]  # indici spigolo (Topo), in ordine di percorrenza
-    fwd: List[bool]  # True = percorso da FirstVertex a LastVertex
-    verts: List[int]  # vertici in ordine (len = edges+1; chiusa: primo==ultimo)
-    nb: int  # faccia vicina (indice Topo), -1 = bordo libero
+    edges: List[int]  # edge indices (Topo), in traversal order
+    fwd: List[bool]  # True = traversed from FirstVertex to LastVertex
+    verts: List[int]  # vertices in order (len = edges+1; closed: first==last)
+    nb: int  # neighboring face (Topo index), -1 = free boundary
     closed: bool = False
 
 
@@ -5404,8 +5466,8 @@ class Engine:
         self.max_edge_tol = max_edge_tol
         self.allow_polyline = allow_polyline
         self.verbose = verbose
-        self.registry = TopTools_IndexedMapOfShape()  # facce analitiche curve
-        self.analytic: Dict[int, "Prim"] = {}  # id registro -> Prim
+        self.registry = TopTools_IndexedMapOfShape()  # analytic curved faces
+        self.analytic: Dict[int, "Prim"] = {}  # registry id -> Prim
         self.topo = Topo(shape)
         self.free0 = count_free_edges(shape)
         self.vol0 = shape_volume(shape)
@@ -5413,7 +5475,7 @@ class Engine:
         self.n_fail = 0
         self.log: List[str] = []
 
-    # --- primitive analitiche dei vicini --------------------------------------
+    # --- analytic primitives of the neighbors ---------------------------------
     def prim_of_face(self, i: int) -> Optional["Prim"]:
         f = self.topo.faces[i]
         k = self.registry.FindIndex(f)
@@ -5425,23 +5487,23 @@ class Engine:
         k = self.registry.Add(face)
         self.analytic[k] = prim
 
-    # --- catene di bordo -------------------------------------------------------
+    # --- boundary chains ---------------------------------------------------------
     def region_loops(self, rf: List[int]) -> Tuple[Optional[List[Loop]], str]:
         topo = self.topo
         rset = set(rf)
-        bnd: Dict[int, int] = {}  # spigolo -> faccia di regione
+        bnd: Dict[int, int] = {}  # edge -> region face
         for i in rf:
             for k in topo.f_edges[i]:
                 fs = topo.e_faces[k]
                 inside = [f for f in fs if f in rset]
                 if len(fs) < 2:
-                    return None, "bordo libero della mesh"
+                    return None, "free boundary of the mesh"
                 if len(inside) == 1:
                     bnd[k] = i
         if not bnd:
-            return None, "nessun bordo"
-        # verso di percorrenza: interno della faccia a sinistra rispetto alla
-        # normale uscente (indipendente dalle convenzioni di orientamento OCC)
+            return None, "no boundary"
+        # direction of travel: the face's interior to the left relative to
+        # the outward normal (independent of OCC's orientation conventions)
         dir_edge: Dict[int, Tuple[int, int]] = {}
         out_v: Dict[int, List[int]] = defaultdict(list)
         for k, i in bnd.items():
@@ -5454,7 +5516,7 @@ class Engine:
             dir_edge[k] = (a, b)
             out_v[a].append(k)
 
-        # percorrenza con rotazione attorno al vertice (gestisce i nodi a 4)
+        # traversal by rotating around the vertex (handles degree-4 nodes)
         def next_edge(k_in: int) -> Optional[int]:
             a, b = dir_edge[k_in]
             cands = out_v.get(b, [])
@@ -5490,9 +5552,9 @@ class Engine:
                 seq.append(k)
                 k = next_edge(k)
             if k != k0 and (not seq or dir_edge[seq[-1]][1] != dir_edge[seq[0]][0]):
-                return None, "bordo non richiudibile"
+                return None, "boundary can't be closed"
             loops.append(seq)
-        # catene: si spezza dove cambia il vicino
+        # chains: split where the neighbor changes
         out: List[Loop] = []
         for seq in loops:
             nbs = []
@@ -5523,20 +5585,20 @@ class Engine:
             out.append(Loop(chains))
         return out, ""
 
-    # --- conversione di una regione -------------------------------------------
+    # --- converting a region -----------------------------------------------------
     def _safe(self, *a, **k) -> Tuple[bool, str]:
         """
-        _convert() con la rete.
-        ⚠️ QUI NON SI MUORE. Il motore lavora su una COPIA (self.shape cambia
-        solo dopo la validazione), quindi una regione che esplode a meta' e'
-        semplicemente una regione scartata: il pezzo resta quello di prima e la
-        corsa continua. Senza questo, una sola primitiva malata buttava via
-        tutto il lavoro gia' fatto - su test9 con --tol 0.0005 era un cono
-        degenerato dal raffinamento (vedi LM_MAX_SLOPE) e lo script moriva
-        dopo venti minuti di Fase C.
-        Le uniche cose che il motore tocca SUL POSTO sono le tolleranze di
-        vertici e spigoli condivisi, e di quelle c'e' il backup: si rimettono
-        a posto qui.
+        _convert() with the safety net.
+        ⚠️ NOTHING DIES HERE. The engine works on a COPY (self.shape only
+        changes after validation), so a region that blows up halfway
+        through is simply a discarded region: the part stays as it was and
+        the run continues. Without this, a single sick primitive used to
+        throw away all the work already done - on test9 with --tol 0.0005
+        it was a cone degenerated by the refinement (see LM_MAX_SLOPE) and
+        the script died after twenty minutes of Phase C.
+        The only things the engine touches IN PLACE are the tolerances of
+        shared vertices and edges, and those have a backup: they're
+        restored here.
         """
         try:
             return self._convert(*a, **k)
@@ -5548,57 +5610,58 @@ class Engine:
             except Exception:
                 pass
             self._vtol_backup = {}
-            Log.debug(f"    !! eccezione nella conversione: {type(ex).__name__}: {ex}")
-            return False, f"eccezione {type(ex).__name__}"
+            Log.debug(f"    !! exception during conversion: {type(ex).__name__}: {ex}")
+            return False, f"exception {type(ex).__name__}"
 
     def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
         mt0 = max_tolerance(self.shape) if self.verbose else 0.0
         ok, why = self._safe(R, strict_hole)
-        # ⚠️ SECONDA STRATEGIA: se il vicino piano ricostruito con l'arco esatto
-        # esce non valido (o l'orientamento non torna, che e' lo stesso caso
-        # visto dall'altro tentativo), si riprova lasciando POLIGONALI i bordi
-        # coi piani: la faccia analitica si converte lo stesso, il bordo resta
-        # quello della mesh.
-        retry = "vicina" in why or "orientamento" in why or "volume" in why
+        # ⚠️ SECOND STRATEGY: if the planar neighbor rebuilt with the exact
+        # arc comes out invalid (or the orientation doesn't work out, which
+        # is the same case seen from the other attempt), retry leaving the
+        # boundaries with the planes POLYGONAL: the analytic face still
+        # converts, the boundary stays the mesh's.
+        retry = "neighbor" in why or "orientation" in why or "volume" in why
         if not ok and not strict_hole and retry:
             ok2, why2 = self._safe(R, strict_hole, analytic_planes=False)
             if ok2:
                 ok, why = ok2, why2
-                R.note += " · bordi coi piani lasciati poligonali"
-            elif "vicina" in why2 or "orientamento" in why2 or "volume" in why2:
-                # ⚠️ TERZA STRATEGIA: nessuno spigolo nuovo, da nessuna parte.
-                # Serve quando il vicino e' una faccia analitica CHIUSA (un foro
-                # gia' convertito, col suo seam): rifarle il bordo la rompe
-                # ("wire:NotConnected"). Cosi' la regione diventa comunque una
-                # superficie esatta e il contorno resta IDENTICO alla mesh:
-                # nessun vicino viene toccato, nessuna scheggia nuova.
+                R.note += " · boundaries with the planes left polygonal"
+            elif "neighbor" in why2 or "orientation" in why2 or "volume" in why2:
+                # ⚠️ THIRD STRATEGY: no new edge, anywhere. Needed when the
+                # neighbor is a CLOSED analytic face (an already-converted
+                # hole, with its own seam): rebuilding its boundary breaks
+                # it ("wire:NotConnected"). This way the region still
+                # becomes an exact surface and the contour stays IDENTICAL
+                # to the mesh: no neighbor is touched, no new sliver.
                 ok3, why3 = self._safe(R, strict_hole, analytic_planes=False, analytic_curved=False)
                 if ok3:
                     ok, why = ok3, why3
-                    R.note += " · contorno lasciato poligonale"
-        # ⚠️ QUARTA STRATEGIA: niente curve "tirate per i vertici". Quando
-        # l'intersezione esatta non esiste il codice ripiega su un cerchio (o
-        # una retta) che passa per i vertici della catena. Quel cerchio sta
-        # sulla superficie a meno di un decimo di tolleranza, ma NON ci sta
-        # sopra: proiettato in (u,v) sbuca fuori dal contorno di un paio di
-        # decimillimetri e il wire esce auto-intersecante. Costa poco
-        # riprovare lasciando quella catena poligonale: la faccia analitica si
-        # converte lo stesso ed e' molto meglio di una regione tassellata.
+                    R.note += " · contour left polygonal"
+        # ⚠️ FOURTH STRATEGY: no curves "stretched through the vertices".
+        # When the exact intersection doesn't exist, the code falls back
+        # to a circle (or a line) passing through the chain's vertices.
+        # That circle sits within a tenth of the tolerance of the surface,
+        # but does NOT lie on it: projected in (u,v) it pokes a couple of
+        # tenths of a millimeter outside the contour and the wire comes
+        # out self-intersecting. It costs little to retry leaving that
+        # chain polygonal: the analytic face still converts and it's much
+        # better than a tessellated region.
         if not ok and not strict_hole and ("SelfIntersecting" in why or "Intersecting" in why):
             ok4, why4 = self._safe(R, strict_hole, fitted_curves=False)
             if ok4:
                 ok, why = ok4, why4
-                R.note += " · bordi approssimati lasciati poligonali"
+                R.note += " · approximated boundaries left polygonal"
         if self.verbose:
             mt1 = max_tolerance(self.shape)
             if mt1 > max(mt0 * 1.5, self.max_edge_tol):
-                Log.debug(f"    !! tolleranza massima salita da {mt0:.1e} a {mt1:.1e} ({'accettata' if ok else 'scartata'})")
+                Log.debug(f"    !! max tolerance rose from {mt0:.1e} to {mt1:.1e} ({'accepted' if ok else 'discarded'})")
         if ok:
             self.n_ok += 1
             R.status = "OK"
         else:
             self.n_fail += 1
-            R.status = "scartata: " + why
+            R.status = "rejected: " + why
         if self.verbose or not ok:
             Log.debug(f"  {R.label()} -> {R.status}")
         return ok, why
@@ -5608,16 +5671,16 @@ class Engine:
         prim = R.prim
         rf = [topo.face_index(f) for f in R.fobjs]
         if any(i < 0 for i in rf):
-            return False, "facce della regione non piu' presenti"
+            return False, "region's faces no longer present"
         rset = set(rf)
         self._rset = rset
         self._rf = rf
         loops, why = self.region_loops(rf)
-        # ⚠️ BORDO NON RICHIUDIBILE: quasi sempre un vertice di strozzatura, dove
-        # due tratti del bordo della stessa regione si toccano (faccette a
-        # sliver). Si tolgono le faccette che passano da quei vertici, si tiene
-        # la componente piu' grande e si riprova: il grosso della regione si
-        # converte, gli sliver restano tassellati.
+        # ⚠️ BOUNDARY CAN'T BE CLOSED: almost always a pinch vertex, where
+        # two stretches of the same region's boundary touch (sliver
+        # facets). The facets passing through those vertices are removed,
+        # the largest component is kept and it's retried: the bulk of the
+        # region converts, the slivers stay tessellated.
         for _ in range(3):
             if loops is not None:
                 break
@@ -5639,26 +5702,26 @@ class Engine:
             return False, why
         if strict_hole:
             if not (prim.kind == AXIAL and abs(prim.slope) < 1e-12 and R.closed_u and R.concave):
-                return False, "non e' un foro cilindrico passante/cieco"
+                return False, "not a through/blind cylindrical hole"
             if len(loops) != 2 or any(len(L.chains) != 1 or not L.chains[0].closed for L in loops):
                 desc = "; ".join(
-                    f"anello {k}: {len(L.chains)} catene, vicini "
-                    + ",".join(("piano" if (ch.nb >= 0 and topo.planar[ch.nb] and topo.nverts[ch.nb] > 4) else f"faccetta{topo.nverts[ch.nb] if ch.nb >= 0 else ''}") for ch in L.chains[:6])
+                    f"ring {k}: {len(L.chains)} chains, neighbors "
+                    + ",".join(("plane" if (ch.nb >= 0 and topo.planar[ch.nb] and topo.nverts[ch.nb] > 4) else f"facet{topo.nverts[ch.nb] if ch.nb >= 0 else ''}") for ch in L.chains[:6])
                     for k, L in enumerate(loops)
                 )
-                return False, f"bordo del foro non e' fatto di due anelli semplici ({desc})"
+                return False, f"the hole's boundary isn't made of two simple rings ({desc})"
             for L in loops:
                 nb = L.chains[0].nb
                 if nb < 0 or not topo.planar[nb]:
-                    return False, "il foro non termina su facce piane"
+                    return False, "the hole doesn't end on planar faces"
                 if abs(abs(float(topo.norms[nb] @ prim.axis)) - 1.0) > 1e-4:
-                    return False, "faccia di sbocco non ortogonale all'asse"
+                    return False, "opening face not orthogonal to the axis"
         if R.closed_u and len(loops) != 2:
-            return False, f"regione chiusa a 360 gradi con {len(loops)} anelli (attesi 2)"
+            return False, f"region closed 360 degrees with {len(loops)} rings (expected 2)"
         if not R.closed_u and prim.kind in (AXIAL, TORUS) and R.coverage > 0.97:
-            return False, "copertura angolare ambigua"
+            return False, "ambiguous angular coverage"
 
-        # --- superficie: cornice scelta lontano dal seam ------------------------
+        # --- surface: frame chosen away from the seam ----------------------------
         C = np.array([topo.cents[i] for i in rf])
         W = np.array([max(topo.areas[i], 1e-12) for i in rf])
         ref = None
@@ -5668,17 +5731,17 @@ class Engine:
             d = d / np.maximum(np.linalg.norm(d, axis=1), 1e-12)[:, None]
             m = (d * W[:, None]).sum(axis=0) / W.sum()
             if float(np.linalg.norm(m)) < 0.2:
-                return False, "sfera: regione troppo estesa (piu' di un emisfero)"
+                return False, "sphere: region too wide (more than a hemisphere)"
             ref = m / np.linalg.norm(m)
-            # asse polare: ortogonale alla direzione media, il piu' lontano
-            # possibile dai punti della regione (poli fuori dalla faccia)
+            # polar axis: orthogonal to the mean direction, as far as
+            # possible from the region's points (poles outside the face)
             u_, v_ = ortho_frame(ref)
             phi = np.linspace(0.0, math.pi, 91)
             A = np.cos(phi)[:, None] * u_ + np.sin(phi)[:, None] * v_
             worst = np.abs(A @ d.T).max(axis=1)
             kbest = int(np.argmin(worst))
             if worst[kbest] > math.cos(math.radians(20.0)):
-                return False, "sfera: polo troppo vicino alla regione"
+                return False, "sphere: pole too close to the region"
             pole_axis = A[kbest]
         elif prim.kind in (AXIAL, TORUS):
             d = C - prim.center
@@ -5696,12 +5759,12 @@ class Engine:
             if why:
                 return False, why
 
-        # --- catene -> spigoli ----------------------------------------------------
+        # --- chains -> edges -----------------------------------------------------
         new_edges: Dict[int, Tuple[object, bool]] = {}  # id(chain) -> (edge, fwd)
         replaced: List[Tuple[Chain, object, bool]] = []
         n_analytic = n_poly = n_reused = 0
         vtol_backup: Dict[int, float] = {}
-        self._vtol_backup = vtol_backup  # stesso dizionario: serve a _safe()
+        self._vtol_backup = vtol_backup  # same dict: _safe() needs it
 
         def vertex_obj(j):
             return td_Vertex(topo.vmap.FindKey(j + 1))
@@ -5720,30 +5783,33 @@ class Engine:
                 len_tot += Lc
                 if ch.nb >= 0 and topo.nverts[ch.nb] <= 4 and topo.areas[ch.nb] < 3.0 * med_area:
                     len_debris += Lc
-        # ⚠️ REGIONE-FRAMMENTO IN MEZZO AL TASSELLATO. Una primitiva fittata su
-        # quattro o cinque faccette, col bordo quasi tutto appoggiato ad altre
-        # faccette sciolte, non e' una lavorazione del pezzo: e' il rumore
-        # della zona di raccordo. Convertirla produce proprio le "tante facce
-        # con forme irregolari" (raggi a caso, ø1.4589, ø2.0204...) che
-        # sporcano il modello. Meglio lasciare li' la mesh: si rifinisce a mano.
+        # ⚠️ FRAGMENT-REGION AMID TESSELLATION. A primitive fitted on four
+        # or five facets, with its boundary resting almost entirely on
+        # other loose facets, isn't a real feature of the part: it's the
+        # noise of a fillet zone. Converting it produces exactly the
+        # "lots of irregularly shaped faces" (random radii, ø1.4589,
+        # ø2.0204...) that clutter the model. Better to leave the mesh
+        # there: it gets cleaned up by hand.
         if not strict_hole and len(rf) < 12 and not R.repeated and len_debris > 0.6 * max(len_tot, 1e-9):
-            return False, (f"regione piccola e isolata in mezzo a faccette tassellate ({len(rf)} facce, {100.0 * len_debris / max(len_tot, 1e-9):.0f}% del bordo): lasciata la mesh")
+            return False, (f"small region isolated among tessellated facets ({len(rf)} faces, {100.0 * len_debris / max(len_tot, 1e-9):.0f}% of the boundary): left as mesh")
         for L in loops:
             for ch in L.chains:
                 if ch.nb < 0:
-                    return False, "bordo libero"
+                    return False, "free boundary"
                 if len(ch.edges) == 1 and not ch.closed:
-                    # ⚠️ SMUSSO ACCANTO A RACCORDO. Uno spigolo solo di solito e'
-                    # gia' buono e si riusa com'e'. Ma quando il vicino e' una
-                    # fascia larga tassellata con un'unica corda (la fine di uno
-                    # smusso, la quad alta 10 mm di un raccordo verticale), quella
-                    # corda TAGLIA la superficie nuova: mezzo centesimo di
-                    # millimetro sotto la sfera. La faccia allora viene scartata
-                    # per tolleranza, e al suo posto resta la tassellatura. Qui si
-                    # guarda quanto lo spigolo si stacca davvero dalla superficie:
-                    # se e' piu' della tolleranza di fit, si prosegue e si prova a
-                    # rifarlo con la curva esatta (sfera x piano = cerchio), che
-                    # sta sia sulla faccia nuova sia sul piano del vicino.
+                    # ⚠️ CHAMFER NEXT TO A FILLET. A single edge is usually
+                    # already good and gets reused as is. But when the
+                    # neighbor is a wide band tessellated with a single
+                    # chord (the end of a chamfer, the 10 mm-tall quad of a
+                    # vertical fillet), that chord CUTS through the new
+                    # surface: half a hundredth of a millimeter below the
+                    # sphere. The face then gets rejected for tolerance,
+                    # and the tessellation stays in its place. Here we
+                    # check how far the edge really is from the surface:
+                    # if it's more than the fit tolerance, we go on and try
+                    # to rebuild it with the exact curve (sphere x plane =
+                    # circle), which lies both on the new face and on the
+                    # neighbor's plane.
                     _dv = self._edge_dev(ch.edges[0], prim)
                     if self.verbose:
                         Log.debug(
@@ -5759,45 +5825,46 @@ class Engine:
                     continue
                 nbp = self.prim_of_face(ch.nb)
                 if nbp is not None and nbp.kind == FREE:
-                    nbp = None  # niente curve esatte contro una forma libera
+                    nbp = None  # no exact curves against a free-form shape
                 if not analytic_curved and nbp is not None and nbp.kind != PLANE:
                     nbp = None
-                # ⚠️ un vicino piano grande quanto una faccetta non e' un piano
-                # del pezzo: e' un pezzetto di superficie curva ridotta a piani
-                # dalla Fase A. Sostituirgli il bordo con un arco esatto lo fa
-                # auto-intersecare: si tiene la polilinea.
+                # ⚠️ a planar neighbor as small as a single facet isn't a
+                # real plane of the part: it's a scrap of curved surface
+                # flattened by Phase A. Replacing its boundary with an
+                # exact arc makes it self-intersect: the polyline is kept.
                 if nbp is not None and nbp.kind == PLANE and (not analytic_planes or topo.areas[ch.nb] < 20.0 * med_area):
                     nbp = None
                 cv = None
                 P = topo.vpos[ch.verts]
                 if nbp is not None:
-                    # ⚠️ QUANTO PUO' SPORGERE L'ARCO. Il metro e' la freccia
-                    # della mesh nella regione: la spezzata del bordo e' una
-                    # corda della curva vera, quindi se ne discosta come le
-                    # faccette si discostano dalla superficie. Con un metro
-                    # piu' largo passa anche la curva sbagliata: su un bordo
-                    # di 0.65 mm veniva accettato un arco di raggio 0.36 che
-                    # sporgeva di 0.2 mm (quasi una semicirconferenza), le
-                    # pcurve si incrociavano e la faccia usciva
-                    # "SelfIntersectingWire".
+                    # ⚠️ HOW FAR THE ARC CAN STICK OUT. The yardstick is the
+                    # mesh's sag in the region: the boundary's polyline is a
+                    # chord of the true curve, so it deviates the way the
+                    # facets deviate from the surface. With a wider
+                    # yardstick even the wrong curve passes: on a 0.65 mm
+                    # boundary, a radius-0.36 arc sticking out by 0.2 mm
+                    # (almost a semicircle) was being accepted, the pcurves
+                    # crossed and the face came out "SelfIntersectingWire".
                     cands = surf_surf_curves(prim, nbp, self.tol_fit)
                     cv = choose_curve(cands, P, self.tol_curve, scale=self.diag, arc_tol=max(self.tol_curve, 2.0 * R.sag))
-                    # ⚠️ SUPERFICI TANGENTI (raccordo-piano, sfera-raccordo): la
-                    # curva di intersezione esatta e' mal condizionata, un
-                    # vertice a 1e-6 da entrambe le superfici puo' stare a
-                    # 3e-3 dalla curva. Allora si prende la curva che passa
-                    # per i vertici della mesh: e' coerente con l'ingresso, e
-                    # la tolleranza dello spigolo ne misura lo scarto vero.
+                    # ⚠️ TANGENT SURFACES (fillet-plane, sphere-fillet): the
+                    # exact intersection curve is poorly conditioned, a
+                    # vertex 1e-6 from both surfaces can be 3e-3 from the
+                    # curve. So the curve passing through the mesh's
+                    # vertices is taken instead: it's consistent with the
+                    # input, and the edge's tolerance measures its true
+                    # deviation.
                     if cv is None and fitted_curves and len(ch.verts) >= 4:
                         Pq = P[:-1] if ch.closed else P
                         cv = fit_curve(Pq, self.tol_curve, arc_tol=max(self.tol_curve, 2.0 * R.sag))
-                    # ⚠️ vicino CURVO gia' convertito e nessuna curva analitica:
-                    # intersezione generica delle due superfici (B-spline)
+                    # ⚠️ CURVED neighbor already converted and no analytic
+                    # curve: generic intersection of the two surfaces (B-spline)
                     if cv is None and nbp.kind != PLANE and not ch.closed and len(ch.verts) >= 3:
-                        # ⚠️ il confine della mesh fra due regioni e' una SCALETTA di
-                        # faccette: i vertici interni stanno fino a una faccetta
-                        # dalla curva vera. Contano solo gli ESTREMI (che restano
-                        # come vertici): i vertici interni spariscono con la curva.
+                        # ⚠️ the mesh's boundary between two regions is a
+                        # STAIRCASE of facets: interior vertices sit up to
+                        # a facet away from the true curve. Only the
+                        # ENDPOINTS matter (which stay as vertices):
+                        # interior vertices disappear along with the curve.
                         try:
                             sn = bt_Surface(topo.faces[ch.nb], TopLoc_Location())
                             gen = intersection_curves(surf, sn, self.tol_fit)
@@ -5806,7 +5873,7 @@ class Engine:
                             cv = choose_curve(gen, P, loose, arc_tol=loose)
                             if self.verbose:
                                 Log.debug(
-                                    f"    IntSS: {len(gen)} curve, scarti "
+                                    f"    IntSS: {len(gen)} curves, deviations "
                                     f"{[f'{float(np.abs(g.dist(P)).max()):.1e}/{arc_deviation(g, P):.1e}' for g in gen]} "
                                     f"tol {loose:.1e} -> {None if cv is None else 'ok'}"
                                 )
@@ -5815,24 +5882,24 @@ class Engine:
                                 if d_ends > self.max_edge_tol:
                                     cv = None
                         except Exception as ex:
-                            Log.debug(f"intersezione generica: {ex}")
+                            Log.debug(f"generic intersection: {ex}")
                 if self.verbose:
                     _c = surf_surf_curves(prim, nbp, self.tol_fit) if nbp is not None else []
                     _d = [f"{c.label()}:{float(np.abs(c.dist(P)).max()):.1e}/{arc_deviation(c, P):.1e}" for c in _c]
                     _f = fit_curve(P[:-1] if ch.closed else P, self.tol_curve, arc_tol=max(self.tol_curve, 2.0 * R.sag))
                     Log.debug(
-                        f"    catena {len(ch.edges)} spigoli, vicino {'-' if nbp is None else nbp.label()}"
+                        f"    chain {len(ch.edges)} edges, neighbor {'-' if nbp is None else nbp.label()}"
                         f"{'' if nbp is None or nbp.kind != PLANE else f' area {topo.areas[ch.nb]:.2f}'}: "
-                        f"candidate {_d} fit {None if _f is None else _f.label()} "
+                        f"candidates {_d} fit {None if _f is None else _f.label()} "
                         f"-> {None if cv is None else cv.label()}  (tol {self.tol_curve:.1e}, arc {max(self.tol_curve, 4.0 * R.sag):.1e})"
                     )
                 if cv is None:
                     if strict_hole:
-                        return False, "bordo del foro non e' un cerchio"
+                        return False, "the hole's boundary isn't a circle"
                     if not self.allow_polyline:
-                        return False, "bordo poligonale non convertibile"
+                        return False, "polygonal boundary not convertible"
                     if len(ch.edges) == 1:
-                        n_reused += 1  # resta lo spigolo della mesh
+                        n_reused += 1  # the mesh's edge stays
                     else:
                         n_poly += 1
                     continue
@@ -5848,16 +5915,17 @@ class Engine:
                 e, fwd_is_v1 = make_edge_on_curve(cv, V1, V2, topo.vpos[j1], topo.vpos[j2], Pmid, ch.closed, Pnext)
                 if e is None:
                     self._restore_vertices(vtol_backup)
-                    return False, f"MakeEdge fallita su {cv.label()}"
+                    return False, f"MakeEdge failed on {cv.label()}"
                 e = td_Edge(e)
-                # ⚠️ se il vicino e' una faccia analitica CURVA gia' convertita,
-                # il nuovo spigolo ha bisogno della pcurve anche sulla SUA
-                # superficie, e ce l'ha da SUBITO: BRepCheck sulla faccia vicina
-                # ricostruita, senza pcurve, risponde "UnorientableShape".
-                # ⚠️ anche un vicino PIANO ha bisogno della pcurve quando lo
-                # spigolo nuovo non e' retta/cerchio/ellisse: la proiezione di
-                # un'iperbole sul piano OCC non se la calcola da sola e la
-                # faccia vicina esce "UnorientableShape".
+                # ⚠️ if the neighbor is an already-converted CURVED analytic
+                # face, the new edge needs the pcurve on ITS surface too,
+                # and needs it RIGHT AWAY: BRepCheck on the rebuilt
+                # neighboring face, without the pcurve, answers
+                # "UnorientableShape".
+                # ⚠️ even a PLANAR neighbor needs the pcurve when the new
+                # edge isn't a line/circle/ellipse: OCC's plane projection
+                # can't compute a hyperbola's on its own, and the
+                # neighboring face comes out "UnorientableShape".
                 if nbp is not None and (nbp.kind != PLANE or isinstance(cv, CHyperbola)):
                     why = self._pcurve_on_neighbor(e, ch.nb, nbp)
                     if why:
@@ -5868,8 +5936,8 @@ class Engine:
                 n_analytic += 1
 
         if self.verbose:
-            Log.debug(f"    BORDO {R.label()[:34]}: {len_tot:.2f} mm, di cui {len_debris:.2f} mm ({100.0 * len_debris / max(len_tot, 1e-9):.0f}%) contro faccette tassellate")
-        # --- seam per le regioni chiuse ---------------------------------------------
+            Log.debug(f"    BOUNDARY {R.label()[:34]}: {len_tot:.2f} mm, of which {len_debris:.2f} mm ({100.0 * len_debris / max(len_tot, 1e-9):.0f}%) against tessellated facets")
+        # --- seam for closed regions --------------------------------------------------
         seam = None
         if not R.closed_u:
             self._seam_path = None
@@ -5879,13 +5947,14 @@ class Engine:
                 self._restore_vertices(vtol_backup)
                 return False, why
 
-        # --- wire e faccia ---------------------------------------------------------
+        # --- wire and face -----------------------------------------------------------
         bb = BRep_Builder()
         F = TopoDS_Face()
         bb.MakeFace(F, surf, 1e-7)
-        # verso dei wire: antiorario rispetto alla normale NATURALE della
-        # superficie. La percorrenza della mesh e' antioraria rispetto alla
-        # normale USCENTE: se la superficie e' concava (foro) va invertita.
+        # wire direction: counterclockwise relative to the surface's
+        # NATURAL normal. The mesh's traversal is counterclockwise relative
+        # to the OUTWARD normal: if the surface is concave (a hole) it must
+        # be flipped.
         flip = R.concave
         self._etol_backup = {}
         wires = self._build_wires(F, sp, loops, new_edges, seam, flip)
@@ -5894,46 +5963,47 @@ class Engine:
             return False, wires
         for w, _, _ in wires:
             bb.Add(F, w)
-        # ⚠️ IL TETTO VA MISURATO SULLA MESH, NON SUL PEZZO. Un bordo lasciato
-        # com'era si stacca dalla superficie nuova esattamente della freccia
-        # delle corde della mesh: su una tassellatura grossolana (un raccordo
-        # R1.5 diviso in quattro faccette da 22 gradi) sono tre centesimi, e
-        # un tetto assoluto li boccia tutti. Ma quel tre centesimi c'e' gia'
-        # nell'ingresso: rifiutando la regione non si guadagna precisione, si
-        # perde solo la superficie esatta e restano le faccette. Quindi il
-        # tetto e' il piu' largo fra quello assoluto e la freccia della
-        # regione, che e' proprio lo scarto che la mesh si porta dietro.
-        # ...ma con un limite: su un fit sballato (un "cilindro" da 143 mm
-        # tirato su quattro faccette enormi) la freccia e' millimetrica, e
-        # senza un tetto duro la regione passerebbe deformando il pezzo.
+        # ⚠️ THE CEILING MUST BE MEASURED AGAINST THE MESH, NOT THE PART. A
+        # boundary left as it was deviates from the new surface by exactly
+        # the mesh's chord sag: on a coarse tessellation (an R1.5 fillet
+        # split into four 22-degree facets) that's three hundredths, and an
+        # absolute ceiling rejects all of them. But those three hundredths
+        # are already in the input: rejecting the region gains no
+        # precision, it only loses the exact surface and the facets
+        # remain. So the ceiling is the wider of the absolute one and the
+        # region's sag, which is exactly the deviation the mesh carries
+        # with it. ...but with a limit: on a botched fit (a 143 mm
+        # "cylinder" stretched over four huge facets) the sag is
+        # millimeter-sized, and without a hard ceiling the region would
+        # pass through, deforming the part.
         tol_cap = max(self.max_edge_tol, min(2.0 * R.sag, 5.0 * self.max_edge_tol))
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
             self._restore_all(vtol_backup)
-            return False, (f"tolleranza degli spigoli poligonali {worst_edge_tol:.1e} > tetto {tol_cap:.1e}")
+            return False, (f"polygonal edge tolerance {worst_edge_tol:.1e} > ceiling {tol_cap:.1e}")
 
         det = check_detail(F)
         if det:
             if self.verbose:
                 self._dump_face(F)
             self._restore_all(vtol_backup)
-            return False, "faccia non valida: " + ", ".join(det)
+            return False, "invalid face: " + ", ".join(det)
         mt = max_tolerance(F)
-        # la faccia puo' portarsi dietro la tolleranza che gli spigoli avevano
-        # gia': quella non l'abbiamo messa noi
+        # the face can carry along the tolerance the edges already had:
+        # we're not the ones who put it there
         if mt > max(tol_cap, max((t for _, t, _ in wires), default=0.0)):
             self._restore_all(vtol_backup)
-            return False, f"tolleranza {mt:.1e} sulla faccia nuova oltre il tetto {tol_cap:.1e}"
+            return False, f"tolerance {mt:.1e} on the new face beyond the ceiling {tol_cap:.1e}"
         a_mesh = float(sum(topo.areas[i] for i in rf))
         a_new = face_area(F)
         perim = sum(edge_length(topo.edges[k]) for L in loops for ch in L.chains for k in ch.edges)
         if abs(a_new - a_mesh) > 0.03 * a_mesh + 2.0 * R.sag * perim + 1e-9:
             self._restore_all(vtol_backup)
-            return False, f"area incoerente: {a_new:.4f} contro {a_mesh:.4f} mm2 della mesh"
+            return False, f"inconsistent area: {a_new:.4f} against the mesh's {a_mesh:.4f} mm2"
 
-        # --- sostituzione nel solido -----------------------------------------------
-        # wire dei vicini PRIMA della sostituzione: un vicino che dopo ne ha di
-        # piu' ha un anello spurio (spigoli vecchi rimasti + arco nuovo = tacca)
+        # --- replacement in the solid --------------------------------------------
+        # neighbors' wires BEFORE the replacement: a neighbor that ends up
+        # with more of them has a spurious ring (old edges left + new arc = notch)
         self._nb_wires = {}
         for ch, _, _ in replaced:
             if ch.nb not in self._nb_wires:
@@ -5941,16 +6011,17 @@ class Engine:
         for attempt in range(2):
             Fo = F if attempt == 0 else td_Face(F.Reversed())
             rs = BRepTools_ReShape()
-            # chiavi sempre FORWARD: ReShape compone l'orientamento del nuovo
-            # con quello RELATIVO fra la chiave e l'occorrenza nel solido
+            # keys always FORWARD: ReShape composes the new orientation with
+            # the RELATIVE one between the key and its occurrence in the solid
             rs.Replace(td_Face(topo.faces[rf[0]].Oriented(TopAbs_FORWARD)), Fo)
             for i in rf[1:]:
                 rs.Remove(td_Face(topo.faces[i].Oriented(TopAbs_FORWARD)))
             for ch, e, fwd_is_v1 in replaced:
                 first = topo.edges[ch.edges[0]]
-                # e FORWARD va da V1 a V2 se fwd_is_v1; la catena percorre first
-                # nel verso ch.fwd[0]. L'orientamento del nuovo spigolo relativo
-                # al vecchio: uguale se entrambi vanno nello stesso verso.
+                # e FORWARD goes from V1 to V2 if fwd_is_v1; the chain
+                # traverses first in direction ch.fwd[0]. The new edge's
+                # orientation relative to the old one: the same if both go
+                # the same way.
                 same = fwd_is_v1 == ch.fwd[0]
                 rs.Replace(first, e if same else td_Edge(e.Reversed()))
                 for k in ch.edges[1:]:
@@ -5962,36 +6033,36 @@ class Engine:
                 return False, f"ReShape: {type(ex).__name__}: {ex}"
             ok, why = self._validate(new_shape, Fo, rf, replaced, R, a_mesh, sp)
             if self.verbose:
-                Log.debug(f"    tentativo {attempt + 1} (Fo {Fo.Orientation()}): {'ok' if ok else why}")
+                Log.debug(f"    attempt {attempt + 1} (Fo {Fo.Orientation()}): {'ok' if ok else why}")
             if ok:
                 break
-            # ⚠️ quando NESSUN bordo e' stato sostituito (tutte le catene
-            # poligonali) il controllo di orientamento non ha spigoli nuovi da
-            # guardare e non dice niente: l'errore si manifesta solo sul
-            # VOLUME. Anche in quel caso va provata la faccia rovesciata.
+            # ⚠️ when NO boundary was replaced (all chains polygonal) the
+            # orientation check has no new edges to look at and says
+            # nothing: the error only shows up on the VOLUME. Even in that
+            # case the flipped face has to be tried.
             if attempt == 1 or ("orient" not in why and "volume" not in why):
                 self._restore_all(vtol_backup)
                 return False, why
-        # --- accettata ------------------------------------------------------------
-        # ⚠️ e i backup si buttano: le tolleranze gonfiate ora sono definitive,
-        # e le loro chiavi sono spigoli e vertici della topologia VECCHIA. Se
-        # restassero li', il rollback d'emergenza di _safe() sulla regione
-        # successiva le riporterebbe indietro e romperebbe questa faccia.
+        # --- accepted --------------------------------------------------------------
+        # ⚠️ and the backups are thrown away: the inflated tolerances are
+        # now final, and their keys are edges and vertices of the OLD
+        # topology. If they stayed there, _safe()'s emergency rollback on
+        # the next region would bring them back and break this face.
         self._etol_backup = {}
         self._vtol_backup = {}
         self._carry_registry(rs, new_shape)
         self._register(Fo, prim)
         self.shape = new_shape
         self.topo = Topo(new_shape, prev=self.topo)
-        R.note = f"{n_analytic} spigoli analitici · {n_reused} riusati · {n_poly} poligonali"
+        R.note = f"{n_analytic} analytic edges · {n_reused} reused · {n_poly} polygonal"
         return True, ""
 
     def _seam_path_search(self, targets_a: set, targets_b: set, sp: SurfParam, r_eff: float):
         """
-        Cammino di spigoli INTERNI alla regione (entrambe le facce nella
-        regione) da un vertice del primo anello a uno del secondo, il piu'
-        "verticale" possibile (costo = scarto in u x raggio). Ritorna
-        (A, B, [(indice spigolo, fwd), ...]) oppure None.
+        A path of edges INTERNAL to the region (both faces inside the
+        region) from a vertex of the first ring to one of the second, as
+        "vertical" as possible (cost = u deviation x radius). Returns
+        (A, B, [(edge index, fwd), ...]) or None.
         """
         import heapq
 
@@ -6044,21 +6115,21 @@ class Engine:
         if best is None:
             return None
         _, A, B, edges = best
-        # lo scarto massimo in u lungo il cammino deve restare piccolo
+        # the maximum u deviation along the path must stay small
         uA = float(sp.uv(topo.vpos[A][None, :])[0][0])
         for k, _ in edges:
             for j in topo.e_verts[k]:
                 uj = float(sp.uv(topo.vpos[j][None, :])[0][0])
-                # gli spigoli del cammino sono spigoli VERI della mesh, stanno
-                # sulla superficie: uno scarto in u non e' un errore, basta che
-                # il cammino non faccia il giro (quarto di giro al massimo)
+                # the path's edges are REAL mesh edges, they lie on the
+                # surface: a deviation in u isn't an error, the path just
+                # must not go all the way around (a quarter turn at most)
                 if abs(float(np.angle(np.exp(1j * (uj - uA))))) > math.pi / 4:
                     return None
         return A, B, edges
 
     def _edge_dev(self, k: int, prim: "Prim") -> float:
-        """Quanto lo spigolo (la sua curva 3D, non solo gli estremi) si stacca
-        dalla superficie della regione."""
+        """How far the edge (its 3D curve, not just the endpoints) strays
+        from the region's surface."""
         try:
             curve, t0, t1 = edge_curve(self.topo.edges[k])
             if curve is None:
@@ -6069,7 +6140,7 @@ class Engine:
             return 0.0
 
     def _pinch_vertices(self, rf: List[int]) -> set:
-        """Vertici toccati da piu' di due spigoli di bordo della regione."""
+        """Vertices touched by more than two of the region's boundary edges."""
         topo = self.topo
         rset = set(rf)
         cnt: Dict[int, int] = defaultdict(int)
@@ -6083,11 +6154,11 @@ class Engine:
 
     def _align_closed_chains(self, loops, sp: SurfParam) -> str:
         """
-        Regione chiusa a 360 gradi: il seam andra' da un vertice A del primo
-        anello a un vertice B del secondo alla STESSA u. Una catena chiusa che
-        diventera' un cerchio ha UN solo vertice (quello di partenza): qui lo si
-        sceglie in modo che i due anelli siano allineati, PRIMA di creare gli
-        spigoli.
+        Region closed 360 degrees: the seam will run from vertex A of the
+        first ring to vertex B of the second, at the SAME u. A closed chain
+        that will become a circle has just ONE vertex (the starting one):
+        here it's chosen so the two rings line up, BEFORE the edges are
+        created.
         """
         topo = self.topo
 
@@ -6109,27 +6180,28 @@ class Engine:
             return sorted(set(out))
 
         L1, L2 = loops
-        # A: se il primo anello e' una catena chiusa, qualunque suo vertice va
-        # bene: si prende quello che allinea meglio col secondo anello
+        # A: if the first ring is a closed chain, any of its vertices will
+        # do: the one that aligns best with the second ring is picked
         c1, c2 = candidates(L1), candidates(L2)
         if not c1 or not c2:
-            return "anelli senza vertici"
+            return "rings with no vertices"
         u1, _ = sp.uv(topo.vpos[c1])
         u2, _ = sp.uv(topo.vpos[c2])
         D = np.abs(np.angle(np.exp(1j * (u2[None, :] - u1[:, None]))))
         ia, ib = np.unravel_index(int(np.argmin(D)), D.shape)
         A, B = c1[ia], c2[ib]
-        # ⚠️ FORI A PIU' FILE DI FACCETTE: i vertici dei due anelli non sono
-        # allineati (scarto anche 0.1 mm) e un seam dritto non esiste. Allora il
-        # seam e' un CAMMINO di spigoli della mesh interni alla regione, da A a
-        # un vertice del secondo anello: spigoli veri, sulla superficie, con le
-        # due pcurve calcolate come per qualsiasi altro spigolo.
+        # ⚠️ HOLES WITH MULTIPLE ROWS OF FACETS: the two rings' vertices
+        # aren't aligned (deviation up to 0.1 mm) and a straight seam
+        # doesn't exist. Then the seam is a PATH of mesh edges internal to
+        # the region, from A to a vertex of the second ring: real edges, on
+        # the surface, with both pcurves computed the same way as any other
+        # edge.
         self._seam_path = None
         r_eff = max(prim_radius(sp.prim), 1e-6)
         if D[ia, ib] * r_eff > self.max_edge_tol:
             path = self._seam_path_search(set(c1), set(c2), sp, r_eff)
             if path is None:
-                return f"seam: nessun vertice allineato sul secondo anello (scarto {D[ia, ib] * r_eff:.1e} mm)"
+                return f"seam: no aligned vertex on the second ring (deviation {D[ia, ib] * r_eff:.1e} mm)"
             A, B, edges = path
             self._seam_path = (A, B, edges)
         for ch in L1.chains:
@@ -6141,7 +6213,7 @@ class Engine:
         return ""
 
     def _dump_face(self, F) -> None:
-        """Diagnostica: pcurve di ogni spigolo di ogni wire (estremi in u,v)."""
+        """Diagnostics: pcurve of every edge of every wire (endpoints in u,v)."""
         cos_ = _st(BRep_Tool, "CurveOnSurface")
         for wi, w in enumerate(explore(F, TopAbs_WIRE)):
             Log.debug(f"    wire {wi} orient {w.Orientation()} closed3d={_st(BRep_Tool, 'IsClosed')(w) if hasattr(BRep_Tool, 'IsClosed_s') else '?'}")
@@ -6155,11 +6227,11 @@ class Engine:
                     Pa, Pb = edge_endpoints(e)
                     Log.debug(f"      edge {e.Orientation()} tol={bt_Tolerance(e):.1e} uv({a.X():+.4f},{a.Y():+.4f})->({b.X():+.4f},{b.Y():+.4f}) 3d {np.round(Pa, 3)}->{np.round(Pb, 3)}")
                 except Exception as ex_:
-                    Log.debug(f"      edge {e.Orientation()}: pcurve assente ({ex_})")
+                    Log.debug(f"      edge {e.Orientation()}: no pcurve ({ex_})")
                 ex.Next()
 
     def _restore_all(self, vbackup: Dict[int, float]) -> None:
-        """Rollback delle tolleranze gonfiate sul posto (vertici e spigoli condivisi)."""
+        """Rolls back the tolerances inflated in place (shared vertices and edges)."""
         self._restore_vertices(vbackup)
         for e, t in getattr(self, "_etol_backup", {}).values():
             set_tolerance(e, t)
@@ -6169,11 +6241,11 @@ class Engine:
         for j, t in backup.items():
             set_tolerance(td_Vertex(self.topo.vmap.FindKey(j + 1)), t)
 
-    # --- seam ------------------------------------------------------------------
+    # --- seam ----------------------------------------------------------------------
     def _make_seam(self, R: Region, sp: SurfParam, loops, new_edges, bump_vertex):
         """
-        Regione chiusa a 360 gradi: serve uno spigolo di seam da un vertice A del
-        primo anello a un vertice B del secondo, alla STESSA u.
+        Region closed 360 degrees: needs a seam edge from vertex A of the
+        first ring to vertex B of the second, at the SAME u.
         """
         topo = self.topo
 
@@ -6195,9 +6267,9 @@ class Engine:
         v1 = surviving_vertices(L1)
         v2 = surviving_vertices(L2)
         if not v1 or not v2:
-            return None, "anelli senza vertici"
-        # A: il primo vertice sopravvissuto di L1 (se L1 e' un cerchio chiuso e'
-        # obbligato); B: quello di L2 con la u piu' vicina
+            return None, "rings with no vertices"
+        # A: L1's first surviving vertex (forced if L1 is a closed circle);
+        # B: the one in L2 with the closest u
         u1, _ = sp.uv(topo.vpos[v1])
         u2, _ = sp.uv(topo.vpos[v2])
         best = None
@@ -6207,11 +6279,11 @@ class Engine:
             if best is None or du[ib] < best[0]:
                 best = (float(du[ib]), ja, v2[ib])
             if id(L1.chains[0]) in new_edges and L1.chains[0].closed:
-                break  # A e' obbligato
+                break  # A is forced
         du, A, B = best
         r_eff = prim_radius(R.prim)
         if du * r_eff > self.max_edge_tol:
-            return None, f"seam: nessun vertice allineato sul secondo anello (scarto {du * r_eff:.1e} mm)"
+            return None, f"seam: no aligned vertex on the second ring (deviation {du * r_eff:.1e} mm)"
         uA = float(sp.uv(topo.vpos[A][None, :])[0][0])
         vA = float(sp.uv(topo.vpos[A][None, :])[1][0])
         vB = float(sp.uv(topo.vpos[B][None, :])[1][0])
@@ -6219,9 +6291,9 @@ class Engine:
             vB = vA + float(np.angle(np.exp(1j * (vB - vA))))
         curve = sp.iso_u_curve(uA)
         if curve is None:
-            return None, "seam non disponibile per questa superficie"
+            return None, "seam not available for this surface"
         curve = _keep(curve)
-        # distanze reali dei vertici dalla curva del seam
+        # real distances of the vertices from the seam curve
         for j, t in ((A, vA), (B, vB)):
             q = curve.Value(t)
             bump_vertex(j, float(np.linalg.norm(topo.vpos[j] - np.array([q.X(), q.Y(), q.Z()]))))
@@ -6234,20 +6306,20 @@ class Engine:
             me = _keep(BRepBuilderAPI_MakeEdge(curve, VB, VA, vB, vA))
             fwd_from_A = False
         if not me.IsDone():
-            return None, "MakeEdge del seam fallita"
+            return None, "seam's MakeEdge failed"
         return ([(td_Edge(me.Edge()), fwd_from_A)], A, B, True), ""
 
-    # --- wire ------------------------------------------------------------------
+    # --- wire ----------------------------------------------------------------------
     def _build_wires(self, F, sp: SurfParam, loops, new_edges, seam, flip: bool):
         """
-        Costruisce i wire della faccia con le pcurve svolte lungo la percorrenza.
-        Ritorna [(wire, tolleranza max degli spigoli)] oppure una stringa d'errore.
+        Builds the face's wires with the pcurves unwrapped along the traversal.
+        Returns [(wire, max edge tolerance)] or an error string.
         """
         topo = self.topo
         bb = BRep_Builder()
 
         def chain_items(ch: Chain):
-            """[(edge, fwd, is_new)] nel verso di percorrenza della catena."""
+            """[(edge, fwd, is_new)] in the chain's direction of travel."""
             if id(ch) in new_edges:
                 e, fwd_is_v1 = new_edges[id(ch)]
                 return [(e, fwd_is_v1, True)]
@@ -6258,7 +6330,7 @@ class Engine:
             for ch in L.chains:
                 items.extend(chain_items(ch))
             if start_vertex is not None:
-                # ruota perche' il primo spigolo parta da start_vertex
+                # rotate so the first edge starts at start_vertex
                 for s in range(len(items)):
                     e, f, _ = items[s]
                     v0 = te_FirstVertex(td_Edge(e)) if f else te_LastVertex(td_Edge(e))
@@ -6280,8 +6352,8 @@ class Engine:
             it1 = loop_items(L1, A)
             it2 = loop_items(L2, B)
             if it1 is None or it2 is None:
-                return "seam: vertice di partenza non trovato sull'anello"
-            # [seam A->B, anello 2 da B a B, seam B->A, anello 1 da A ad A]
+                return "seam: starting vertex not found on the ring"
+            # [seam A->B, ring 2 from B to B, seam B->A, ring 1 from A to A]
             up = [(e, f, ("seam", k)) for k, (e, f) in enumerate(seam_edges)]
             down = [(e, not f, ("seam", k)) for k, (e, f) in reversed(list(enumerate(seam_edges)))]
             seq = up + it2 + down + it1
@@ -6301,10 +6373,10 @@ class Engine:
                 e = td_Edge(e)
                 curve, t0, t1 = edge_curve(e)
                 if curve is None:
-                    return "spigolo senza curva 3D"
+                    return "edge without a 3D curve"
                 c2d, (u_end, v_end), dev = make_pcurve(sp, curve, t0, t1, fwd, u_prev, v_prev)
                 if c2d is None:
-                    return "pcurve non calcolabile"
+                    return "pcurve can't be computed"
                 if u_start is None:
                     uu, vv = sp.uv(np.array([[curve.Value(t0 if fwd else t1).X(), curve.Value(t0 if fwd else t1).Y(), curve.Value(t0 if fwd else t1).Z()]]))
                     u_start, v_start = float(c2d.Value(t0 if fwd else t1).X()), float(c2d.Value(t0 if fwd else t1).Y())
@@ -6313,11 +6385,11 @@ class Engine:
                 tol_e = max(t_old, 1.2 * dev + 1e-7)
                 key = self.topo.emap.FindIndex(e)
                 if key > 0 and key not in self._etol_backup:
-                    self._etol_backup[key] = (e, t_old)  # spigolo condiviso: rollback
+                    self._etol_backup[key] = (e, t_old)  # shared edge: rollback
                 if isinstance(tag, tuple) and tag[0] == "seam":
-                    # ogni spigolo del seam compare due volte: una FORWARD e una
-                    # REVERSED. La prima pcurve di UpdateEdge(E, C1, C2, F) e'
-                    # quella dell'uso FORWARD, la seconda quella dell'uso REVERSED.
+                    # every seam edge appears twice: one FORWARD and one
+                    # REVERSED. UpdateEdge(E, C1, C2, F)'s first pcurve is
+                    # the FORWARD use's, the second the REVERSED use's.
                     kk = tag[1]
                     seam_pc[(kk, bool(fwd))] = (c2d, tol_e)
                     if (kk, True) in seam_pc and (kk, False) in seam_pc:
@@ -6328,44 +6400,46 @@ class Engine:
                         worst_own = max(worst_own, t_f, t_r)
                 else:
                     bb.UpdateEdge(e, c2d, F, tol_e)
-                    # ⚠️ quello che conta per il tetto e' lo scarto CHE
-                    # AGGIUNGIAMO NOI: se lo spigolo arriva gia' con una
-                    # tolleranza alta, gliel'ha data la conversione del vicino
-                    # ed e' gia' nel modello. Bocciare anche questa regione non
-                    # la toglie, toglie solo un'altra superficie esatta.
+                    # ⚠️ what matters for the ceiling is the deviation WE
+                    # ADD: if the edge already arrives with a high
+                    # tolerance, the neighbor's conversion gave it that and
+                    # it's already in the model. Rejecting this region too
+                    # doesn't remove it, it only removes another exact
+                    # surface.
                     worst_own = max(worst_own, 1.2 * dev + 1e-7)
                     if self.verbose and tol_e > self.max_edge_tol:
                         Log.debug(
-                            f"      spigolo oltre il tetto: tol {tol_e:.2e} "
-                            f"(scarto pcurve {dev:.2e}, tolleranza preesistente "
-                            f"{t_old:.2e}, lunghezza {edge_length(e):.4f}, "
-                            f"{'analitico' if edge_is_analytic(e) else 'polilinea'})"
+                            f"      edge beyond the ceiling: tol {tol_e:.2e} "
+                            f"(pcurve deviation {dev:.2e}, pre-existing tolerance "
+                            f"{t_old:.2e}, length {edge_length(e):.4f}, "
+                            f"{'analytic' if edge_is_analytic(e) else 'polyline'})"
                         )
                     worst = max(worst, tol_e)
                 bb.Add(w, e if fwd else td_Edge(e.Reversed()))
-            # chiusura nello spazio (u,v)
+            # closure in (u,v) space
             if u_start is not None and u_prev is not None:
                 gap = math.hypot(u_prev - u_start, v_prev - v_start)
-                # scarto in parametri: i vertici stanno sulla superficie a meno
-                # del rumore, quindi un piccolo scarto e' normale e lo copre la
-                # tolleranza; uno scarto di ~2pi e' un errore di svolgimento
+                # deviation in parameters: the vertices lie on the surface
+                # within the noise, so a small deviation is normal and the
+                # tolerance covers it; a deviation of ~2pi is an unwrapping error
                 r_eff = max(prim_radius(sp.prim), 1e-3)
                 if gap * r_eff > 4.0 * self.max_edge_tol:
-                    return f"wire non chiuso nei parametri (scarto {gap:.1e}, du {u_prev - u_start:+.3f} dv {v_prev - v_start:+.3f})"
+                    return f"wire not closed in parameter space (deviation {gap:.1e}, du {u_prev - u_start:+.3f} dv {v_prev - v_start:+.3f})"
             out.append((w, worst, worst_own))
         return out
 
-    # --- validazione sul solido ---------------------------------------------------
+    # --- validation on the solid ---------------------------------------------------
     def _normal_ok(self, Fo, rf, sp: "SurfParam") -> bool:
         """
-        La faccia nuova guarda dalla stessa parte delle faccette che sostituisce.
+        The new face faces the same way as the facets it replaces.
 
-        ⚠️ SERVE QUANDO IL VOLUME NON PARLA. Il controllo di orientamento
-        classico guarda gli spigoli NUOVI: se non ne abbiamo creati nessuno
-        (bordo tutto della mesh) non dice niente, e su un guscio aperto non
-        c'e' nemmeno il volume a fare da rete. Qui si valuta la normale della
-        faccia nuova (composta col suo orientamento) nel punto della faccetta
-        piu' grande e la si confronta con la normale di quella faccetta.
+        ⚠️ NEEDED WHEN THE VOLUME DOESN'T SPEAK. The classic orientation
+        check looks at the NEW edges: if we haven't created any (boundary
+        entirely from the mesh) it says nothing, and on an open shell
+        there isn't even the volume to act as a safety net. Here the new
+        face's normal (composed with its orientation) is evaluated at the
+        point of the largest facet and compared against that facet's
+        normal.
         """
         topo = self.topo
         try:
@@ -6383,20 +6457,20 @@ class Engine:
                 return True
             return float((n / nn) @ n_mesh) > 0.0
         except Exception as ex:
-            Log.debug(f"    controllo normale non riuscito: {type(ex).__name__}: {ex}")
+            Log.debug(f"    normal check failed: {type(ex).__name__}: {ex}")
             return True
 
     def _validate(self, new_shape, Fo, rf, replaced, R: Region, a_mesh: float, sp: "SurfParam" = None):
         fe = count_free_edges(new_shape)
         if fe != self.free0:
-            return False, f"spigoli liberi {fe} (prima {self.free0})"
+            return False, f"free edges {fe} (was {self.free0})"
         emap = edge_face_map(new_shape)
-        # orientamento coerente: ogni spigolo nuovo va percorso in versi opposti
-        # dalle due facce che lo condividono
+        # consistent orientation: every new edge must be traversed in
+        # opposite directions by the two faces sharing it
         check_edges = [e for _, e, _ in replaced]
         for e in check_edges:
             if not emap.Contains(e):
-                return False, "spigolo nuovo assente dal solido"
+                return False, "new edge absent from the solid"
             faces = list(_iter_list(emap.FindFromKey(e)))
             ors = []
             for f in faces:
@@ -6404,12 +6478,12 @@ class Engine:
             if len(ors) == 2 and ors[0] == ors[1]:
                 if self.verbose:
                     Log.debug(
-                        f"    spigolo nuovo: facce {[str(f.Orientation()) for f in faces]} "
-                        f"orientamenti spigolo {[str(o) for o in ors]} "
+                        f"    new edge: faces {[str(f.Orientation()) for f in faces]} "
+                        f"edge orientations {[str(o) for o in ors]} "
                         f"Fo={Fo.Orientation()} in faces={[f.IsSame(Fo) for f in faces]}"
                     )
-                return False, "orientamento della faccia nuova incoerente coi vicini"
-        # facce vicine ricostruite valide e senza anelli spuri
+                return False, "new face's orientation inconsistent with its neighbors"
+        # rebuilt neighboring faces valid and without spurious rings
         touched = set()
         for ch, e, _ in replaced:
             for f in _iter_list(emap.FindFromKey(e)):
@@ -6417,77 +6491,78 @@ class Engine:
                     touched.add(self.registry.Add(f))
                     rec = self._nb_wires.get(ch.nb)
                     if rec is not None and count_sub(f, TopAbs_WIRE) > rec[1]:
-                        return False, "faccia vicina con anello spurio (tacca)"
+                        return False, "neighboring face with a spurious ring (notch)"
         for k in touched:
             f = self.registry.FindKey(k)
             det = check_detail(f)
             if det:
                 if self.verbose:
-                    Log.debug(f"    vicino non valido: tipo {face_surface_type(f)} area {face_area(f):.4f} -> {det}")
+                    Log.debug(f"    invalid neighbor: type {face_surface_type(f)} area {face_area(f):.4f} -> {det}")
                     self._dump_face(td_Face(f))
-                return False, "faccia vicina non valida: " + ", ".join(det)
-        # anche i vicini delle catene poligonali riusate condividono spigoli con
-        # tolleranza aggiornata: la faccia nuova stessa e' gia' stata validata
-        # verso della faccia nuova (funziona anche senza spigoli nuovi)
+                return False, "invalid neighboring face: " + ", ".join(det)
+        # the neighbors of reused polygonal chains also share edges with an
+        # updated tolerance: the new face itself has already been validated
+        # direction of the new face (also works without new edges)
         if sp is not None and not self._normal_ok(Fo, rf, sp):
-            return False, "orientamento della faccia nuova incoerente coi vicini"
-        # ⚠️ GUSCIO APERTO: niente controllo di volume. Con degli spigoli liberi
-        # il "volume" di OpenCascade e' il flusso di un guscio che non chiude,
-        # e cambia di decine di mm3 anche sostituendo una faccetta da un
-        # decimo: bocciava quasi tutto su una mesh non chiusa. Restano gli
-        # altri controlli (spigoli liberi invariati, facce valide, area
-        # coerente, verso della normale).
+            return False, "new face's orientation inconsistent with its neighbors"
+        # ⚠️ OPEN SHELL: no volume check. With free edges, OpenCascade's
+        # "volume" is the flux of a shell that doesn't close, and it
+        # changes by tens of mm3 even when replacing a tenth-sized facet:
+        # it used to reject almost everything on a non-closed mesh. The
+        # other checks remain (free edges unchanged, valid faces,
+        # consistent area, normal direction).
         if self.free0 > 0:
             return True, ""
         # volume
         v1 = shape_volume(new_shape)
         v0 = self.vol0 if self.vol0 else shape_volume(self.shape)
-        # ⚠️ IL TETTO DEVE CONTARE ANCHE I VICINI. Sostituire una regione non
-        # muove solo la sua faccia: i bordi poligonali che la toccano diventano
-        # curve, e le facce vicine si rifanno con quelle. Con il tetto calcolato
-        # sulla sola area della regione, una calotta sferica R0.5 da mezzo mm2
-        # incastrata fra tre facce da 1, 5 e 12 mm2 sforava di un soffio
-        # (+0,0555 contro 0,0513) e restava tassellata - due calotte identiche
-        # a due identiche altre che invece passavano. Su test8 il controllo del
-        # volume bocciava 66 conversioni e NESSUNA di piu' di quattro volte il
-        # tetto: non stava piu' prendendo errori veri, solo conversioni buone.
-        # Il nuovo tetto e' un limite VERO, non una stima: se nessuna faccia si
-        # sposta di piu' di dev, il volume racchiuso non puo' cambiare di piu'
-        # dell'area toccata per dev. E non stringe mai quello di prima.
+        # ⚠️ THE CEILING MUST ALSO COUNT THE NEIGHBORS. Replacing a region
+        # doesn't just move its own face: the polygonal boundaries touching
+        # it become curves, and the neighboring faces get rebuilt along
+        # with them. With the ceiling computed on the region's area alone,
+        # an R0.5 spherical cap of half a mm2 wedged between three faces of
+        # 1, 5 and 12 mm2 overshot by a hair (+0.0555 against 0.0513) and
+        # stayed tessellated - while two identical caps, elsewhere, passed.
+        # On test8 the volume check was rejecting 66 conversions and NONE
+        # of them by more than four times the ceiling: it wasn't catching
+        # real errors anymore, only good conversions. The new ceiling is a
+        # TRUE bound, not an estimate: if no face moves more than dev, the
+        # enclosed volume can't change by more than the touched area times
+        # dev. And it never tightens the previous one.
         dev = max(R.sag, self.tol_fit)
         a_touch = face_area(Fo) + sum(face_area(self.registry.FindKey(k)) for k in touched)
         bound = max(10.0 * a_mesh, a_touch) * dev + 1e-9 * abs(v0) + 2e-3
         if abs(v1 - v0) > bound:
             if self.verbose:
                 Log.debug(
-                    f"    volume: faccia nuova area {face_area(Fo):.4f} (mesh {a_mesh:.4f}); "
-                    f"vicini toccati: " + ", ".join(f"{face_surface_type(self.registry.FindKey(k))!s:.12} {face_area(self.registry.FindKey(k)):.4f}" for k in touched)
+                    f"    volume: new face area {face_area(Fo):.4f} (mesh {a_mesh:.4f}); "
+                    f"touched neighbors: " + ", ".join(f"{face_surface_type(self.registry.FindKey(k))!s:.12} {face_area(self.registry.FindKey(k)):.4f}" for k in touched)
                 )
                 for ch, e, _ in replaced:
                     Log.debug(
-                        f"      catena -> vicino area prima {self.topo.areas[ch.nb]:.4f} "
-                        f"nverts {self.topo.nverts[ch.nb]} spigoli {len(ch.edges)} "
-                        f"chiusa={ch.closed} lung. nuovo spigolo {edge_length(e):.4f}"
+                        f"      chain -> neighbor area before {self.topo.areas[ch.nb]:.4f} "
+                        f"nverts {self.topo.nverts[ch.nb]} edges {len(ch.edges)} "
+                        f"closed={ch.closed} new edge length {edge_length(e):.4f}"
                     )
-            return False, f"volume variato di {v1 - v0:+.4f} mm3 (limite {bound:.4f})"
+            return False, f"volume changed by {v1 - v0:+.4f} mm3 (limit {bound:.4f})"
         self.vol0 = v1
         self.free0 = fe
         return True, ""
 
     def _pcurve_on_neighbor(self, e, nb: int, prim: "Prim") -> str:
-        """Pcurve dello spigolo nuovo sulla faccia vicina analitica curva (sul posto)."""
+        """Pcurve of the new edge on the curved analytic neighboring face (in place)."""
         f = self.topo.faces[nb]
         try:
             spn = SurfParam(prim, self._frame_ref_of_face(f, prim), self._pole_axis_of_face(f))
-            # ⚠️ IL PIANO HA UNA CORNICE SUA. Per cilindri e coni bastava
-            # l'asse X, ma un Geom_Plane ha anche un'ORIGINE, e quella della
-            # primitiva fittata non c'entra niente con quella della faccia gia'
-            # costruita: la pcurve finirebbe traslata di millimetri e il wire
-            # del vicino non si chiuderebbe piu'.
+            # ⚠️ THE PLANE HAS ITS OWN FRAME. For cylinders and cones the X
+            # axis was enough, but a Geom_Plane also has an ORIGIN, and the
+            # fitted primitive's has nothing to do with the already-built
+            # face's: the pcurve would end up translated by millimeters and
+            # the neighbor's wire would no longer close.
             if prim.kind == PLANE:
                 ad = BRepAdaptor_Surface(f, True)
                 if ad.GetType() != GeomAbs_Plane:
-                    return "il vicino non e' un piano"
+                    return "the neighbor isn't a plane"
                 pos = ad.Plane().Position()
                 o, dx, dy, dz = pos.Location(), pos.XDirection(), pos.YDirection(), pos.Direction()
                 spn.C = np.array([o.X(), o.Y(), o.Z()])
@@ -6497,13 +6572,13 @@ class Engine:
             curve, t0, t1 = edge_curve(e)
             c2d, _, dev = make_pcurve(spn, curve, t0, t1, True, None, None)
             if c2d is None:
-                return "pcurve sul vicino non calcolabile"
+                return "pcurve on the neighbor can't be computed"
             tol = max(float(bt_Tolerance(e)), 1.2 * dev + 1e-7)
             if tol > self.max_edge_tol:
-                return f"pcurve sul vicino: scarto {dev:.1e} oltre il tetto"
+                return f"pcurve on the neighbor: deviation {dev:.1e} beyond the ceiling"
             BRep_Builder().UpdateEdge(e, c2d, f, tol)
         except Exception as ex:
-            return f"pcurve sul vicino: {type(ex).__name__}: {ex}"
+            return f"pcurve on the neighbor: {type(ex).__name__}: {ex}"
         return ""
 
     def _pole_axis_of_face(self, f):
@@ -6517,7 +6592,7 @@ class Engine:
         return None
 
     def _frame_ref_of_face(self, f, prim):
-        """Cornice della superficie gia' costruita: X dalla Geom_Surface della faccia."""
+        """Frame of the already-built surface: X from the face's Geom_Surface."""
         ad = BRepAdaptor_Surface(f, True)
         t = ad.GetType()
         try:
@@ -6533,9 +6608,9 @@ class Engine:
                 return None
             d = pos.XDirection()
             x = np.array([d.X(), d.Y(), d.Z()])
-            # l'asse della primitiva potrebbe essere opposto a quello della
-            # superficie costruita: SurfParam ricava Y = Z x X, quindi basta X
-            # e un asse coerente. Si allinea l'asse della prim a quello della faccia.
+            # the primitive's axis might be opposite to the built surface's:
+            # SurfParam derives Y = Z x X, so X and a consistent axis are
+            # enough. The prim's axis is aligned to the face's.
             dz = pos.Direction()
             z = np.array([dz.X(), dz.Y(), dz.Z()])
             if prim.kind != SPHERE and prim.axis is not None and float(prim.axis @ z) < 0:
@@ -6547,7 +6622,7 @@ class Engine:
             return None
 
     def _carry_registry(self, rs, new_shape) -> None:
-        """Le facce analitiche ricostruite da ReShape mantengono la loro primitiva."""
+        """Analytic faces rebuilt by ReShape keep their primitive."""
         upd = {}
         for k, prim in list(self.analytic.items()):
             old = self.registry.FindKey(k)
@@ -6562,7 +6637,7 @@ class Engine:
 
 
 # =============================================================================
-# 11. FASI B e C
+# 11. PHASES B and C
 # =============================================================================
 
 
@@ -6587,30 +6662,30 @@ def worst_tolerance_entity(shape) -> str:
     for v in explore(shape, TopAbs_VERTEX):
         t = float(bt_Tolerance(td_Vertex(v)))
         if t > worst[0]:
-            worst = (t, f"vertice {np.round(vpos(v), 3)}")
+            worst = (t, f"vertex {np.round(vpos(v), 3)}")
     for e in explore(shape, TopAbs_EDGE):
         t = float(bt_Tolerance(td_Edge(e)))
         if t > worst[0]:
-            worst = (t, f"spigolo da {np.round(vpos(te_FirstVertex(td_Edge(e))), 3)} ({str(BRepAdaptor_Curve(td_Edge(e)).GetType()).split('_')[-1]})")
+            worst = (t, f"edge from {np.round(vpos(te_FirstVertex(td_Edge(e))), 3)} ({str(BRepAdaptor_Curve(td_Edge(e)).GetType()).split('_')[-1]})")
     for f in explore(shape, TopAbs_FACE):
         t = float(bt_Tolerance(td_Face(f)))
         if t > worst[0]:
-            worst = (t, f"faccia {str(face_surface_type(f)).split('_')[-1]} area {face_area(f):.3f}")
-    return f"{worst[0]:.2e} mm su {worst[1]}"
+            worst = (t, f"face {str(face_surface_type(f)).split('_')[-1]} area {face_area(f):.3f}")
+    return f"{worst[0]:.2e} mm on {worst[1]}"
 
 
 def _print_regions(regions: List[Region], title: str) -> None:
     if not regions:
         return
     Log.info(title)
-    hdr = f"   {'#':>3}  {'forma':<6} {'dimensioni':<22} {'tipo':<8} {'ang.':>5} {'facce':>11}  {'RMS':>8} {'max':>8}  esito"
+    hdr = f"   {'#':>3}  {'shape':<6} {'dimensions':<22} {'type':<8} {'ang.':>5} {'faces':>11}  {'RMS':>8} {'max':>8}  outcome"
     _out(hdr)
     for k, R in enumerate(regions):
         _out(f"   {k:>3}  {R.label()}  {R.rms:>8.1e} {R.max_res:>8.1e}  {R.status}" + (f"  [{R.note}]" if R.note and R.status == "OK" else ""))
 
 
 def _prim_signature(p: "Prim"):
-    """Identita' della primitiva a meno del posto in cui sta."""
+    """Primitive's identity regardless of where it sits."""
     if p.kind == AXIAL:
         return (AXIAL, round(float(p.r0), 3), round(float(p.slope), 3))
     if p.kind == TORUS:
@@ -6619,20 +6694,20 @@ def _prim_signature(p: "Prim"):
 
 
 # ---------------------------------------------------------------------------
-# 10b. SPEZZATE -> ARCHI (le curve del CAD che erano rimaste poligonali)
+# 10b. POLYLINES -> ARCS (the CAD curves that had stayed polygonal)
 # ---------------------------------------------------------------------------
 #
-# Quando una regione viene convertita, il motore rifa' con la curva esatta solo
-# i bordi per cui SA calcolare l'intersezione fra le due superfici; tutto il
-# resto lo lascia com'era ("riusati"). Su un pezzo vero quelli sono la
-# maggioranza: su test8, 4.862 bordi riusati contro 328 rifatti. Cosi' due
-# facce analitiche gia' a posto - un cilindro e il piano su cui sbuca - si
-# toccano ancora lungo una spezzata di sei segmenti.
-# Qui si guarda il B-Rep FINITO e si chiede: questa catena di segmenti sta su un
-# cerchio? Misurato su test8: 110 catene su 249 ci stanno a meno di un micron, e
-# i raggi sono quelli del disegno - R0.5 cinquantatre volte, R0.3 diciotto,
-# R0.8 otto. Non e' un'approssimazione che si concede: e' lo spigolo vero del
-# CAD, che la tassellatura aveva spezzato.
+# When a region is converted, the engine only rebuilds with the exact curve
+# the boundaries for which it CAN compute the intersection between the two
+# surfaces; everything else is left as it was ("reused"). On a real part
+# those are the majority: on test8, 4,862 boundaries reused against 328
+# rebuilt. So two already-fine analytic faces - a cylinder and the plane it
+# emerges from - still touch along a six-segment polyline.
+# Here the FINISHED B-Rep is examined and the question is asked: does this
+# chain of segments sit on a circle? Measured on test8: 110 of 249 chains sit
+# within a micron, and the radii are the ones from the drawing - R0.5 fifty-
+# three times, R0.3 eighteen, R0.8 eight. It's not an approximation being
+# allowed: it's the CAD's real edge, which the tessellation had split up.
 
 
 def _is_line_edge(e) -> bool:
@@ -6643,7 +6718,7 @@ def _is_line_edge(e) -> bool:
 
 
 class _ArcSurf:
-    """SurfParam minimale sopra una Geom_Surface qualunque, per make_pcurve."""
+    """Minimal SurfParam over any Geom_Surface, for make_pcurve."""
 
     def __init__(self, surf):
         self.s = surf
@@ -6674,17 +6749,18 @@ class _ArcSurf:
 
 
 def _arc_fit_circle(P: np.ndarray):
-    """(centro, raggio, normale, X, Y, scarto max) del cerchio per i punti P."""
+    """(center, radius, normal, X, Y, max deviation) of the circle through points P."""
     c0 = P.mean(axis=0)
     Q = P - c0
     _, _, vt = np.linalg.svd(Q, full_matrices=False)
     nrm = vt[2]
     fuori_piano = float(np.abs(Q @ nrm).max())
-    # (!) TERNA DESTRORSA, obbligatorio. La SVD non garantisce che vt[0] x vt[1]
-    # faccia vt[2]: una volta su due esce sinistrorsa. gp_Ax2(P, N, X) invece
-    # misura l'angolo da X verso N x X, quindi se si usa vt[1] come asse Y per
-    # calcolare gli angoli, meta' delle volte i parametri passati a MakeEdge
-    # sono quelli dell'arco specchiato e l'arco viene scartato.
+    # (!) RIGHT-HANDED FRAME, mandatory. The SVD doesn't guarantee vt[0] x
+    # vt[1] equals vt[2]: it comes out left-handed about half the time.
+    # gp_Ax2(P, N, X), instead, measures the angle from X toward N x X, so
+    # if vt[1] is used as the Y axis to compute the angles, half the time
+    # the parameters passed to MakeEdge are the mirrored arc's and the arc
+    # gets rejected.
     X = vt[0]
     Y = np.cross(nrm, X)
     Y = Y / max(float(np.linalg.norm(Y)), 1e-300)
@@ -6706,10 +6782,10 @@ def _arc_fit_circle(P: np.ndarray):
 
 def _arc_chains(topo: "Topo"):
     """
-    Catene massimali di spigoli RETTILINEI consecutivi sostituibili con un solo
-    spigolo: i vertici interni devono avere grado 2 (nessun'altra faccia si
-    affaccia li') e le due facce ai lati devono essere sempre le stesse.
-    Ritorna [(spigoli, vertici in ordine, [faccia, faccia]), ...].
+    Maximal chains of consecutive STRAIGHT edges replaceable by a single
+    edge: interior vertices must have degree 2 (no other face touches
+    there) and the two side faces must always be the same.
+    Returns [(edges, vertices in order, [face, face]), ...].
     """
     nE = len(topo.edges)
     lin = [_is_line_edge(topo.edges[k]) for k in range(nE)]
@@ -6726,7 +6802,7 @@ def _arc_chains(topo: "Topo"):
     out = []
     for v0 in list(ve):
         if len(ve[v0]) == 2:
-            continue                       # vertice interno: non e' un capo
+            continue                       # interior vertex: not an endpoint
         for e0 in ve[v0]:
             if e0 in usato or not lin[e0]:
                 continue
@@ -6756,7 +6832,7 @@ def _arc_chains(topo: "Topo"):
 
 
 def _arc_wire_anchor(F_new, E_new):
-    """(u_prev, v_prev, percorso in avanti) per E_new nel wire della faccia."""
+    """(u_prev, v_prev, traversed forward) for E_new in the face's wire."""
     cos_ = _st(BRep_Tool, "CurveOnSurface")
     for w in explore(F_new, TopAbs_WIRE):
         ex = _BRepTools.BRepTools_WireExplorer(_TopoDS.TopoDS.Wire_s(w), F_new)
@@ -6781,18 +6857,18 @@ def _arc_wire_anchor(F_new, E_new):
     return None, None, None
 
 
-def snap_arcs(shape, tol: float, title: str = "Archi"):
+def snap_arcs(shape, tol: float, title: str = "Arcs"):
     """
-    Sostituisce con un arco di cerchio esatto ogni catena di segmenti che su un
-    cerchio ci sta davvero. Ogni sostituzione viene verificata SULLE DUE FACCE
-    che la toccano prima di essere accettata, e alla fine si ricontrolla il
-    pezzo intero: se qualcosa non torna si rinuncia a tutte insieme.
+    Replaces with an exact circular arc every chain of segments that truly
+    sits on a circle. Every replacement is checked on BOTH FACES touching
+    it before being accepted, and at the end the whole part is rechecked:
+    if something doesn't hold up, all of them are given up at once.
     """
     t0 = time.perf_counter()
     topo = Topo(shape)
     cands = _arc_chains(topo)
     if not cands:
-        Log.info(f"{title}: nessuna spezzata sostituibile   "
+        Log.info(f"{title}: no replaceable polyline   "
                  f"[{time.perf_counter() - t0:.2f}s]")
         return shape, 0
     bb = BRep_Builder()
@@ -6803,7 +6879,7 @@ def snap_arcs(shape, tol: float, title: str = "Archi"):
         dr = P[-1] - P[0]
         L = float(np.linalg.norm(dr))
         if L < 1e-12:
-            continue                       # catena chiusa su se stessa
+            continue                       # chain closed on itself
         d0 = P - P[0]
         dr = dr / L
         dev_retta = float(np.linalg.norm(d0 - np.outer(d0 @ dr, dr), axis=1).max())
@@ -6811,23 +6887,24 @@ def snap_arcs(shape, tol: float, title: str = "Archi"):
         if fit is None:
             continue
         cen, rad, nrm, X, Y, dev = fit
-        # (!) il cerchio deve spiegare la catena MOLTO meglio della retta: una
-        # spezzata quasi dritta passa per un cerchio qualunque e non vuol dire
-        # niente.
+        # (!) the circle has to explain the chain MUCH better than the
+        # line: an almost-straight polyline fits any old circle and it
+        # doesn't mean anything.
         if not (dev <= tol and dev < 0.2 * dev_retta and rad < 1e4):
             continue
         ang = np.unwrap(np.arctan2((P - cen) @ Y, (P - cen) @ X))
         d_ang = np.diff(ang)
         if not (np.all(d_ang > 0) or np.all(d_ang < 0)):
-            continue                       # non gira sempre dalla stessa parte
+            continue                       # doesn't always turn the same way
         if abs(ang[-1] - ang[0]) >= 2 * math.pi - 1e-9:
             continue
-        # (!) IL VERSO. Lo spigolo nuovo prende il posto del PRIMO della catena
-        # e ne eredita il flag di orientamento nei due wire: il suo verso
-        # naturale deve essere quello. E l'arco va preso fra i due parametri
-        # GIUSTI: con i vertici scambiati e il cerchio fermo si prende l'arco
-        # COMPLEMENTARE - 300 gradi al posto di 60 - che in (u,v) sbuca
-        # dall'altra parte della superficie e fa "UnorientableShape".
+        # (!) THE DIRECTION. The new edge takes the place of the chain's
+        # FIRST one and inherits its orientation flag in the two wires: its
+        # natural direction has to match. And the arc must be taken
+        # between the RIGHT two parameters: with the vertices swapped and
+        # the circle left as is, you get the COMPLEMENTARY arc - 300
+        # degrees instead of 60 - which in (u,v) pokes out on the other
+        # side of the surface and produces "UnorientableShape".
         va, _vb = topo.e_verts[cat[0]]
         testa = va == seq[0]
         i1, i2 = (seq[0], seq[-1]) if testa else (seq[-1], seq[0])
@@ -6877,31 +6954,32 @@ def snap_arcs(shape, tol: float, title: str = "Archi"):
             rs.Remove(td_Edge(topo.edges[k].Oriented(TopAbs_FORWARD)))
         fatti += 1
     if not fatti:
-        Log.info(f"{title}: nessuna spezzata da promuovere "
-                 f"({len(cands)} catene guardate)   [{time.perf_counter() - t0:.2f}s]")
+        Log.info(f"{title}: no polyline to promote "
+                 f"({len(cands)} chains examined)   [{time.perf_counter() - t0:.2f}s]")
         return shape, 0
     nuovo = rs.Apply(shape)
-    # (!) e adesso il controllo di sempre: se il pezzo intero non regge si
-    # rinuncia a TUTTO. Uno spigolo piu' bello non vale un solido rotto.
+    # (!) and now the usual check: if the whole part doesn't hold up,
+    # EVERYTHING is given up. A prettier edge isn't worth a broken solid.
     fe0, fe1 = count_free_edges(shape), count_free_edges(nuovo)
     v0, v1 = shape_volume(shape), shape_volume(nuovo)
     male = ""
     if fe1 > fe0:
-        male = f"spigoli liberi {fe0} -> {fe1}"
+        male = f"free edges {fe0} -> {fe1}"
     elif not is_valid(nuovo):
         male = "BRepCheck: " + ", ".join(check_detail(nuovo, 3))
     elif abs(v1 - v0) > max(1e-4 * abs(v0), 1e-9):
-        # (!) il volume CAMBIA, ed e' giusto cosi': la spezzata tagliava dentro
-        # l'arco, l'arco vero sta fuori di una freccia. Su test8 fa 0,05 mm3 su
-        # 2.754, cioe' 2 parti su centomila - un ventesimo di quello che si
-        # concede alla Fase C. Il tetto serve solo a prendere i disastri.
+        # (!) the volume DOES change, and rightly so: the polyline was
+        # cutting inside the arc, the true arc lies outside by a sag. On
+        # test8 that's 0.05 mm3 out of 2,754, i.e. 2 parts in a hundred
+        # thousand - a twentieth of what Phase C allows itself. The ceiling
+        # is only there to catch disasters.
         male = f"volume {v0:.4f} -> {v1:.4f}"
     if male:
-        Log.warn(f"{title}: {fatti} archi scartati tutti insieme ({male})")
+        Log.warn(f"{title}: {fatti} arcs rejected all together ({male})")
         return shape, 0
     n0, n1 = len(topo.edges), len(Topo(nuovo).edges)
-    Log.ok(f"{title}: {fatti:,} spezzate promosse ad arco esatto · "
-           f"spigoli {n0:,} -> {n1:,} · volume {100 * (v1 - v0) / max(abs(v0), 1e-12):+.4f}%"
+    Log.ok(f"{title}: {fatti:,} polylines promoted to exact arcs · "
+           f"edges {n0:,} -> {n1:,} · volume {100 * (v1 - v0) / max(abs(v0), 1e-12):+.4f}%"
            f"   [{time.perf_counter() - t0:.2f}s]")
     return nuovo, fatti
 
@@ -6919,9 +6997,9 @@ def run_phase(
     validate: bool = False,
     threads: int = 1,
 ) -> PhaseResult:
-    """which = 'B' (solo fori) oppure 'C' (tutte le lavorazioni curve)."""
+    """which = 'B' (holes only) or 'C' (all curved features)."""
     is_b = which == "B"
-    Log.banner("FASE B — fori circolari" if is_b else "FASE C — raccordi, smussi, svasature, sfere, bossi")
+    Log.banner("PHASE B — circular holes" if is_b else "PHASE C — fillets, chamfers, countersinks, spheres, bosses")
     t_all = time.perf_counter()
     res = PhaseResult(shape=shape)
     res.faces_before = count_sub(shape, TopAbs_FACE)
@@ -6934,7 +7012,7 @@ def run_phase(
     tol_grow = min(10.0 * tol_fit, 1e-3 * diag)
     if max_edge_tol is None or max_edge_tol <= 0:
         max_edge_tol = max(20.0 * tol_fit, 2e-4 * diag)
-    Log.info(f"Facce {topo.nF:,} · diagonale {diag:.1f} mm · tolleranza vertici-superficie {tol_fit:.1e} mm · tetto tolleranza spigoli {max_edge_tol:.1e} mm")
+    Log.info(f"Faces {topo.nF:,} · diagonal {diag:.1f} mm · vertex-surface tolerance {tol_fit:.1e} mm · edge tolerance ceiling {max_edge_tol:.1e} mm")
 
     t0 = time.perf_counter()
     regions = segment_curved(
@@ -6942,11 +7020,11 @@ def run_phase(
     )
     for R in regions:
         R.fobjs = [topo.faces[i] for i in R.faces]
-    # ⚠️ RIPETIZIONE = LAVORAZIONE. Un raggio strano che compare UNA volta su
-    # quattro faccette e' rumore di una zona di raccordo; lo stesso raggio che
-    # compare dodici volte nel pezzo e' una lavorazione ripetuta (una fresa
-    # passata piu' volte, una serie di scanalature) e va ricostruita anche se
-    # sta in mezzo a faccette sciolte.
+    # ⚠️ REPETITION = FEATURE. A weird radius that shows up ONCE among four
+    # facets is noise from a fillet zone; the same radius showing up twelve
+    # times across the part is a repeated feature (a mill pass repeated,
+    # a series of grooves) and should be rebuilt even if it sits amid loose
+    # facets.
     sig = defaultdict(int)
     for R in regions:
         sig[_prim_signature(R.prim)] += 1
@@ -6954,10 +7032,10 @@ def run_phase(
         R.repeated = sig[_prim_signature(R.prim)] >= 3
     if is_b:
         regions = [R for R in regions if R.closed_u and R.concave]
-        Log.info(f"Fori candidati (cilindri chiusi a 360 gradi, concavi): {len(regions)}")
-    Log.debug(f"Segmentazione in {time.perf_counter() - t0:.2f}s")
+        Log.info(f"Candidate holes (cylinders closed 360 degrees, concave): {len(regions)}")
+    Log.debug(f"Segmentation in {time.perf_counter() - t0:.2f}s")
     if not regions:
-        Log.warn("Nessuna regione da convertire.")
+        Log.warn("No region to convert.")
         res.shape = shape
         res.faces_after = res.faces_before
         res.free_after = res.free_before
@@ -6967,25 +7045,26 @@ def run_phase(
         return res
 
     eng = Engine(shape, tol_fit, diag, max_edge_tol, allow_polyline=not is_b, verbose=(Log.level <= 10))
-    # ordine: prima le regioni grandi (piu' bordo analitico per le successive)
+    # order: large regions first (more analytic boundary for the following ones)
     order = sorted(range(len(regions)), key=lambda k: -sum(topo.areas[i] for i in regions[k].faces))
     pending = list(order)
-    # ⚠️ due passate: una regione scartata solo perche' un vicino era ancora
-    # tassellato puo' riuscire dopo che il vicino e' stato convertito.
+    # ⚠️ two passes: a region rejected only because a neighbor was still
+    # tessellated can succeed once the neighbor has been converted.
     for round_ in range(2):
         again = []
         for k in pending:
             R = regions[k]
             ok, why = eng.convert(R, strict_hole=is_b)
-            # ⚠️ "in mezzo a faccette tassellate" dipende da QUANDO si guarda:
-            # se intanto i vicini si convertono, il bordo non e' piu' un campo
-            # di faccette sciolte e la regione va riprovata.
-            if not ok and round_ == 0 and ("poligonal" in why or "tolleranza" in why or "seam" in why or "tassellate" in why):
+            # ⚠️ "amid tessellated facets" depends on WHEN you look: if the
+            # neighbors get converted in the meantime, the boundary is no
+            # longer a field of loose facets and the region should be
+            # retried.
+            if not ok and round_ == 0 and ("polygonal" in why or "tolerance" in why or "seam" in why or "tessellated" in why):
                 again.append(k)
         if not again:
             break
         pending = again
-        Log.info(f"Seconda passata su {len(pending)} regioni scartate per bordi poligonali")
+        Log.info(f"Second pass on {len(pending)} regions rejected for polygonal boundaries")
 
     res.shape = eng.shape
     res.regions = regions
@@ -6997,20 +7076,20 @@ def run_phase(
     res.max_tol = max_tolerance(res.shape)
     res.seconds = time.perf_counter() - t_all
     if res.max_tol > max_edge_tol:
-        Log.warn("Tolleranza massima oltre il tetto: " + worst_tolerance_entity(res.shape))
-    _print_regions(regions, "Regioni:")
+        Log.warn("Maximum tolerance beyond the ceiling: " + worst_tolerance_entity(res.shape))
+    _print_regions(regions, "Regions:")
     Log.ok(
-        f"Convertite {res.n_ok}/{len(regions)} regioni · facce {res.faces_before:,} -> "
-        f"{res.faces_after:,} · spigoli liberi {res.free_before} -> {res.free_after} · "
+        f"Converted {res.n_ok}/{len(regions)} regions · faces {res.faces_before:,} -> "
+        f"{res.faces_after:,} · free edges {res.free_before} -> {res.free_after} · "
         f"volume {res.vol_before:.3f} -> {res.vol_after:.3f} mm3 "
         f"({100 * (res.vol_after - res.vol_before) / max(abs(res.vol_before), 1e-9):+.4f}%) · "
-        f"tolleranza max {res.max_tol:.1e} mm   [{res.seconds:.1f}s]"
+        f"max tolerance {res.max_tol:.1e} mm   [{res.seconds:.1f}s]"
     )
     if res.free_after != res.free_before:
-        Log.error("Il numero di spigoli liberi e' cambiato: NON dovrebbe succedere, segnala il caso.")
+        Log.error("The number of free edges changed: this should NOT happen, please report it.")
     if validate:
         ok = is_valid(res.shape)
-        (Log.ok if ok else Log.warn)(f"BRepCheck: {'OK' if ok else 'NON valida'}")
+        (Log.ok if ok else Log.warn)(f"BRepCheck: {'OK' if ok else 'NOT valid'}")
     return res
 
 
@@ -7024,24 +7103,24 @@ def write_report(path: str, src: str, before, after_a, results: List[PhaseResult
         "=" * 78,
         "refit.py — REPORT",
         "=" * 78,
-        f"Sorgente : {src}",
-        f"Data     : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Source   : {src}",
+        f"Date     : {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
-        "--- FASE A ---------------------------------------------------------",
-        f"  facce  : {before['faces']:,}  ->  {after_a['faces']:,}",
-        f"  edge   : {before['edges']:,}  ->  {after_a['edges']:,}",
-        f"  vertici: {before['verts']:,}  ->  {after_a['verts']:,}",
+        "--- PHASE A ---------------------------------------------------------",
+        f"  faces    : {before['faces']:,}  ->  {after_a['faces']:,}",
+        f"  edges    : {before['edges']:,}  ->  {after_a['edges']:,}",
+        f"  vertices : {before['verts']:,}  ->  {after_a['verts']:,}",
     ]
     for name, res in results:
         L += [
             "",
-            f"--- FASE {name} " + "-" * (66 - len(name)),
-            f"  regioni convertite : {res.n_ok} / {len(res.regions)}",
-            f"  facce              : {res.faces_before:,} -> {res.faces_after:,}",
-            f"  spigoli liberi     : {res.free_before} -> {res.free_after}",
+            f"--- PHASE {name} " + "-" * (65 - len(name)),
+            f"  regions converted  : {res.n_ok} / {len(res.regions)}",
+            f"  faces              : {res.faces_before:,} -> {res.faces_after:,}",
+            f"  free edges         : {res.free_before} -> {res.free_after}",
             f"  volume             : {res.vol_before:.4f} -> {res.vol_after:.4f} mm3",
-            f"  tolleranza max     : {res.max_tol:.2e} mm",
-            f"  tempo              : {res.seconds:.1f} s",
+            f"  max tolerance      : {res.max_tol:.2e} mm",
+            f"  time               : {res.seconds:.1f} s",
             "",
         ]
         for k, R in enumerate(res.regions):
@@ -7058,19 +7137,19 @@ def write_report(path: str, src: str, before, after_a, results: List[PhaseResult
 
 
 def default_threads() -> int:
-    """Due core liberi per il sistema, mai piu' di 22: oltre non si guadagna
-    piu' niente perche' i semi da provare sono poche decine."""
+    """Two cores left free for the system, never more than 22: beyond that
+    nothing more is gained because there are only a few dozen seeds to try."""
     n = os.cpu_count() or 2
     return max(1, min(22, n - 2))
 
 
 class _PhaseArg(argparse.Action):
     """
-    ⚠️ LE FASI VANNO NELL'ORDINE IN CUI SONO SCRITTE. argparse da' solo i
-    valori finali, non l'ordine: questa azione registra ogni -a/-b/-c in una
-    lista man mano che compare. Cosi' '-c' vuol dire SOLO la Fase C (utile per
-    capire se un difetto nasce nella fase precedente), e '-a -b -c -a 0.005'
-    vuol dire esattamente quello che c'e' scritto.
+    ⚠️ PHASES RUN IN THE ORDER THEY'RE WRITTEN. argparse only gives the
+    final values, not the order: this action records every -a/-b/-c into a
+    list as it appears. This way '-c' alone means ONLY Phase C (useful for
+    figuring out whether a defect comes from an earlier phase), and
+    '-a -b -c -a 0.005' means exactly what's written.
     """
 
     def __call__(self, parser, ns, values, option_string=None):
@@ -7085,53 +7164,54 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="refit.py",
         description=(
-            "Riconversione morbida di mesh (STL, o STEP nato da mesh) in B-Rep analitica.\n"
+            "Soft reconversion of a mesh (STL, or STEP born from a mesh) into an analytic B-Rep.\n"
             "\n"
-            "  Fase A (-a)  unione delle facce complanari e degli spigoli collineari.\n"
-            "  Fase B (-b)  fori circolari passanti o ciechi: cilindro chiuso a 360 gradi,\n"
-            "               concavo, che sbocca su due piani ortogonali all'asse con due\n"
-            "               bordi circolari. Solo quelli: e' la fase prudente.\n"
-            "  Fase C (-c)  raccordi, smussi, svasature, lamature, sfere d'angolo, bossi:\n"
-            "               cilindri, coni, sfere e tori anche parziali, coi bordi lasciati\n"
-            "               poligonali dove non esiste una curva esatta.\n"
+            "  Phase A (-a)  merging of coplanar faces and collinear edges.\n"
+            "  Phase B (-b)  through or blind circular holes: a cylinder closed 360\n"
+            "                degrees, concave, opening onto two planes orthogonal to\n"
+            "                the axis with two circular boundaries. Only those: it's\n"
+            "                the cautious phase.\n"
+            "  Phase C (-c)  fillets, chamfers, countersinks, counterbores, corner\n"
+            "                spheres, bosses: cylinders, cones, spheres and tori (even\n"
+            "                partial), with boundaries left polygonal where no exact\n"
+            "                curve exists.\n"
             "\n"
-            "Ogni regione viene sostituita da sola e subito verificata (solido ancora\n"
-            "chiuso, facce valide, orientamento coerente, area e volume coerenti con la\n"
-            "mesh): se un controllo non passa si torna indietro e quel pezzo resta\n"
-            "tassellato. L'uscita e' sempre coerente con l'ingresso, al massimo e' meno\n"
-            "pulita. Senza -a/-b/-c girano tutte e tre le fasi."
+            "Every region is replaced on its own and checked immediately (solid still\n"
+            "closed, faces valid, consistent orientation, area and volume consistent\n"
+            "with the mesh): if a check fails it's rolled back and that piece stays\n"
+            "tessellated. The output is always consistent with the input, at worst\n"
+            "it's less clean. Without -a/-b/-c all three phases run."
         ),
         epilog=(
-            "esempi\n"
-            "  python refit.py pezzo.stl                 tutte le fasi\n"
-            "  python refit.py pezzo.stl -a              solo unione delle facce complanari\n"
-            "  python refit.py pezzo.stl -a 0.01         idem, unendo fino a 10 micron\n"
-            "  python refit.py pezzo.stl -b -c --report  fori e lavorazioni, con report .txt\n"
-            "  python refit.py pezzo.stl -b -c -a 0.01   riunione finale a 10 micron\n"
-            "  python refit.py pezzo.stl -b -c -i 2      due cicli B/C prima di salvare\n"
-            "  python refit.py pezzo.step -o out.step    ingresso STEP\n"
-            "  python refit.py pezzo.stl -j 1            tutto in sequenza (riproducibile)\n"
+            "examples\n"
+            "  python refit.py part.stl                  all phases\n"
+            "  python refit.py part.stl -a               only merging coplanar faces\n"
+            "  python refit.py part.stl -a 0.01          same, merging up to 10 microns\n"
+            "  python refit.py part.stl -b -c --report   holes and features, with a .txt report\n"
+            "  python refit.py part.stl -b -c -a 0.01    final merge at 10 microns\n"
+            "  python refit.py part.stl -b -c -i 2       two B/C cycles before saving\n"
+            "  python refit.py part.step -o out.step     STEP input\n"
+            "  python refit.py part.stl -j 1             everything sequential (reproducible)\n"
             "\n"
-            "note del report (--report), una riga per regione\n"
-            "  [N analitici . N riusati . N poligonali]  bordi rifatti con la curva esatta;\n"
-            "      bordi gia' buoni presi dalla mesh; bordi lasciati come spezzata.\n"
-            "  bordi coi piani lasciati poligonali   la faccia e' esatta, i bordi coi piani\n"
-            "      vicini restano quelli della mesh (secondo tentativo).\n"
-            "  contorno lasciato poligonale          nessuno spigolo nuovo: il contorno\n"
-            "      resta identico alla mesh (terzo tentativo, per non rompere un vicino\n"
-            "      analitico gia' chiuso).\n"
-            "  scartata: ...                         motivo per cui la regione resta\n"
-            "      tassellata. 'regione troppo piccola in mezzo a faccette tassellate'\n"
-            "      vuol dire primitiva fittata sul rumore di una zona di raccordo: meglio\n"
-            "      lasciare la mesh e rifinire a mano.\n"
+            "report notes (--report), one line per region\n"
+            "  [N analytic . N reused . N polygonal]  boundaries rebuilt with the exact\n"
+            "      curve; boundaries already good taken from the mesh; boundaries left as a polyline.\n"
+            "  boundaries with the planes left polygonal  the face is exact, the\n"
+            "      boundaries with the neighboring planes stay the mesh's (second attempt).\n"
+            "  contour left polygonal                no new edge at all: the contour\n"
+            "      stays identical to the mesh (third attempt, to avoid breaking an\n"
+            "      already-closed analytic neighbor).\n"
+            "  rejected: ...                         why the region stays tessellated.\n"
+            "      'region too small amid tessellated facets' means a primitive fitted\n"
+            "      on a fillet zone's noise: better to leave the mesh and finish by hand.\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("input", nargs="?", help="file .stl oppure .step/.stp")
-    p.add_argument("-o", "--output", metavar="FILE", help="file STEP di uscita (default: <nome>.step, oppure <nome>_phaseA.step con la sola Fase A)")
-    p.add_argument("--check", action="store_true", help="verifica l'ambiente (OpenCascade, numpy, funzioni richieste) ed esci")
+    p.add_argument("input", nargs="?", help=".stl or .step/.stp file")
+    p.add_argument("-o", "--output", metavar="FILE", help="output STEP file (default: <name>.step, or <name>_phaseA.step with Phase A alone)")
+    p.add_argument("--check", action="store_true", help="check the environment (OpenCascade, numpy, required functions) and exit")
 
-    g = p.add_argument_group("fasi (nessuna = A B C A)")
+    g = p.add_argument_group("phases (none = A B C A)")
     g.add_argument(
         "-a",
         nargs="?",
@@ -7141,106 +7221,105 @@ def parse_args(argv=None):
         dest="ph_a",
         metavar="TOL",
         action=_PhaseArg,
-        help="Fase A: unione facce complanari. Valore opzionale = distanza max "
-        "dei vertici dal piano comune in mm (es. -a 0.01 unisce facce con "
-        "scarti fino a 10 micron). Senza valore: 2e-6 x diagonale. Si puo' "
-        "ripetere: 'refit.py x.stl -a -b -c -a 0.005' fa A stretta, B, C e "
-        "la riunione finale larga",
+        help="Phase A: merge coplanar faces. Optional value = max distance of "
+        "the vertices from the common plane, in mm (e.g. -a 0.01 merges "
+        "faces with deviations up to 10 microns). Without a value: 2e-6 x "
+        "diagonal. Can be repeated: 'refit.py x.stl -a -b -c -a 0.005' "
+        "does a tight A, B, C and a wide final re-merge",
     )
-    g.add_argument("-b", nargs=0, dest="ph_b", action=_PhaseArg, help="Fase B: solo fori circolari passanti o ciechi")
-    g.add_argument("-c", nargs=0, dest="ph_c", action=_PhaseArg, help="Fase C: raccordi, smussi, lamature, sfere, tori, forme libere")
-    g.add_argument("-i", "--iterations", type=int, default=1, metavar="N", help="ripeti N volte l'intera sequenza di fasi prima di salvare (default 1)")
-    g.add_argument("--keep-a", action="store_true", help="salva anche l'intermedio <nome>_phaseA.step dopo la prima Fase A")
+    g.add_argument("-b", nargs=0, dest="ph_b", action=_PhaseArg, help="Phase B: only through/blind circular holes")
+    g.add_argument("-c", nargs=0, dest="ph_c", action=_PhaseArg, help="Phase C: fillets, chamfers, countersinks, spheres, tori, free-form shapes")
+    g.add_argument("-i", "--iterations", type=int, default=1, metavar="N", help="repeat the whole phase sequence N times before saving (default 1)")
+    g.add_argument("--keep-a", action="store_true", help="also save the intermediate <name>_phaseA.step after the first Phase A")
 
-    g = p.add_argument_group("Fase A")
+    g = p.add_argument_group("Phase A")
     g.add_argument(
         "--lin-tol",
         type=float,
         default=None,
-        help="distanza max dei vertici dal piano comune per fondere due facce "
-        "(mm): e' la tolleranza della Fase A INIZIALE, quella che -a "
-        "cambia solo per la passata finale. Default: 2e-6 x diagonale, "
-        "minimo 1e-5",
+        help="max distance of the vertices from the common plane to merge two "
+        "faces (mm): this is the INITIAL Phase A's tolerance, the one -a "
+        "only changes for the final pass. Default: 2e-6 x diagonal, "
+        "minimum 1e-5",
     )
-    g.add_argument("--no-cad-edges", action="store_true", help="[A] non proteggere gli spigoli del CAD riconosciuti dal cambio di trama della mesh (vedi la nota nel sorgente)")
-    g.add_argument("--ang-tol", type=float, default=0.005, help="tolleranza angolare per l'unione classica di STEP non triangolari (gradi)")
+    g.add_argument("--no-cad-edges", action="store_true", help="[A] don't protect the CAD edges recognized by the mesh's texture change (see the note in the source)")
+    g.add_argument("--ang-tol", type=float, default=0.005, help="angular tolerance for the classic merge of non-triangular STEP (degrees)")
 
-    g = p.add_argument_group("Fasi B e C")
+    g = p.add_argument_group("Phases B and C")
     g.add_argument(
         "--tol",
         type=float,
         default=None,
-        help="distanza max fra un vertice della mesh e la superficie perche' la "
-        "primitiva sia accettata (mm). E' l'UNICA tolleranza delle fasi B e "
-        "C: tutte le altre ne discendono - crescita della regione 10x (e "
-        "comunque non oltre 1e-3 x diagonale), curve d'intersezione 4x, "
-        "'e' la stessa superficie del vicino?' 50x, tetto delle tolleranze "
-        "degli spigoli 20x (vedi --max-edge-tol). PIU' PICCOLA = il pezzo "
-        "resta piu' vicino alla mesh e le regioni non sconfinano oltre gli "
-        "spigoli del CAD, ma quello che la mesh non sostiene resta "
-        "tassellato. PIU' GRANDE = piu' facce riconosciute, ma la regione "
-        "si allarga oltre lo spigolo vero e il pezzo si deforma. NON tocca "
-        "la Fase A, che ha --lin-tol e il valore dopo -a. Default: 1e-5 x "
-        "diagonale, minimo 2e-4 (su un pezzo da 150 mm di diagonale: "
-        "1.5e-3)",
+        help="max distance between a mesh vertex and the surface for the "
+        "primitive to be accepted (mm). It's the ONLY tolerance of phases "
+        "B and C: all the others derive from it - region growth 10x (and "
+        "never beyond 1e-3 x diagonal), intersection curves 4x, "
+        "'is it the same surface as the neighbor?' 50x, edge-tolerance "
+        "ceiling 20x (see --max-edge-tol). SMALLER = the part stays "
+        "closer to the mesh and regions don't overrun past the CAD's "
+        "edges, but what the mesh doesn't support stays tessellated. "
+        "LARGER = more faces recognized, but the region widens past the "
+        "true edge and the part deforms. Does NOT touch Phase A, which "
+        "has --lin-tol and the value after -a. Default: 1e-5 x diagonal, "
+        "minimum 2e-4 (on a part with a 150 mm diagonal: 1.5e-3)",
     )
     g.add_argument(
         "--max-edge-tol",
         type=float,
         default=None,
-        help="tetto della tolleranza degli spigoli: un bordo poligonale lasciato "
-        "su una faccia analitica che si scosta di piu' fa scartare la "
-        "regione (mm). Default: 20 x --tol, e comunque almeno 2e-4 x "
-        "diagonale",
+        help="edge tolerance ceiling: a polygonal boundary left on an analytic "
+        "face that deviates more than this makes the region get rejected "
+        "(mm). Default: 20 x --tol, and in any case at least 2e-4 x "
+        "diagonal",
     )
     g.add_argument(
         "--no-arcs",
         action="store_true",
-        help="non promuovere ad arco esatto le spezzate che stanno su un cerchio "
-        "(e' l'ultimo passo, dopo tutte le fasi: su test8 toglie 288 spigoli "
-        "senza muovere una faccia)",
+        help="don't promote to an exact arc the polylines that sit on a circle "
+        "(it's the last step, after all phases: on test8 it removes 288 "
+        "edges without moving a single face)",
     )
     g.add_argument(
         "--arc-tol",
         type=float,
         default=None,
-        help="quanto possono distare dal cerchio i vertici della spezzata perche' "
-        "diventi un arco (mm). Default: --tol, e in mancanza 1e-5 x diagonale",
+        help="how far a polyline's vertices can be from the circle for it to "
+        "become an arc (mm). Default: --tol, and failing that 1e-5 x diagonal",
     )
     g.add_argument(
         "--min-faces",
         type=int,
         default=4,
-        help="faccette minime perche' un gruppo diventi una regione (default 4). "
-        "A parte questo la Fase C scarta le regioni sotto le 12 faccette "
-        "che hanno piu' del 60%% del bordo appoggiato ad altre faccette "
-        "tassellate: sono primitive fittate sul rumore",
+        help="minimum facets for a group to become a region (default 4). "
+        "Besides this, Phase C rejects regions under 12 facets that have "
+        "more than 60%% of their boundary resting on other tessellated "
+        "facets: those are primitives fitted on noise",
     )
-    g.add_argument("--no-sphere", action="store_true", help="[C] non riconoscere le sfere")
-    g.add_argument("--no-cone", action="store_true", help="[C] non riconoscere i coni")
-    g.add_argument("--no-torus", action="store_true", help="[C] non riconoscere i tori")
-    g.add_argument("--no-free", action="store_true", help="[C] non ricostruire le macchie di raccordo a forma libera (B-spline): restano tassellate o spezzate in cilindretti")
+    g.add_argument("--no-sphere", action="store_true", help="[C] don't recognize spheres")
+    g.add_argument("--no-cone", action="store_true", help="[C] don't recognize cones")
+    g.add_argument("--no-torus", action="store_true", help="[C] don't recognize tori")
+    g.add_argument("--no-free", action="store_true", help="[C] don't rebuild free-form fillet patches (B-spline): they stay tessellated or split into little cylinders")
 
-    g = p.add_argument_group("sistema / output")
+    g = p.add_argument_group("system / output")
     g.add_argument(
         "-j",
         "--threads",
         type=int,
         default=default_threads(),
         metavar="N",
-        help="tetto ai processi di lavoro per la ricerca delle primitive nelle "
-        f"Fasi B e C (default {default_threads()} su questa macchina, 1 = "
-        "tutto in sequenza). Quanti se ne usano davvero dipende dal lavoro "
-        "da fare. La Fase A e le sostituzioni nel solido restano su un core "
-        "solo. Con piu' processi le regioni trovate possono cambiare di "
-        "poco: con -j 1 il risultato e' riproducibile",
+        help="ceiling on worker processes for the primitive search in "
+        f"Phases B and C (default {default_threads()} on this machine, 1 = "
+        "everything sequential). How many are actually used depends on "
+        "the work at hand. Phase A and the in-solid replacements stay on "
+        "a single core. With more processes the regions found can change "
+        "slightly: with -j 1 the result is reproducible",
     )
-    g.add_argument("--validate", action="store_true", help="BRepCheck completo alla fine di ogni fase (lento su shape grandi)")
-    g.add_argument("--report", action="store_true", help="scrivi <nome>_report.txt con l'esito di ogni regione")
-    g.add_argument("--log", metavar="FILE", help="scrivi il log su file")
-    g.add_argument("-v", "--verbose", action="store_true", help="dettaglio per regione: curve provate, tentativi, motivi dello scarto")
-    g.add_argument("--quiet", action="store_true", help="solo avvisi ed errori")
-    g.add_argument("--no-color", action="store_true", help="niente colori ANSI")
+    g.add_argument("--validate", action="store_true", help="full BRepCheck at the end of every phase (slow on large shapes)")
+    g.add_argument("--report", action="store_true", help="write <name>_report.txt with the outcome of every region")
+    g.add_argument("--log", metavar="FILE", help="write the log to a file")
+    g.add_argument("-v", "--verbose", action="store_true", help="per-region detail: curves tried, attempts, rejection reasons")
+    g.add_argument("--quiet", action="store_true", help="only warnings and errors")
+    g.add_argument("--no-color", action="store_true", help="no ANSI colors")
     return p.parse_args(argv)
 
 
@@ -7255,7 +7334,7 @@ def main(argv=None) -> int:
     Log.level = 10 if args.verbose else (30 if args.quiet else 20)
 
     if args.check:
-        Log.banner("Verifica ambiente")
+        Log.banner("Environment check")
         Log.ok(f"OpenCascade  : {_NS}")
         try:
             import OCP  # noqa
@@ -7272,14 +7351,14 @@ def main(argv=None) -> int:
             ("MakeShapeOnMesh", getattr(_BRepBuilderAPI, "BRepBuilderAPI_MakeShapeOnMesh", None)),
             ("UnifySameDomain.KeepShape", getattr(ShapeUpgrade_UnifySameDomain, "KeepShape", None)),
         ):
-            (Log.ok if fn is not None else Log.error)(f"{name:<28}: {'ok' if fn is not None else 'ASSENTE'}")
+            (Log.ok if fn is not None else Log.error)(f"{name:<28}: {'ok' if fn is not None else 'MISSING'}")
         return 0
 
     if not args.input:
-        Log.error("Manca il file di ingresso (.stl o .step). Usa -h per l'aiuto.")
+        Log.error("Missing input file (.stl or .step). Use -h for help.")
         return 2
 
-    # sequenza delle fasi, nell'ordine scritto. Senza flag: A B C A.
+    # phase sequence, in the order written. No flags: A B C A.
     seq = list(getattr(args, "sequence", None) or [])
     if not seq:
         seq = [("A", None), ("B", None), ("C", None), ("A", None)]
@@ -7289,26 +7368,26 @@ def main(argv=None) -> int:
     t_start = time.perf_counter()
 
     shape, before = read_input(args.input)
-    # i processi di lavoro delle Fasi B/C si accendono da subito: impiegano
-    # circa un secondo a partire e lo fanno mentre gira la prima fase
+    # the Phase B/C worker processes are started right away: they take
+    # about a second to spin up, and they do it while the first phase runs
     if (not only_a) and args.threads > 1 and before["faces"] >= 2000:
         warm_pool(args.threads, before["faces"])
 
-    Log.info("Sequenza: " + " ".join(w + ("" if v is None or v <= 0 else f"({v:g})") for w, v in seq))
+    Log.info("Sequence: " + " ".join(w + ("" if v is None or v <= 0 else f"({v:g})") for w, v in seq))
     results: List[Tuple[str, PhaseResult]] = []
     after_a = before
     n_a = 0
     for it in range(max(1, args.iterations)):
-        tag = f" (ciclo {it + 1})" if args.iterations > 1 else ""
+        tag = f" (cycle {it + 1})" if args.iterations > 1 else ""
         for w, val in seq:
             if w == "A":
                 n_a += 1
                 lt = val if (val is not None and val > 0) else args.lin_tol
-                titolo = "FASE A — unione facce complanari" if n_a == 1 else "FASE A — riunione delle facce"
+                titolo = "PHASE A — merging coplanar faces" if n_a == 1 else "PHASE A — re-merging faces"
                 shape, bef_a, after_a = phase_a(shape, lt, args.ang_tol, validate=args.validate, title=titolo + tag, use_barrier=not args.no_cad_edges)
-                # ⚠️ 'before' resta quello del FILE, non della prima Fase A:
-                # con la Fase A non in testa (es. -b -c -a) altrimenti il
-                # report direbbe "994 facce in ingresso" invece di 5.682.
+                # ⚠️ 'before' stays the FILE's count, not the first Phase A's:
+                # with Phase A not first in sequence (e.g. -b -c -a) otherwise the
+                # report would say "994 input faces" instead of 5,682.
                 if n_a == 1:
                     if args.keep_a and not only_a:
                         write_step(shape, f"{stem}_phaseA.step")
@@ -7332,39 +7411,39 @@ def main(argv=None) -> int:
                 )
                 shape = rc.shape
                 results.append(("C" + tag, rc))
-    # (!) ULTIMO PASSO: le spezzate che sono archi del CAD tornano archi. Si fa
-    # alla fine perche' serve il B-Rep finito: un bordo diventa una catena
-    # sostituibile solo dopo che le facce ai suoi due lati sono al loro posto.
+    # (!) LAST STEP: polylines that are actually CAD arcs turn back into arcs.
+    # This runs at the end because it needs the finished B-Rep: an edge becomes
+    # a replaceable chain only once the faces on both its sides are in place.
     if not (only_a or args.no_arcs):
-        Log.banner("Archi \u00b7 le spezzate che erano curve del CAD")
+        Log.banner("Arcs · the polylines that used to be CAD curves")
         _V = Topo(shape).vpos
         _diag = float(np.linalg.norm(_V.max(axis=0) - _V.min(axis=0))) if len(_V) else 1.0
         _tolA = args.arc_tol if args.arc_tol and args.arc_tol > 0 else (
             args.tol if args.tol and args.tol > 0 else max(2e-4, 1e-5 * _diag))
         shape, _ = snap_arcs(shape, _tolA)
-    Log.banner("Salvataggio")
-    # ⚠️ L'ULTIMA PAROLA PRIMA DI SCRIVERE. Ogni conversione si valida da sola,
-    # ma i controlli sono locali: se qualcosa e' sfuggito si vede solo qui.
+    Log.banner("Saving")
+    # ⚠️ THE LAST WORD BEFORE WRITING. Every conversion validates itself,
+    # but the checks are local: if something slipped through, this is where it shows.
     if not is_valid(shape):
-        Log.warn("il pezzo finito non passa BRepCheck: " + ", ".join(check_detail(shape, 4)))
+        Log.warn("the finished part doesn't pass BRepCheck: " + ", ".join(check_detail(shape, 4)))
     write_step(shape, out_path)
     _ri, _ = read_step(out_path)
     if is_valid(shape) and not is_valid(_ri):
-        Log.warn("valido in memoria ma non dopo la scrittura STEP: " + ", ".join(check_detail(_ri, 4)))
+        Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))
     if args.report:
         write_report(f"{stem}_report.txt", args.input, before, after_a, results)
     if args.log:
         Log.dump(args.log)
 
-    Log.banner("Fatto")
+    Log.banner("Done")
     st = shape_stats(shape)
     Log.ok(
-        f"{before['faces']:,} facce in ingresso -> {st['faces']:,} in uscita · "
-        f"spigoli liberi {count_free_edges(shape)} · tolleranza max {max_tolerance(shape):.1e} mm "
+        f"{before['faces']:,} input faces -> {st['faces']:,} output faces · "
+        f"free edges {count_free_edges(shape)} · max tolerance {max_tolerance(shape):.1e} mm "
         f"· {time.perf_counter() - t_start:.1f}s"
     )
     for name, r in results:
-        Log.ok(f"Fase {name}: {r.n_ok}/{len(r.regions)} regioni convertite")
+        Log.ok(f"Phase {name}: {r.n_ok}/{len(r.regions)} regions converted")
     close_pool()
     return 0
 
@@ -7373,6 +7452,6 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterrotto.")
+        print("\nInterrupted.")
     finally:
         close_pool()

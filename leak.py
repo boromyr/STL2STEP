@@ -1,9 +1,9 @@
-"""Quanto i nostri confini seguono gli spigoli del CAD?
+"""How closely do our boundaries follow the CAD edges?
 
-Per ogni REGIONE (e per ogni SEZIONE) si guarda a quale faccia originale
-appartengono le sue faccette: quelle che non stanno nella faccia di
-maggioranza sono "sbavature", cioe' il bordo che zigzaga attraverso uno
-spigolo del CAD invece di seguirlo.
+For each REGION (and each SECTION) we look at which original face its
+facets belong to: the ones that don't sit in the majority face are
+"bleed", i.e. the boundary zigzags across a CAD edge instead of
+following it.
 """
 import sys
 import numpy as np
@@ -63,8 +63,8 @@ def main():
     cent = np.array([topo.cents[i] for i in range(topo.nF)])
     dd, _, jj = closest_on_tris(toA(cent), tA)
     of = fA[jj]
-    print(f"allineamento ICP: medio {med:.5f} max {mx:.5f} mm · "
-          f"baricentri: medio {dd.mean():.5f} max {dd.max():.5f} mm")
+    print(f"ICP alignment: mean {med:.5f} max {mx:.5f} mm · "
+          f"centroids: mean {dd.mean():.5f} max {dd.max():.5f} mm")
 
     diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0)))
     tf = max(2e-4, 1e-5 * diag)
@@ -88,13 +88,13 @@ def main():
             if bad:
                 righe.append((bad, len(g), sorted(c.values(), reverse=True)[:4]))
         righe.sort(reverse=True)
-        print(f"{nome}: {len(gruppi)} gruppi, faccette {tot_f}, sbavature {tot_bad} "
+        print(f"{nome}: {len(gruppi)} groups, facets {tot_f}, bleed {tot_bad} "
               f"({100.0*tot_bad/max(tot_f,1):.1f}%)")
         for bad, n, det in righe[:8]:
-            print(f"    gruppo di {n:5d} faccette: {bad:4d} fuori  (ripartizione {det})")
+            print(f"    group of {n:5d} facets: {bad:4d} outside  (breakdown {det})")
 
-    sbava([list(Rg.faces) for Rg in regs], "REGIONI")
-    sbava([list(np.where(lab == c)[0]) for c in range(nc)], "SEZIONI")
+    sbava([list(Rg.faces) for Rg in regs], "REGIONS")
+    sbava([list(np.where(lab == c)[0]) for c in range(nc)], "SECTIONS")
 
 
 if __name__ == "__main__":

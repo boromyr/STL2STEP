@@ -14,11 +14,11 @@ for i in range(topo.nF):
     if str(BRepAdaptor_Surface(topo.faces[i]).GetType()).split("_")[-1] != "Plane": continue
     if d[2] > 4 and d[0] < 1.2 and d[1] < 1.2:
         out.append((i, V.mean(axis=0), topo.norms[i], topo.areas[i]))
-print(len(out), "strisce verticali")
-# raggruppa per xy
+print(len(out), "vertical strips")
+# group by xy
 g = collections.defaultdict(list)
 for i, c, n, a in out:
     g[(round(c[0]), round(c[1]))].append((i, np.round(c,2), np.round(n,3), round(a,2)))
 for k in sorted(g, key=lambda k: -len(g[k]))[:10]:
-    print("gruppo", k, len(g[k]))
+    print("group", k, len(g[k]))
     for r in g[k]: print("   ", r)

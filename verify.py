@@ -7,7 +7,7 @@ _st=_rf._st
 Log.level=30
 
 def tri_dist(P, A, B, C):
-    """distanza punto-triangolo vettorizzata (P: n x 3, A/B/C: m x 3) -> n x m"""
+    """vectorized point-to-triangle distance (P: n x 3, A/B/C: m x 3) -> n x m"""
     out=np.empty((len(P),len(A)))
     AB=B-A; AC=C-A; N=np.cross(AB,AC)
     nn=np.linalg.norm(N,axis=1); nn[nn<1e-20]=1e-20; Nu=N/nn[:,None]
@@ -15,7 +15,7 @@ def tri_dist(P, A, B, C):
         w=p-A
         d_plane=np.einsum('ij,ij->i',w,Nu)
         proj=p-d_plane[:,None]*Nu
-        # coordinate baricentriche
+        # barycentric coordinates
         v0=AB; v1=AC; v2=proj-A
         d00=np.einsum('ij,ij->i',v0,v0); d01=np.einsum('ij,ij->i',v0,v1)
         d11=np.einsum('ij,ij->i',v1,v1); d20=np.einsum('ij,ij->i',v2,v0); d21=np.einsum('ij,ij->i',v2,v1)
@@ -23,7 +23,7 @@ def tri_dist(P, A, B, C):
         v=(d11*d20-d01*d21)/den; w2=(d00*d21-d01*d20)/den; u=1-v-w2
         inside=(u>=-1e-9)&(v>=-1e-9)&(w2>=-1e-9)
         d=np.abs(d_plane)
-        # fuori: distanza ai tre segmenti
+        # outside: distance to the three segments
         if not inside.all():
             idx=~inside
             best=np.full(idx.sum(), np.inf)
@@ -46,7 +46,7 @@ def main():
     A=np.array(A);B=np.array(B);C=np.array(C)
     out,_=read_step(sys.argv[2])
     to=Topo(out)
-    # campiona i vertici + centri delle facce di uscita, e punti interni via triangolazione
+    # sample the vertices + centers of the output faces, and interior points via triangulation
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     BRepMesh_IncrementalMesh(out, 0.05, False, 0.5, True)
     pts=[]
@@ -64,13 +64,13 @@ def main():
         n=int(sys.argv[3])
         if len(P)>n:
             P=P[np.random.default_rng(0).choice(len(P),n,replace=False)]
-    print("punti campionati sull'uscita:", len(P), " triangoli della mesh:", len(A))
+    print("points sampled on the output:", len(P), " mesh triangles:", len(A))
     d=np.empty(len(P))
     step=200
     for s in range(0,len(P),step):
         d[s:s+step]=tri_dist(P[s:s+step],A,B,C).min(axis=1)
-    print(f"distanza uscita->mesh:  media {d.mean():.5f}  p99 {np.percentile(d,99):.5f}  max {d.max():.5f} mm")
-    print(f"punti oltre 0.05 mm: {(d>0.05).sum()}   oltre 0.1 mm: {(d>0.1).sum()}")
+    print(f"output->mesh distance:  mean {d.mean():.5f}  p99 {np.percentile(d,99):.5f}  max {d.max():.5f} mm")
+    print(f"points beyond 0.05 mm: {(d>0.05).sum()}   beyond 0.1 mm: {(d>0.1).sum()}")
 
 if __name__=="__main__":
     main()

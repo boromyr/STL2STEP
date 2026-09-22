@@ -17,10 +17,10 @@ def main(path):
         L = sv[0]; W = sv[1]
         if topo.planar[i] and W > 1e-12 and L / max(W,1e-12) > 8.0 and topo.areas[i] > 0.2:
             strips.append((L/W, topo.areas[i], np.round(c,1)))
-        kinds["piana" if topo.planar[i] else "curva"] += 1
-    print(path, dict(kinds), "  strisce sottili:", len(strips))
+        kinds["planar" if topo.planar[i] else "curved"] += 1
+    print(path, dict(kinds), "  thin strips:", len(strips))
     for s in sorted(strips, key=lambda t: -t[1])[:10]:
-        print(f"    rapporto {s[0]:6.1f} area {s[1]:7.2f} cen {s[2]}")
+        print(f"    ratio {s[0]:6.1f} area {s[1]:7.2f} center {s[2]}")
 if __name__ == "__main__":
     for p in sys.argv[1:]:
         main(p)

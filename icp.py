@@ -1,4 +1,4 @@
-"""Allineamento preciso fra due B-Rep dello stesso pezzo: assi d'inerzia + ICP."""
+"""Precise alignment between two B-Reps of the same part: inertia axes + ICP."""
 import sys, itertools
 import numpy as np
 sys.path.insert(0, "D:/Users/PC/Desktop/refit")
@@ -7,7 +7,7 @@ from align import tri_of, best_transform
 
 
 def closest_on_tris(P, T, chunk=300):
-    """(distanza, punto piu' vicino, indice del triangolo) per ogni punto."""
+    """(distance, closest point, triangle index) for each point."""
     A, B, C = T[:, 0], T[:, 1], T[:, 2]
     n = len(P)
     out_d = np.full(n, np.inf)
@@ -54,7 +54,7 @@ def closest_on_tris(P, T, chunk=300):
 
 
 def kabsch(P, Q):
-    """Rototraslazione che porta P su Q (righe = punti)."""
+    """Rigid transform that takes P onto Q (rows = points)."""
     cp, cq = P.mean(axis=0), Q.mean(axis=0)
     H = (P - cp).T @ (Q - cq)
     U, S, Vt = np.linalg.svd(H)
@@ -64,17 +64,17 @@ def kabsch(P, Q):
 
 
 def align(shA, shB, defl=0.05, iters=25, cap=2500):
-    """Ritorna una funzione che porta i punti di B nel frame di A, e lo scarto."""
+    """Returns a function that maps B's points into A's frame, and the residual."""
     tA, fA, tipA, arA = tri_of(shA, defl)
     tB, fB, tipB, arB = tri_of(shB, defl)
     PA = tA.reshape(-1, 3)
     PB = tB.reshape(-1, 3)
     d0, cA, cB, Rm = best_transform(shA, shB, PA, PB)
-    # punti di B da allineare: i vertici della triangolazione
+    # B's points to align: the triangulation vertices
     S = np.unique(np.round(PB, 6), axis=0)
     if len(S) > cap:
         S = S[np.linspace(0, len(S) - 1, cap).astype(int)]
-    # trasformazione corrente: x_A = cA + (x_B - cB) @ Rm
+    # current transform: x_A = cA + (x_B - cB) @ Rm
     off = cA - cB @ Rm
     M = Rm.copy()
     for _ in range(iters):
@@ -98,4 +98,4 @@ if __name__ == "__main__":
     shA = R.read_input(sys.argv[1])[0]
     shB = R.read_input(sys.argv[2])[0]
     f, med, mx, tA, fA, tipA, arA = align(shA, shB)
-    print(f"ICP: scarto medio {med:.5f} mm, max {mx:.5f} mm")
+    print(f"ICP: mean residual {med:.5f} mm, max {mx:.5f} mm")
