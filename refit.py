@@ -141,6 +141,30 @@ only way to look into the gaps BETWEEN vertices, where a spline with too
 many poles wobbles). The sparsest pole grid that passes both tests wins; if
 none passes, the patch stays tessellated.
 
+CHAMFERS AROUND A TILTED WALL: THE FAN-TESSELLATED BAND
+A chamfer between the floor and a corner whose wall axis is tilted against
+it (test0: walls at 13 degrees, R3 corners) is a RULED surface - the CAD
+writes it as a B-spline, straight in one direction - and the tessellator
+covers it with a FAN of long triangles, vertices only on the two rails. It
+used to stay exactly like that in the output (the "fans" between the
+chamfer planes). Four things were in the way:
+ 1. the quadric fit breaks the band into 5-11 fragments (cones and tori
+    R4-5 over 8-16 degrees); the filters drop every one of them as noise,
+    and the free-form pass only looked at sections containing SURVIVING
+    fragments. The dropped ones now count too - they are exactly what the
+    patch replaces - and two pieces are enough when both are weak fits;
+ 2. a height-field spline over the band's bounding rectangle has no data
+    across the band: the facets' interior points are now used as WEAK
+    data (1/20 of a vertex), which holds the spline across without pulling
+    it off the vertices; with them, 20 vertices are enough (was 30);
+ 3. a fragment with no more distinct vertices than its primitive has
+    unknowns (a torus through 7 points) passes "exactly" through them
+    whatever they are: it's dropped, and the band grows over its facets;
+ 4. the rails, which have no analytic form either, become interpolating
+    B-spline curves in the final step instead of 16-segment polylines.
+test0 ('-a -b -c -a 0.01'): 158 -> 79 faces, 474 -> 198 edges, the six
+bands one B-spline each, same deviation from the mesh.
+
 HOW CLOSE IT GETS TO THE STARTING CAD (test4, measured)
 The original part has 51 faces: 25 planes, 17 cylinders, 6 B-splines, 3
 cones. With 'refit.py test4.stl -a -b -c -a 0.005' you get 54 faces: 28
@@ -254,6 +278,17 @@ than four times the ceiling: it wasn't catching real errors anymore, only
 good conversions. The new ceiling is a TRUE bound, not an estimate - if no
 face moves more than dev, the enclosed volume can't change by more than
 the touched area times dev - and it never tightens the previous one.
+⚠️ AND THE VOLUME ITSELF WAS WRONG. BRepGProp's analytic volume is fine on a
+whole solid, but its CHANGE across one replacement - faces trimmed by
+interpolated B-spline pcurves - is off by 20-100 times the real one: an
+R17.7 cap swapped for its own 25 facets (same area to the fourth digit,
+vertices at 2e-7) "moved" 5.4e-3 mm3 against a true 4e-5; test8's thirty
+R0.3 fillets and test9's rejections were mostly this. The change is now
+measured as the flux of x.n/3 over a TRIANGULATION of just the faces that
+changed, before and after (BRepMesh shares every edge's discretization
+between its two faces, so the triangulated shell is watertight). It's
+exact to the meshing deflection, a tenth of the tolerance, and it works on
+an open shell too (the global volume had to be skipped there).
 
 AND THEN THE ARCS (last step, --no-arcs to turn it off)
 ----------------------------------------------------------
@@ -287,6 +322,51 @@ MakeEdge(circle, V1, V2) takes the arc going from V1 to V2 at INCREASING
 parameter: swapping the two vertices without also flipping the circle
 takes the COMPLEMENTARY arc - 300 degrees instead of 60 - which in (u,v)
 exits on the other side of the surface and produces "UnorientableShape".
+Since September 2026 the step asks first for the EXACT curve: when both
+faces are analytic, their intersection (circle, ellipse, hyperbola, line)
+is computed from the surfaces and the edge lies on both to within rounding,
+not to within the mesh's noise. Only when that fails does it fall back to a
+circle through the vertices - lying in the planar face's own plane, when
+there is one. Rings closed on themselves (a hole's rim left polygonal
+because, when the hole was converted, the plane around it was still loose
+facets) become a single closed edge. Each edge's tolerance is the measured
+deviation, no longer the blanket --arc-tol; each face may gain or lose at
+most the crescent between the polyline and the curve; and a part that was
+already invalid before this step no longer makes every arc get thrown away.
+
+TANGENT JUNCTIONS AND TRUE TOLERANCES
+---------------------------------------
+Most edges of a machined part are TANGENT junctions: a wall running into a
+corner fillet, a fillet into the floor. Three things went wrong there.
+  - The circle "plane x cylinder" was built with the CYLINDER's axis as its
+    normal. A fitted axis is off orthogonal by theta, so the circle stood
+    r*theta off the plane (3-5e-5 mm on test5's corners) while the edge
+    declared 1e-7. It's now built in the plane (off the cylinder by
+    r*theta^2/2: nothing); the same for the tangency lines and the torus.
+  - Nobody measured the new edge against a PLANAR neighbor (OCC projects
+    the pcurve on the fly, so no deviation ever came out): now it's
+    measured and the edge carries it.
+  - At a G1 junction the fitted arc and the straight edge are tangent up to
+    the fit's noise: the vertex sits 3e-5 off the arc, and the two curves
+    cross for real sqrt(2 R gap) further on - 13 microns, far outside the
+    vertex. BRepCheck says SelfIntersectingWire. The edge's tolerance now
+    covers the gap over that stretch, as any CAD does (tangent_gap).
+Result: "boundaries with the planes left polygonal" went from 3-38 regions
+per part to ZERO; the analytic edges are the exact ones on the first try.
+
+OPENCASCADE 8 (cadquery-ocp 8.x)
+--------------------------------
+Two things changed under the script's feet. The collection typedefs
+(TopTools_IndexedMapOfShape, TColgp_Array1OfPnt2d, ...) are gone: only the
+template names in OCP.collections remain, and the import died. Worse, and
+silent: BRepCheck_Result.Status() raises TypeError, and check_detail()
+swallowed it returning [] - which every caller reads as "valid". The engine
+stopped rejecting broken faces, and test0, test2 and test4 came out invalid
+with holes up to 1.6 mm deep against the mesh. The statuses are now read
+from the single checkers (BRepCheck_Face, BRepCheck_Wire), and an invalid
+shape can never come back as [] again. Both OCP 7.x and 8.x work.
+Note: cadquery-ocp 8.0.1 requires vtk==9.6.2; with a newer vtk the OCP DLL
+doesn't load at all ("DLL load failed").
 
 THE TWO TOLERANCES, WHICH DON'T TALK TO EACH OTHER
 ------------------------------------------------------
@@ -376,7 +456,7 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -559,6 +639,29 @@ _TColgp = _m("TColgp")
 _TColStd = _m("TColStd")
 _Geom2dAPI = _m("Geom2dAPI")
 _TopLoc = _m("TopLoc")
+_BRepMesh = _m("BRepMesh")
+try:
+    _Coll = _m("collections")
+except ImportError:
+    _Coll = None
+
+
+def _cls(mod, old: str, *new: str):
+    """
+    Collection class by its classic typedef name, or by the template name.
+    ⚠️ OCP 8 (OpenCascade 8) no longer exports the typedefs: in place of
+    TopTools_IndexedMapOfShape there is only OCP.collections.
+    IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher, and the script died on
+    import. Both spellings are looked up, the old one first.
+    """
+    c = getattr(mod, old, None)
+    if c is not None:
+        return c
+    for nm in new:
+        c = getattr(_Coll, nm, None) if _Coll is not None else None
+        if c is not None:
+            return c
+    raise AttributeError(f"{old} not available in {_NS}")
 
 gp_Pnt, gp_Dir, gp_Vec, gp_Ax2, gp_Ax3, gp_Pnt2d = (_gp.gp_Pnt, _gp.gp_Dir, _gp.gp_Vec, _gp.gp_Ax2, _gp.gp_Ax3, _gp.gp_Pnt2d)
 TopAbs_FACE = _TopAbs.TopAbs_FACE
@@ -572,8 +675,15 @@ TopAbs_FORWARD = _TopAbs.TopAbs_FORWARD
 TopAbs_OUT = _TopAbs.TopAbs_OUT
 TopAbs_IN = _TopAbs.TopAbs_IN
 TopExp_Explorer = _TopExp.TopExp_Explorer
-TopTools_IndexedMapOfShape = _TopTools.TopTools_IndexedMapOfShape
-TopTools_IndexedDataMapOfShapeListOfShape = _TopTools.TopTools_IndexedDataMapOfShapeListOfShape
+TopTools_IndexedMapOfShape = _cls(_TopTools, "TopTools_IndexedMapOfShape", "IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher", "IndexedMap_TopoDS_Shape")
+TopTools_IndexedDataMapOfShapeListOfShape = _cls(_TopTools, "TopTools_IndexedDataMapOfShapeListOfShape", "IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher")
+TColgp_Array2OfPnt = _cls(_TColgp, "TColgp_Array2OfPnt", "Array2_gp_Pnt")
+TColgp_Array1OfPnt2d = _cls(_TColgp, "TColgp_Array1OfPnt2d", "Array1_gp_Pnt2d")
+TColgp_HArray1OfPnt2d = _cls(_TColgp, "TColgp_HArray1OfPnt2d", "HArray1_gp_Pnt2d")
+TColgp_HArray1OfPnt = _cls(_TColgp, "TColgp_HArray1OfPnt", "HArray1_gp_Pnt")
+TColStd_Array1OfReal = _cls(_TColStd, "TColStd_Array1OfReal", "Array1_double")
+TColStd_Array1OfInteger = _cls(_TColStd, "TColStd_Array1OfInteger", "Array1_int")
+TColStd_HArray1OfReal = _cls(_TColStd, "TColStd_HArray1OfReal", "HArray1_double")
 BRep_Tool = _BRep.BRep_Tool
 BRep_Builder = _BRep.BRep_Builder
 BRepAdaptor_Surface = _BRepAdaptor.BRepAdaptor_Surface
@@ -649,6 +759,7 @@ bt_Range = _st(BRep_Tool, "Range")
 bt_Curve = _st(BRep_Tool, "Curve")
 bt_Surface = _st(BRep_Tool, "Surface")
 bt_Degenerated = _st(BRep_Tool, "Degenerated")
+bt_Triangulation = _st(BRep_Tool, "Triangulation")
 te_FirstVertex = _st(_TopExp.TopExp, "FirstVertex")
 te_LastVertex = _st(_TopExp.TopExp, "LastVertex")
 te_MapShapes = _st(_TopExp.TopExp, "MapShapes")
@@ -847,8 +958,41 @@ for _n in dir(_BRepCheck):
             pass
 
 
+def _bc_name(st) -> str:
+    return str(st).split("_")[-1]
+
+
+def _probe_face(an, F) -> List[str]:
+    """
+    Statuses of an invalid face read from the single checkers, which return
+    a BRepCheck_Status directly (OCP 8 can't hand over the status LIST).
+    """
+    out: List[str] = []
+    try:
+        bf = _BRepCheck.BRepCheck_Face(F)
+        for st in (bf.IntersectWires(False), bf.ClassifyWires(False), bf.OrientationOfWires(False)):
+            out.append(_bc_name(st))
+        if bf.IsUnorientable():
+            out.append("UnorientableShape")
+    except Exception:
+        pass
+    for w in explore(F, TopAbs_WIRE):
+        try:
+            if an.IsValid(w):
+                continue
+            bw = _BRepCheck.BRepCheck_Wire(td_Wire(w))
+            bw.Minimum()
+            bw.InContext(F)
+            e1, e2 = TopoDS_Edge(), TopoDS_Edge()
+            for st in (bw.Closed(False), bw.Closed2d(F, False), bw.Orientation(F, False), bw.SelfIntersect(F, e1, e2, False)):
+                out.append(_bc_name(st))
+        except Exception:
+            out.append("InvalidWire")
+    return [x for x in dict.fromkeys(out) if x and x != "NoError"]
+
+
 def check_detail(shape, limit: int = 6) -> List[str]:
-    """BRepCheck errors in plain text ([] = valid)."""
+    """BRepCheck errors in plain text ([] = valid, and ONLY when valid)."""
     try:
         an = BRepCheck_Analyzer(shape)
         if an.IsValid():
@@ -856,27 +1000,46 @@ def check_detail(shape, limit: int = 6) -> List[str]:
     except Exception as e:
         return [f"BRepCheck: {e}"]
     out: List[str] = []
-    for kind, lab in ((TopAbs_FACE, "face"), (TopAbs_WIRE, "wire"), (TopAbs_EDGE, "edge"), (TopAbs_VERTEX, "vertex")):
+
+    def add(tag: str) -> bool:
+        if tag not in out:
+            out.append(tag)
+        return len(out) >= limit
+
+    for kind, lab in ((TopAbs_FACE, "face"), (TopAbs_WIRE, "wire"), (TopAbs_EDGE, "edge"), (TopAbs_VERTEX, "vertex"), (TopAbs_SHELL, "shell")):
         for s in explore(shape, kind):
+            names = None
             try:
                 res = an.Result(s)
+                if res is not None:
+                    names = [_bc_name(st) for st in res.Status()]
             except Exception:
-                continue
-            if res is None:
-                continue
-            try:
-                sts = list(res.Status())
-            except Exception:
-                sts = []
-            for st in sts:
-                nm = str(st).split("_")[-1]
-                if nm and nm != "NoError":
-                    tag = f"{lab}:{nm}"
-                    if tag not in out:
-                        out.append(tag)
-                    if len(out) >= limit:
-                        return out
-    return out
+                names = None
+            if names is None:
+                # ⚠️ OCP 8: Result().Status() raises TypeError ("Unregistered
+                # type NCollection_Shared<NCollection_List<BRepCheck_Status>>").
+                # The old code swallowed it and returned [] = "valid" for an
+                # INVALID face: the engine stopped rejecting broken faces and
+                # the output file came out invalid. Here the sub-shape's
+                # validity is asked directly, and the names come from the
+                # single checkers.
+                try:
+                    if an.IsValid(s):
+                        continue
+                except Exception:
+                    continue
+                if lab == "face":
+                    names = _probe_face(an, td_Face(s)) or ["Invalid"]
+                elif lab == "wire":
+                    continue  # already probed in its face's context
+                else:
+                    names = ["Invalid"]
+            for nm in names:
+                if nm and nm != "NoError" and add(f"{lab}:{nm}"):
+                    return out
+    # ⚠️ an invalid shape must NEVER come back as []: the callers read an
+    # empty list as "valid"
+    return out or ["shape:Invalid"]
 
 
 def is_valid(shape) -> bool:
@@ -2156,7 +2319,7 @@ class FreeForm:
         nu, nv = self.poles.shape
         gu = _bs_greville(self.ku, nu)
         gv = _bs_greville(self.kv, nv)
-        arr = _TColgp.TColgp_Array2OfPnt(1, nu, 1, nv)
+        arr = TColgp_Array2OfPnt(1, nu, 1, nv)
         for i in range(nu):
             for j in range(nv):
                 q = self.C + gu[i] * self.X + gv[j] * self.Y + self.poles[i, j] * self.Z
@@ -2164,8 +2327,8 @@ class FreeForm:
 
         def _kn(kk):
             vals = np.unique(np.round(kk, 12))
-            ka = _TColStd.TColStd_Array1OfReal(1, len(vals))
-            ma = _TColStd.TColStd_Array1OfInteger(1, len(vals))
+            ka = TColStd_Array1OfReal(1, len(vals))
+            ma = TColStd_Array1OfInteger(1, len(vals))
             for i, t in enumerate(vals):
                 ka.SetValue(i + 1, float(t))
                 ma.SetValue(i + 1, int((np.abs(kk - t) < 1e-12).sum()))
@@ -2195,13 +2358,37 @@ def _free_tame(ff: "FreeForm", x, y, z, ngrid: int = 25) -> bool:
     return bool(H.max() <= z.max() + lim and H.min() >= z.min() - lim)
 
 
-def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.ndarray] = None, check_tol: Optional[float] = None, max_tilt_deg: float = 70.0) -> Optional[Prim]:
+def fit_free(
+    P: np.ndarray,
+    Nrep: np.ndarray,
+    tol: float,
+    check: Optional[np.ndarray] = None,
+    check_tol: Optional[float] = None,
+    max_tilt_deg: float = 70.0,
+    soft: Optional[np.ndarray] = None,
+    soft_w: float = 0.05,
+) -> Optional[Prim]:
     """
     Least-squares B-spline over a point cloud with normals.
 
     tol       : maximum deviation allowed on the mesh's VERTICES.
     check     : points INSIDE the facets (centroids and side midpoints).
     check_tol : how far those are allowed to be.
+    soft      : points INSIDE the facets used as WEAK data (weight soft_w).
+
+    ⚠️ A FAN-TESSELLATED BAND HAS NO VERTEX INSIDE. A chamfer running
+    around a corner whose wall is tilted against the floor is a RULED
+    surface (the CAD writes it as a B-spline ruled in one direction), and
+    the tessellator covers it with a fan of long triangles whose vertices
+    sit only on the two rails. The grid spans the band's bounding
+    rectangle, so across the band the poles see no data at all: with the
+    vertices alone, test0's 1.4 mm band around an R3 corner would not go
+    below 6.5e-4 on the vertices with 5x5 poles (the cap), and with more
+    poles it wobbles by 8e-3 between the rails. The facets themselves say
+    where the surface is between the rails, to within their sag: as weak
+    data (1/20 of a vertex) they hold the spline across the band without
+    pulling it off the vertices - 6x8 poles, 3.7e-4 on the vertices and
+    4.4e-3 in the facets, which is the sag of the rails' own chords.
 
     ⚠️ THE VERTICES TELL YOU NOTHING. A B-spline with enough poles passes
     through every vertex and does whatever it wants between one vertex and
@@ -2215,7 +2402,11 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
     tessellated than invented.
     """
     P = np.unique(np.round(np.asarray(P, float), 9), axis=0)
-    if len(P) < 30:
+    # with the facets as weak data the band is covered even between the
+    # rails: 20 vertices around a corner are enough (test0's R3 corners
+    # have 27); without them 30 stays the floor
+    n_soft = 0 if soft is None else len(soft)
+    if len(P) < (20 if n_soft >= 2 * len(P) else 30):
         return None
     pl = fit_plane(P)
     if pl is None:
@@ -2236,7 +2427,16 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
         return None
     x0, x1 = x.min() - 0.06 * ex, x.max() + 0.06 * ex
     y0, y1 = y.min() - 0.06 * ey, y.max() + 0.06 * ey
-    nmax2 = max(16, len(P) // 2)
+    S = np.zeros((0, 3)) if soft is None else np.atleast_2d(np.asarray(soft, float))
+    if S.size:
+        ds = S - C
+        xs, ys, zs = ds @ X, ds @ Y, ds @ Z
+        # outside the vertices' footprint the soft points would move the knots' span
+        ms = (xs >= x0) & (xs <= x1) & (ys >= y0) & (ys <= y1)
+        xs, ys, zs = xs[ms], ys[ms], zs[ms]
+    else:
+        xs = ys = zs = np.zeros(0)
+    nmax2 = max(16, (len(P) + len(xs)) // 2)
     # ⚠️ THE GRID MUST BE SCALED TO THE PATCH. A SQUARE grid on a 1.4 x 4.3
     # mm strip puts the poles 0.16 mm apart crosswise, where the data sits
     # 0.3 mm apart: under-determined, and the spline wobbles. With square
@@ -2260,6 +2460,10 @@ def fit_free(P: np.ndarray, Nrep: np.ndarray, tol: float, check: Optional[np.nda
             sc = float(np.linalg.norm(A)) / max(float(np.linalg.norm(Rg)), 1e-12)
             AtA = A.T @ A
             Atz = A.T @ z
+            if len(xs):
+                As = (_bs_basis(xs, ku, nu)[:, :, None] * _bs_basis(ys, kv, nv)[:, None, :]).reshape(len(xs), nu * nv)
+                AtA = AtA + soft_w**2 * (As.T @ As)
+                Atz = Atz + soft_w**2 * (As.T @ zs)
             RtR = Rg.T @ Rg
             I = np.eye(nu * nv)
         except Exception:
@@ -2528,6 +2732,15 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
     if out is not None and out.kind == AXIAL and out.slope != 0.0:
         if not (np.isfinite(out.r0) and np.isfinite(out.slope) and out.r0 > 1e-9 and abs(out.slope) <= LM_MAX_SLOPE):
             out = prim
+    # ⚠️ same window for the others: the residual depends on |radius|, so a
+    # sphere or a tube can cross zero and come out with a NEGATIVE radius
+    # that explains the points just as well - and Geom_*Surface refuses it.
+    # A torus whose major radius collapses under the tube's is a spindle:
+    # a self-intersecting surface no CAD writes for a fillet.
+    if out is not None and out.kind == SPHERE and not (np.isfinite(out.r0) and out.r0 > 1e-9):
+        out = prim
+    if out is not None and out.kind == TORUS and not (np.isfinite(out.r0) and np.isfinite(out.r1) and out.r1 > 1e-9 and out.r0 > 0.15 * out.r1):
+        out = prim
     out.rms = float(np.sqrt(np.mean(out.dist(P_all) ** 2)))
     return out
 
@@ -2696,7 +2909,10 @@ def prims_same(pa: "Prim", pb: "Prim", tol_len: float, cos_ang: float) -> bool:
         return False
     if pa.kind == TORUS:
         return abs(pa.r0 - pb.r0) <= tol_len and abs(pa.r1 - pb.r1) <= tol_len and abs(float(d @ pa.axis)) <= tol_len
-    if abs(pa.slope - abs(pb.slope) * (1.0 if float(pa.axis @ pb.axis) > 0 else -1.0)) > 1e-4:
+    # ⚠️ with the axis flipped the taper flips sign (t -> -t): it's the
+    # SIGNED slope that has to match. abs(pb.slope) made two identical cones
+    # with a negative taper always look different.
+    if abs(pa.slope - pb.slope * (1.0 if float(pa.axis @ pb.axis) > 0 else -1.0)) > 1e-4:
         return False
     t = float(d @ pa.axis)
     return abs((pa.r0 + pa.slope * t) - pb.r0) <= tol_len
@@ -2929,7 +3145,13 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
     if abs(D) <= max(10.0 * tol, 1e-9):
         return []  # plane through the apex: degenerate
     cps = float(n @ a)
-    W = n - cps * a
+    # ⚠️ x runs along the AXIS'S PROJECTION ONTO THE PLANE (a - cos(psi) n),
+    # not along the normal's projection onto the axis's orthogonal plane
+    # (n - cos(psi) a): that one isn't even in the plane. With it every
+    # oblique section came out wrong - the ellipse 5 mm off the cone, the
+    # hyperbola 1.6 mm - and the plane parallel to the axis (psi = 90,
+    # the countersink cut by a slot's wall) gave no curve at all.
+    W = a - cps * n
     sps = float(np.linalg.norm(W))
     ca, sa = math.cos(alpha), math.sin(alpha)
     out: List[_Curve] = []
@@ -2946,6 +3168,8 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
     x0 = -D * cps * sps / A2
     C = P0 + x0 * E1
     if A2 < 0.0:  # ELLIPSE
+        if D <= 0.0:
+            return out  # it lies on the VIRTUAL nappe (radius < 0)
         ax = abs(D) * ca * sa / abs(A2)
         ay = abs(D) * sa / math.sqrt(-A2)
         if min(ax, ay) > 10.0 * tol:
@@ -3039,9 +3263,169 @@ def _cone_coax_circles(cone: "Prim", other: "Prim", tol: float) -> List["_Curve"
 
 
 # --- 5C.6  EXACT intersection between two primitives ---------------------------
+#
+# ⚠️ TANGENT JOINTS ARE THE NORM, AND THEY'RE ILL-CONDITIONED. A fillet is
+# tangent to both faces it joins: torus-plane at a boss's base, torus-
+# cylinder around a hole, sphere-torus at a corner. There the two profiles
+# TOUCH instead of crossing, and on fitted primitives (radius off by eps) the
+# exact solution splits into two circles sqrt(2 r eps) apart - with eps = 1e-4
+# on r = 1, fourteen hundredths on each side of the true edge. Neither passes
+# the vertex test, and the boundary stayed the mesh's polyline. So whenever
+# two roots come out close, the DOUBLE root (the tangency) is offered too,
+# and the vertices choose.
+
+
+def _profile_hits(pr_a, pr_b, tol: float):
+    """
+    Meeting points (t, rho) of two meridian profiles, in the same axial
+    frame. A profile is ("line", b, s) for rho = b + s t, or ("circle", tc,
+    rc, rr) for (t - tc)^2 + (rho - rc)^2 = rr^2.
+    """
+    hits: List[Tuple[float, float]] = []
+
+    def near_double(sep: float, scale: float) -> bool:
+        return sep <= 0.3 * max(scale, 1e-12)
+
+    if pr_a[0] == "circle" and pr_b[0] == "line":
+        pr_a, pr_b = pr_b, pr_a
+    if pr_a[0] == "line" and pr_b[0] == "line":
+        _, b1, s1 = pr_a
+        _, b2, s2 = pr_b
+        if abs(s1 - s2) > 1e-9:
+            t = (b2 - b1) / (s1 - s2)
+            hits.append((t, b1 + s1 * t))
+        return hits
+    if pr_a[0] == "line":
+        _, b, s = pr_a
+        _, tc, rc, rr = pr_b
+        # (t - tc)^2 + (b + s t - rc)^2 = rr^2
+        K = b - rc
+        qa = 1.0 + s * s
+        qb = 2.0 * (K * s - tc)
+        qc = tc * tc + K * K - rr * rr
+        disc = qb * qb - 4.0 * qa * qc
+        t0 = -qb / (2.0 * qa)
+        if disc < -(4.0 * qa * max(tol, 1e-9) * max(rr, 1e-9)):
+            return hits
+        half = math.sqrt(max(disc, 0.0)) / (2.0 * qa)
+        ts = [t0 - half, t0 + half] if half > 1e-12 else [t0]
+        if half > 1e-12 and near_double(half, rr):
+            ts.append(t0)
+        return [(t, b + s * t) for t in ts]
+    _, t1, r1c, R1 = pr_a
+    _, t2, r2c, R2 = pr_b
+    c1, c2 = np.array([t1, r1c]), np.array([t2, r2c])
+    dv = c2 - c1
+    d = float(np.linalg.norm(dv))
+    if d < 1e-12:
+        return hits
+    if d > R1 + R2 + tol or d < abs(R1 - R2) - tol:
+        return hits
+    x = (d * d + R1 * R1 - R2 * R2) / (2.0 * d)
+    h = math.sqrt(max(R1 * R1 - x * x, 0.0))
+    e = dv / d
+    q = np.array([-e[1], e[0]])
+    base = c1 + x * e
+    pts = [base + h * q, base - h * q] if h > 1e-12 else [base]
+    if h > 1e-12 and near_double(h, min(R1, R2)):
+        pts.append(base)
+    return [(float(p[0]), float(p[1])) for p in pts]
+
+
+def _coax_profile_circles(pa: "Prim", pb: "Prim", tol: float) -> List["_Curve"]:
+    """
+    ANY two coaxial surfaces of revolution (cylinder, cone, sphere, torus)
+    meet along circles, found where their meridian profiles meet - line or
+    circle in the (t, rho) half-plane. Covers what had no branch at all
+    (sphere x torus, torus x torus: the corner sphere closing a toroidal
+    fillet, two stacked fillets on a turned part) and adds the tangency
+    candidates to the ones that had a branch.
+    """
+    ref = pa if pa.kind != SPHERE else pb
+    if ref.kind == SPHERE or ref.axis is None:
+        return []
+    a = ref.axis / np.linalg.norm(ref.axis)
+    O = ref.center
+
+    def profile(p):
+        d = p.center - O
+        tc = float(d @ a)
+        if float(np.linalg.norm(d - tc * a)) > max(tol, 1e-6):
+            return None
+        if p.kind == SPHERE:
+            return ("circle", tc, 0.0, float(p.r0))
+        b = p.axis / np.linalg.norm(p.axis)
+        cs = float(a @ b)
+        if abs(cs) < 1.0 - 1e-6:
+            return None
+        if p.kind == TORUS:
+            return ("circle", tc, float(p.r0), float(p.r1))
+        s = float(p.slope) * (1.0 if cs > 0 else -1.0)
+        return ("line", float(p.r0) - s * tc, s)
+
+    pr_a, pr_b = profile(pa), profile(pb)
+    if pr_a is None or pr_b is None:
+        return []
+    out: List[_Curve] = []
+    for t, rho in _profile_hits(pr_a, pr_b, tol):
+        if rho > 10.0 * tol:
+            out.append(_circle(O + t * a, a, rho))
+    return out
+
+
+def _sphere_torus_meridian(sp: "Prim", tr: "Prim", tol: float) -> List["_Curve"]:
+    """
+    ⚠️ THE CORNER SPHERE CLOSING A TOROIDAL FILLET. The torus is the envelope
+    of the spheres of radius r centered on its core circle: a sphere of the
+    same radius centered ON that circle touches it along the meridian
+    through its center. Not coaxial, so the profile method can't see it.
+    """
+    a = tr.axis / np.linalg.norm(tr.axis)
+    d = sp.center - tr.center
+    h = float(d @ a)
+    rad = d - h * a
+    rn = float(np.linalg.norm(rad))
+    lim = max(10.0 * tol, 1e-3 * tr.r0)
+    if abs(sp.r0 - tr.r1) > max(tol, 1e-3 * tr.r1) or abs(h) > lim or abs(rn - tr.r0) > lim or rn < 1e-9:
+        return []
+    return [_circle(sp.center, np.cross(a, rad / rn), 0.5 * (sp.r0 + tr.r1))]
 
 
 def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
+    """
+    Analytic intersection curves between two primitives: the specific
+    branches below, plus the circles of any COAXIAL pair of surfaces of
+    revolution and the tangency candidates.
+    """
+    out = _surf_surf_core(pa, pb, tol)
+    if pa is None or pb is None or pa.kind in (PLANE, FREE) or pb.kind in (PLANE, FREE):
+        if pa is not None and pb is not None and {pa.kind, pb.kind} == {PLANE, TORUS}:
+            out = out + _plane_torus_tangent(pa if pa.kind == PLANE else pb, pb if pb.kind == TORUS else pa, tol)
+        return out
+    try:
+        out = out + _coax_profile_circles(pa, pb, tol)
+        if {pa.kind, pb.kind} == {SPHERE, TORUS}:
+            s_, t_ = (pa, pb) if pa.kind == SPHERE else (pb, pa)
+            out = out + _sphere_torus_meridian(s_, t_, tol)
+    except Exception as e:
+        Log.debug(f"coaxial intersection {pa.kind}x{pb.kind} failed: {e}")
+    return out
+
+
+def _plane_torus_tangent(pl: "Prim", tr: "Prim", tol: float) -> List["_Curve"]:
+    """Fillet at a boss's base: the plane orthogonal to the axis touches the
+    torus along the circle of radius R, one tube radius from its center."""
+    n, a = pl.axis / np.linalg.norm(pl.axis), tr.axis / np.linalg.norm(tr.axis)
+    cph = float(a @ n)
+    if abs(cph) < 1.0 - 1e-6:
+        return []
+    t = float((pl.center - tr.center) @ n) / cph
+    if abs(abs(t) - tr.r1) > 0.3 * tr.r1 or abs(t) <= tol:
+        return []
+    return [_circle(tr.center + t * a, n, tr.r0)]
+
+
+def _surf_surf_core(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
     """
     Analytic intersection curves between two primitives.
     Returns ALL possible solutions (0, 1 or 2): the comparison against the
@@ -3092,7 +3476,13 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                 tstar = float((pa.center - pb.center) @ n) / cph
                 r = pb.r0 + pb.slope * tstar
                 if r > 10 * tol:
-                    out.append(_circle(pb.center + tstar * a, a, r))
+                    # ⚠️ normal = the PLANE's, not the axis's: a fitted axis
+                    # is off orthogonal by theta, and the circle with the
+                    # axis as normal leaves the plane by r*theta (first
+                    # order: 3-5e-5 on test5's corner fillets, while the
+                    # edge declared 1e-7). In the plane it leaves the
+                    # cylinder by r*theta^2/2: second order, nothing.
+                    out.append(_circle(pb.center + tstar * a, n, r))
             if abs(pb.slope) >= 1e-9:  # CONE: generic conic
                 out += _cone_plane_curves(pb, pa, tol)
             if abs(pb.slope) < 1e-9:
@@ -3101,13 +3491,18 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                     foot = pb.center - h * n
                     w = np.cross(n, a)
                     nw = np.linalg.norm(w)
+                    # same reason: the line runs along the axis PROJECTED
+                    # onto the plane, or it climbs out of it (by 1e-2 per
+                    # unit length at the 0.57-degree limit of this branch)
+                    ap = a - float(a @ n) * n
+                    ap = ap / max(float(np.linalg.norm(ap)), 1e-300)
                     if nw > 1e-12 and abs(h) <= pb.r0 * 1.02 + tol:
                         w /= nw
                         s = math.sqrt(max(pb.r0**2 - h**2, 0.0))
-                        out.append(CLine(foot, a))  # TANGENCY
+                        out.append(CLine(foot, ap))  # TANGENCY
                         if s > max(tol, 1e-9):
-                            out.append(CLine(foot + s * w, a))
-                            out.append(CLine(foot - s * w, a))
+                            out.append(CLine(foot + s * w, ap))
+                            out.append(CLine(foot - s * w, ap))
                 if 1e-9 < abs(cph) < 1.0 - 1e-9:  # OBLIQUE plane
                     tstar = float((pa.center - pb.center) @ n) / cph
                     c = pb.center + tstar * a
@@ -3130,7 +3525,7 @@ def surf_surf_curves(pa: "Prim", pb: "Prim", tol: float) -> List[_Curve]:
                     ctr = pb.center + t * a
                     for rr in (pb.r0 + s, pb.r0 - s):
                         if rr > 10 * tol:
-                            out.append(_circle(ctr, a, rr))
+                            out.append(_circle(ctr, n, rr))
             elif abs(cph) < 1e-2:  # MERIDIAN plane
                 h = float((pb.center - pa.center) @ n)
                 if abs(h) <= max(tol, 1e-6):
@@ -3409,7 +3804,7 @@ class Topo:
     after every accepted replacement.
     """
 
-    __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "vmap", "nV", "vpos", "adj", "planar")
+    __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "v_edges", "vmap", "nV", "vpos", "adj", "planar")
 
     def __init__(self, shape, prev: Optional["Topo"] = None):
         self.shape = shape
@@ -3466,10 +3861,14 @@ class Topo:
             for i in fs:
                 self.f_edges[i].append(k)
         self.e_verts = []
-        for e in self.edges:
+        self.v_edges: Dict[int, List[int]] = defaultdict(list)
+        for k, e in enumerate(self.edges):
             a = vmap.FindIndex(te_FirstVertex(e)) - 1
             b = vmap.FindIndex(te_LastVertex(e)) - 1
             self.e_verts.append((a, b))
+            self.v_edges[a].append(k)
+            if b != a:
+                self.v_edges[b].append(k)
         self.adj = [set() for _ in range(self.nF)]
         for fs in self.e_faces:
             for a in range(len(fs)):
@@ -4338,7 +4737,9 @@ class Segmenter:
         regions = [describe_region(p, topo, rf) for p, rf in found]
         # ⚠️ facets each covering more than 30 degrees aren't a tessellation
         # of that surface: it's a random fit on 4 faces
-        regions = [R for R in regions if not (R.prim.kind in (AXIAL, TORUS) and R.coverage > 0 and R.coverage * 360.0 / max(len(R.faces), 1) > 30.0)]
+        coarse = lambda R: R.prim.kind in (AXIAL, TORUS) and R.coverage > 0 and R.coverage * 360.0 / max(len(R.faces), 1) > 30.0
+        frags = [R for R in regions if coarse(R)]
+        regions = [R for R in regions if not coarse(R)]
 
         # ⚠️ fragments: a 5-facet "cylinder" covering 7 degrees, or a torus
         # with a major radius under 0.3 mm, isn't a real feature: it's a
@@ -4353,8 +4754,43 @@ class Segmenter:
                 return True
             if R.prim.kind == SPHERE and R.coverage < 0.005 and len(R.faces) < 10:
                 return True
+            # ⚠️ THE SPINDLE TORUS. With R < r the tube crosses the axis, and
+            # STEP can't carry it as a TOROIDAL_SURFACE (it comes back as a
+            # SURFACE_OF_REVOLUTION over a B-spline profile). It does exist -
+            # a fillet bigger than the pin it rounds (test8: R0.43 r0.49,
+            # vertices at 1.8e-5 against a tolerance of 6.6e-4) - but most of
+            # the ones found were fits on a fillet zone's noise (test0: R1.32
+            # r4.47 on 15 facets, R2.02 r5.11 on 8). What tells them apart
+            # is the fit: a real surface exported by a CAD sits at a few
+            # percent of the tolerance, the noise fits at 35-120%.
+            if R.prim.kind == TORUS and R.prim.r0 < R.prim.r1 and not R.closed_u and R.rms > 0.25 * self.tol_fit:
+                return True
+            # ⚠️ WEAK FITS MUST HOLD ON AVERAGE. face_tol widens a coarse
+            # facet's threshold to half its sag: that's for the WORST facets
+            # of a well-determined surface, not for the whole region. A
+            # 4-facet cylinder or a 3-degree cap with vertices on average
+            # beyond the tolerance (rms 1.7e-3 against 8e-4, 4e-3 against
+            # 1e-3: a o78 "sphere" on 12 facets, a o25.7 on 23) isn't the
+            # surface, it's the one that happens to pass through those few
+            # points - the random radii that clutter the model.
+            if (len(R.faces) < 8 or (R.prim.kind == SPHERE and R.coverage < 0.02)) and R.rms > self.tol_fit:
+                return True
+            # ⚠️ AS MANY POINTS AS UNKNOWNS: THE RESIDUAL PROVES NOTHING. A
+            # torus has 7 degrees of freedom; through the 6-7 distinct
+            # vertices of 4 facets it passes "exactly" whatever they are
+            # (test0: a spindle torus R2.93 r6.36 at rms 2.6e-16 on four
+            # facets of a chamfer, left as a SURFACE_OF_REVOLUTION sliver
+            # between the chamfer's B-spline and its plane). The fit can
+            # only be judged with points to spare: torus 7 unknowns + 2,
+            # the others with at least one more point than unknowns.
+            if len(R.faces) < 12:
+                nv = len(np.unique(np.round(np.vstack([topo.verts[i] for i in R.faces]), 9), axis=0))
+                dof = {TORUS: 9, SPHERE: 5, AXIAL: 6 if abs(R.prim.slope) > 0 else 5}.get(R.prim.kind, 0)
+                if nv <= dof:
+                    return True
             return False
 
+        frags += [R for R in regions if _fragment(R)]
         regions = [R for R in regions if not _fragment(R)]
         # ⚠️ RECOVERY MUST BE DONE ON THE FINAL MAP. Regions thrown out by
         # the filters (fragments, random fits) keep their facets occupied
@@ -4374,7 +4810,7 @@ class Segmenter:
         # between, and in the CAD it's ONE single face.
         found = self._merge_cosurface(found, "after recovery")
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
-        regions = self._blend_patches(regions)
+        regions = self._blend_patches(regions, frags)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
@@ -4528,7 +4964,7 @@ class Segmenter:
             pass
         return p
 
-    def _blend_patches(self, regions):
+    def _blend_patches(self, regions, frags=None):
         """
         ⚠️ THE CHAMFER RUNNING ALONG A CURVED EDGE. Where the edge to be
         chamfered is neither straight nor a circular arc, the blending
@@ -4545,7 +4981,8 @@ class Segmenter:
         fit must stay within the SAME tolerance as the fragments: if it
         doesn't fit, nothing is touched.
         """
-        if not self.allow_free or len(regions) < self.blend_min:
+        frags = list(frags or [])
+        if not self.allow_free or len(regions) + len(frags) < self.blend_min:
             return regions
         topo = self.topo
         owner = {}
@@ -4553,7 +4990,19 @@ class Segmenter:
             for i in R.faces:
                 owner[i] = k
         lab, nc = self.sections()
-        n_in = np.bincount(lab, minlength=nc)
+        # ⚠️ THE FRAGMENTS THE FILTERS THREW AWAY COUNT TOO. A fan-tessellated
+        # chamfer band (test0: 74 facets around an R3 corner) comes out of
+        # the seeds as eleven 8-to-16-degree cones and tori: every one of
+        # them is a fragment, the filters drop them all, and a section made
+        # only of loose facets never got here - the band stayed a fan of
+        # long triangles in the finished part. They are what the patch
+        # replaces: they qualify the section and give the sag reference,
+        # exactly like the fragments that survived.
+        f_sec = []
+        for R in frags:
+            cf = Counter(int(lab[i]) for i in R.faces)
+            c0, k0 = cf.most_common(1)[0]
+            f_sec.append((c0, k0 >= 0.8 * len(R.faces)))
         drop, extra = set(), []
         for c in range(nc):
             m = np.where(lab == c)[0]
@@ -4570,7 +5019,30 @@ class Segmenter:
             for q in cnt:
                 tot[q] = len(regions[q].faces)
             dentro = [q for q in cnt if cnt[q] >= 0.8 * tot[q]]
-            if len(dentro) < self.blend_min:
+            # ⚠️ A STRONG REGION THAT OWNS THE SECTION IS NOT A FRAGMENT. A
+            # region sitting on the mesh the way a CAD surface does (a few
+            # thousandths of the tolerance) is the real thing: on test6 a
+            # R1.5 r0.5 torus at rms 1.3e-6 and three exact spheres shared a
+            # section with some fragments, and once the facets' interior
+            # points made the spline fit there, they were all melted into
+            # one 17x19 B-spline (which then failed on its edges and left the
+            # whole corner tessellated). Leaving it OUT of the patch doesn't
+            # work either - the patch gets a hole where it was and comes out
+            # InvalidImbricationOfWires (test7). So: a strong region that is
+            # a small part of the section is dissolved with the rest, as
+            # before; one covering more than a quarter of it keeps the
+            # section as it is.
+            a_sec = float(sum(topo.areas[i] for i in m))
+            if any(regions[q].rms <= 0.05 * self.tol_fit and tot[q] >= 8 and sum(topo.areas[i] for i in regions[q].faces) > 0.25 * a_sec for q in dentro):
+                continue
+            dentro_f = [q for q, (c0, ok) in enumerate(f_sec) if ok and c0 == c]
+            # ⚠️ TWO PIECES ARE ENOUGH. How many quadrics a band breaks into
+            # is scheduling noise: on test0's R3 corner the sequential seeds
+            # give a cone and four fragments, the parallel ones a 20-facet
+            # cone and one fragment, and the band stayed a fan. (A strong
+            # region owning the section has already stopped it above.)
+            n_pc = len(dentro) + len(dentro_f)
+            if n_pc < min(2, self.blend_min):
                 continue
             fuori = {i for i in m if owner.get(i) is not None and owner[i] not in dentro}
             faces = [int(i) for i in m if i not in fuori]
@@ -4589,26 +5061,68 @@ class Segmenter:
             # everyone and tells you how far it strays from the mesh
             # between one vertex and the next: the new surface only needs
             # to not be worse than the ones it replaces.
-            sag_old = max(region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro)
-            pr = fit_free(P, N, self.tol_fit, check=sag_points(topo, faces), check_tol=2.0 * sag_old + 2.0 * self.tol_fit)
+            sag_old = max([region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro] + [region_sag(frags[q].prim, topo, list(frags[q].faces)) for q in dentro_f])
+            chk = sag_points(topo, faces)
+            pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
             if pr is None:
                 continue
-            # ⚠️ THE REAL TEST IS AGAINST THE MESH, NOT AGAINST THE
-            # FRAGMENTS. Probe points taken on the fragments' primitives
-            # seemed like a good idea, but on a 1 mm-radius patch covered
-            # by ø6 spheres the fragments are the ones getting it wrong:
-            # the probe said 2e-03 while the B-spline was CLOSER to the
-            # part than they were. The sag - distance of the facets'
-            # INTERIOR points from the surface - is measured the same way
-            # for everyone, and tells you how far it strays from the mesh
-            # between one vertex and the next: the new surface must not be
-            # worse than the ones it replaces.
             drop |= set(dentro)
+            busy = {i for k, R in enumerate(regions) if k not in drop for i in R.faces}
+            busy |= {i for R in extra for i in R.faces}
+            pr, faces = self._grow_free(pr, faces, busy, 2.0 * sag_old + 2.0 * self.tol_fit)
             extra.append(describe_region(pr, topo, faces))
         if not extra:
             return regions
         Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
         return [R for k, R in enumerate(regions) if k not in drop] + extra
+
+    def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
+        """
+        A free-form patch takes the loose facets next to it that lie near its
+        surface (vertices within tol_grow, normals within 10 degrees, inside
+        the spline's domain), then is refitted on the union with the same
+        checks (vertices within tol_fit); if the refit fails the patch stays
+        as it was.
+
+        ⚠️ SECTIONS STOP AT THE TEXTURE, A FILTERED FRAGMENT DOESN'T. On
+        test0 four facets at the end of a chamfer band had been taken by a
+        spurious torus in a section of their own: once the torus is
+        dropped (see _fragment) they are loose, the band's section doesn't
+        include them, and they stayed a two-triangle wedge between the
+        band's B-spline and the next chamfer plane.
+        """
+        topo = self.topo
+        fs = set(faces)
+        cmax = math.cos(math.radians(10.0))
+        for _ in range(rounds):
+            ff = pr.free
+            cand = {j for i in fs for j in topo.adj[i] if j not in fs and j not in busy}
+            add = []
+            for j in cand:
+                V = topo.verts[j]
+                if not V.size:
+                    continue
+                u, v = ff.uv(V)
+                if u.min() < ff.ku[0] or u.max() > ff.ku[-1] or v.min() < ff.kv[0] or v.max() > ff.kv[-1]:
+                    continue
+                # nominated at the GROWTH tolerance (the spline is extrapolated
+                # there); the refit on the union is what must hold tol_fit
+                if float(np.abs(ff.dist(V)).max()) > self.tol_grow:
+                    continue
+                if float(np.min(ff.normal_at(V) @ topo.norms[j])) < cmax:
+                    continue
+                add.append(j)
+            if not add:
+                break
+            union = sorted(fs | set(add))
+            P = np.vstack([topo.verts[i] for i in union])
+            N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in union])
+            chk = sag_points(topo, union)
+            p2 = fit_free(P, N, self.tol_fit, check=chk, check_tol=check_tol, soft=chk)
+            if p2 is None:
+                break
+            pr, fs = p2, set(union)
+        return pr, sorted(fs)
 
     def _fill_islands(self, faces, owner, max_frac: float = 0.25):
         """UNCLAIMED facets fully surrounded by the patch: they belong to
@@ -5267,7 +5781,26 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
     Returns (Geom2d_Curve, (u_end, v_end) in the direction of travel, deviation).
     u_prev/v_prev = end of the previous edge in the wire: the pcurve is
     unwrapped to start from there.
+
+    ⚠️ THE DEVIATION BECOMES THE EDGE'S TOLERANCE, so it must be the
+    geometry's, not the interpolation's. 25 samples leave a spline error
+    of ~1e-5 x radius on a circle that isn't an iso-line of the surface (a
+    cap's boundary on a sphere, anything on a B-spline): on a 10 mm arc
+    that's 1e-4 of tolerance invented by the sampling. The samples are
+    doubled while the error BETWEEN them exceeds the one AT them (at the
+    samples the pcurve is exact, what's left there is the true distance
+    curve-surface - the sag of a chord, which more samples can't remove).
     """
+    out = None
+    for nn in (n, 2 * n - 1, 4 * n - 3):
+        out = _make_pcurve_n(sp, curve, t0, t1, traverse_fwd, u_prev, v_prev, nn)
+        c2d, _, dev, node_dev = out
+        if c2d is None or dev <= max(1.5 * node_dev, 1e-7):
+            break
+    return out[0], out[1], out[2]
+
+
+def _make_pcurve_n(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, u_prev: Optional[float], v_prev: Optional[float], n: int):
     P, ts = curve_points(curve, t0, t1, n)
     u, v = sp.uv(P)
     if not traverse_fwd:
@@ -5279,30 +5812,32 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
     u_end, v_end = float(u[-1]), float(v[-1])
     if not traverse_fwd:
         u, v = u[::-1], v[::-1]
+    # the true curve-surface distance, at the nodes (the projections)
+    node_dev = float(np.linalg.norm(P - sp.point(u, v), axis=1).max())
     # a line in (u,v) and linear in t?  -> degree-1 B-spline (exact)
     lin_u = u[0] + (u[-1] - u[0]) * (ts - t0) / max(t1 - t0, 1e-300)
     lin_v = v[0] + (v[-1] - v[0]) * (ts - t0) / max(t1 - t0, 1e-300)
     if float(np.abs(lin_u - u).max()) < 1e-9 and float(np.abs(lin_v - v).max()) < 1e-9:
-        poles = _TColgp.TColgp_Array1OfPnt2d(1, 2)
+        poles = TColgp_Array1OfPnt2d(1, 2)
         poles.SetValue(1, gp_Pnt2d(float(u[0]), float(v[0])))
         poles.SetValue(2, gp_Pnt2d(float(u[-1]), float(v[-1])))
-        knots = _TColStd.TColStd_Array1OfReal(1, 2)
+        knots = TColStd_Array1OfReal(1, 2)
         knots.SetValue(1, float(t0))
         knots.SetValue(2, float(t1))
-        mults = _TColStd.TColStd_Array1OfInteger(1, 2)
+        mults = TColStd_Array1OfInteger(1, 2)
         mults.SetValue(1, 2)
         mults.SetValue(2, 2)
         c2d = Geom2d_BSplineCurve(poles, knots, mults, 1)
     else:
-        pts = _TColgp.TColgp_HArray1OfPnt2d(1, n)
-        prm = _TColStd.TColStd_HArray1OfReal(1, n)
+        pts = TColgp_HArray1OfPnt2d(1, n)
+        prm = TColStd_HArray1OfReal(1, n)
         for i in range(n):
             pts.SetValue(i + 1, gp_Pnt2d(float(u[i]), float(v[i])))
             prm.SetValue(i + 1, float(ts[i]))
         it = _Geom2dAPI.Geom2dAPI_Interpolate(pts, prm, False, 1e-12)
         it.Perform()
         if not it.IsDone():
-            return None, (u_end, v_end), math.inf
+            return None, (u_end, v_end), math.inf, 0.0
         c2d = it.Curve()
     # "same parameter" deviation: |C3d(t) - S(pcurve(t))| over a dense sample
     tt = np.linspace(t0, t1, 2 * n + 1)
@@ -5310,7 +5845,7 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
     uu = np.array([c2d.Value(t).X() for t in tt])
     vv = np.array([c2d.Value(t).Y() for t in tt])
     dev = float(np.linalg.norm(Q - sp.point(uu, vv), axis=1).max())
-    return c2d, (u_end, v_end), dev
+    return c2d, (u_end, v_end), dev, node_dev
 
 
 def edge_curve(edge):
@@ -5391,6 +5926,91 @@ def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmi
     if not me.IsDone():
         return None, fwd_is_v1
     return me.Edge(), fwd_is_v1
+
+
+def tangent_gap(cv: "_Curve", edge, P_v: np.ndarray, cos_tan: float = math.cos(math.radians(5.0))) -> float:
+    """
+    Tolerance a new edge on curve cv needs at vertex P_v because of the
+    other edge `edge` that leaves the same vertex nearly TANGENT to it.
+
+    ⚠️ TANGENT JUNCTIONS. A straight boundary running into a corner fillet
+    meets the fillet's arc tangentially (G1). The vertex sits gap = 3e-5
+    off the fitted arc (the fit's noise, well inside the vertex tolerance),
+    but because the two curves are tangent that small gap turns into a real
+    crossing sqrt(2 R gap) away along the edges - 13 microns on test5's R3
+    corners, far outside the vertex. BRepCheck calls it SelfIntersectingWire
+    and the region fell back to a polygonal boundary. Over that stretch the
+    two edges are the same curve to within the gap: the edge's tolerance
+    has to say so, as any CAD does at a G1 junction. Returns 0 when the
+    junction isn't tangent (a real corner: nothing to cover).
+    """
+    try:
+        curve, t0, t1 = edge_curve(edge)
+        if curve is None:
+            return 0.0
+        L = edge_length(edge)
+        if L <= 1e-12:
+            return 0.0
+        q0, q1 = curve.Value(t0), curve.Value(t1)
+        d0 = float(np.linalg.norm(np.array([q0.X(), q0.Y(), q0.Z()]) - P_v))
+        d1 = float(np.linalg.norm(np.array([q1.X(), q1.Y(), q1.Z()]) - P_v))
+        t_end, t_in = (t0, t0 + 0.05 * (t1 - t0)) if d0 <= d1 else (t1, t1 - 0.05 * (t1 - t0))
+        qa, qb = curve.Value(t_end), curve.Value(t_in)
+        d_other = np.array([qb.X() - qa.X(), qb.Y() - qa.Y(), qb.Z() - qa.Z()])
+        tc = float(np.asarray(cv.param(P_v[None, :]), float)[0])
+        h = 1e-6 * max(1.0, abs(tc))
+        d_new = cv.point(np.array([tc + h]))[0] - cv.point(np.array([tc - h]))[0]
+        nd, no = float(np.linalg.norm(d_new)), float(np.linalg.norm(d_other))
+        if nd < 1e-300 or no < 1e-300 or abs(float(d_new @ d_other)) / (nd * no) < cos_tan:
+            return 0.0
+        return float(np.abs(cv.dist(P_v[None, :]))[0]) + float(bt_Tolerance(td_Edge(edge)))
+    except Exception:
+        return 0.0
+
+
+def tri_flux(faces, defl: float) -> float:
+    """
+    Enclosed-volume contribution of the faces, (1/3) * integral of x.n, summed
+    over a triangulation of each face (normals as the face is oriented).
+    NaN if a face can't be triangulated.
+
+    ⚠️ WHY NOT BRepGProp. Its analytic volume is fine on a whole solid made
+    of simple faces, but on the faces this engine builds - trimmed by
+    interpolated B-spline pcurves - its CHANGE is off by 20-100 times the
+    geometric one: a R17.7 cap swapped for its 25 facets (area identical to
+    the fourth digit, vertices at 2e-7) "moved" the volume by 5.4e-3 mm3
+    where the triangulated integral says 4e-5; an R2 cap, 1.7e-2 against
+    8e-4. The volume check was rejecting correct conversions (on test6, on
+    test8's thirty R0.3 fillets, on test9's lettering) and the last
+    attempt's "orientation" message hid it. BRepMesh shares each edge's
+    discretization between its two faces, so the triangulated shell is
+    watertight and the difference before/after is the real one.
+    """
+    tot = 0.0
+    for f in faces:
+        f = td_Face(f)
+        try:
+            _BRepMesh.BRepMesh_IncrementalMesh(f, float(defl), False, 0.3, False)
+            loc = TopLoc_Location()
+            tri = bt_Triangulation(f, loc)
+        except Exception:
+            return float("nan")
+        if tri is None or tri.NbTriangles() == 0:
+            return float("nan")
+        tr = loc.Transformation()
+        ident = loc.IsIdentity()
+        N = np.empty((tri.NbNodes(), 3))
+        for k in range(1, tri.NbNodes() + 1):
+            q = tri.Node(k)
+            if not ident:
+                q = q.Transformed(tr)
+            N[k - 1] = (q.X(), q.Y(), q.Z())
+        T = np.array([tri.Triangle(k).Get() for k in range(1, tri.NbTriangles() + 1)], dtype=int) - 1
+        if f.Orientation() == TopAbs_REVERSED:
+            T = T[:, [0, 2, 1]]
+        A, B, C = N[T[:, 0]], N[T[:, 1]], N[T[:, 2]]
+        tot += float(np.einsum("ij,ij->i", A + B + C, np.cross(B - A, C - A)).sum()) / 18.0
+    return tot
 
 
 def composed_edge_orientations(face, edge) -> List:
@@ -5776,6 +6396,7 @@ class Engine:
             grow_vertex_tolerance(V, dist)
 
         med_area = float(np.median([topo.areas[i] for i in rf]))
+        new_curves: List[Tuple["_Curve", object, int, int]] = []
         len_tot = len_debris = 0.0
         for L in loops:
             for ch in L.chains:
@@ -5931,10 +6552,50 @@ class Engine:
                     if why:
                         self._restore_vertices(vtol_backup)
                         return False, why
+                # tangent junctions at the two ends (see tangent_gap):
+                # against every edge that stays at those vertices
+                # ⚠️ AND THE TOLERANCE HAS TO BE TRUE. A planar neighbor gets
+                # no stored pcurve (OCC projects on the fly), so nothing
+                # measured how far the new curve is from that plane: the
+                # edge declared 1e-7 while standing 3-5e-5 off it. Measured
+                # here, against the face's own plane.
+                need = 0.0
+                if topo.planar[ch.nb]:
+                    try:
+                        c3, a3, b3 = edge_curve(e)
+                        Q3, _ = curve_points(c3, a3, b3, 33)
+                        need = float(np.abs((Q3 - face_plane_point(topo.faces[ch.nb])) @ topo.norms[ch.nb]).max())
+                    except Exception:
+                        need = 0.0
+                own = set(ch.edges)
+                for j in {j1, j2}:
+                    for k in topo.v_edges.get(j, ()):
+                        if k not in own:
+                            need = max(need, tangent_gap(cv, topo.edges[k], topo.vpos[j]))
+                if need > 0.0:
+                    if 1.2 * need + 1e-7 > self.max_edge_tol:
+                        self._restore_vertices(vtol_backup)
+                        return False, f"new edge {cv.label()} stands {need:.1e} off its neighbor"
+                    BRep_Builder().UpdateEdge(e, float(1.2 * need + 1e-7))
+                    for j in {j1, j2}:
+                        bump_vertex(j, need)
+                new_curves.append((cv, e, j1, j2))
                 new_edges[id(ch)] = (e, fwd_is_v1)
                 replaced.append((ch, e, fwd_is_v1))
                 n_analytic += 1
 
+        # two NEW edges meeting tangentially (two fillet arcs, arc and line)
+        for a_ in range(len(new_curves)):
+            for b_ in range(len(new_curves)):
+                cva, _, ja1, ja2 = new_curves[a_]
+                _, eb, jb1, jb2 = new_curves[b_]
+                if a_ == b_:
+                    continue
+                for j in {ja1, ja2} & {jb1, jb2}:
+                    g = tangent_gap(cva, eb, topo.vpos[j])
+                    if 0.0 < g and 1.2 * g + 1e-7 <= self.max_edge_tol:
+                        BRep_Builder().UpdateEdge(new_curves[a_][1], float(1.2 * g + 1e-7))
+                        bump_vertex(j, g)
         if self.verbose:
             Log.debug(f"    BOUNDARY {R.label()[:34]}: {len_tot:.2f} mm, of which {len_debris:.2f} mm ({100.0 * len_debris / max(len_tot, 1e-9):.0f}%) against tessellated facets")
         # --- seam for closed regions --------------------------------------------------
@@ -6422,7 +7083,8 @@ class Engine:
                 # deviation in parameters: the vertices lie on the surface
                 # within the noise, so a small deviation is normal and the
                 # tolerance covers it; a deviation of ~2pi is an unwrapping error
-                r_eff = max(prim_radius(sp.prim), 1e-3)
+                # (u, v) are lengths on a plane or a free-form patch, angles elsewhere
+                r_eff = 1.0 if sp.prim.kind in (PLANE, FREE) else max(prim_radius(sp.prim), 1e-3)
                 if gap * r_eff > 4.0 * self.max_edge_tol:
                     return f"wire not closed in parameter space (deviation {gap:.1e}, du {u_prev - u_start:+.3f} dv {v_prev - v_start:+.3f})"
             out.append((w, worst, worst_own))
@@ -6511,11 +7173,35 @@ class Engine:
         # it used to reject almost everything on a non-closed mesh. The
         # other checks remain (free edges unchanged, valid faces,
         # consistent area, normal direction).
+        # volume: triangulated flux of the faces that changed (see tri_flux)
+        dev = max(R.sag, self.tol_fit)
+        fo_in = None
+        for e_ in explore(Fo, TopAbs_EDGE):
+            if emap.Contains(e_):
+                for f_ in _iter_list(emap.FindFromKey(e_)):
+                    if f_.IsSame(Fo):
+                        fo_in = f_
+                        break
+            if fo_in is not None:
+                break
+        old_f = [self.topo.faces[i] for i in rf] + [self.topo.faces[j] for j in {ch.nb for ch, _, _ in replaced}]
+        new_f = [self.registry.FindKey(k) for k in touched] + [fo_in if fo_in is not None else Fo]
+        defl = max(0.1 * dev, 1e-5)
+        v_new, v_old = tri_flux(new_f, defl), tri_flux(old_f, defl)
+        if np.isfinite(v_new) and np.isfinite(v_old):
+            a_touch = face_area(Fo) + sum(face_area(self.registry.FindKey(k)) for k in touched)
+            # meshing error of the curved faces: at most area * deflection
+            bound = max(10.0 * a_mesh, a_touch) * dev + 2.0 * a_touch * defl + 1e-9
+            if abs(v_new - v_old) > bound:
+                return False, f"volume changed by {v_new - v_old:+.5f} mm3 (limit {bound:.5f})"
+            self.free0 = fe
+            return True, ""
+        # no triangulation: the global volume (closed shells only) as before.
+        # (self.vol0 isn't kept up to date by the path above: recomputed.)
         if self.free0 > 0:
             return True, ""
-        # volume
         v1 = shape_volume(new_shape)
-        v0 = self.vol0 if self.vol0 else shape_volume(self.shape)
+        v0 = shape_volume(self.shape)
         # ⚠️ THE CEILING MUST ALSO COUNT THE NEIGHBORS. Replacing a region
         # doesn't just move its own face: the polygonal boundaries touching
         # it become curves, and the neighboring faces get rebuilt along
@@ -6826,16 +7512,35 @@ def _arc_chains(topo: "Topo"):
                 a, b = topo.e_verts[k]
                 v = b if a == v else a
                 seq.append(v)
-            if len(cat) >= 3:
+            # two segments are enough when the curve is the EXACT
+            # intersection of the two faces (snap_arcs asks for three to
+            # trust a circle fitted through the vertices)
+            if len(cat) >= 2:
                 out.append((cat, seq, sorted(facce)))
     return out
 
 
 def _arc_wire_anchor(F_new, E_new):
-    """(u_prev, v_prev, traversed forward) for E_new in the face's wire."""
+    """
+    ([(u_prev, v_prev), ...], traversed forward) for E_new in the face's
+    wire: where the pcurve has to start, i.e. the end of its predecessor.
+    Usually one candidate; [None] when the edge is alone in its wire.
+
+    ⚠️ TWO EDGES BETWEEN THE SAME TWO VERTICES. When half of a hole's rim
+    is already an arc and the other half is the chain being replaced, the
+    new edge joins the SAME pair of vertices as the old arc, and on a cone
+    one of the two sits on the seam, where the wire passes twice - once per
+    side. The wire explorer walks by vertices and there it picks either
+    side: with the wrong one the arc lands one period (2 pi) off, the wire
+    has a 2D gap and the face is invalid (test0: both countersunk holes
+    kept 23 and 15 segments with a 7.7e-3 tolerance). So every edge whose
+    TRAVERSAL ends at the new edge's start is also a candidate; the caller
+    tries them in order and keeps the one giving a valid face.
+    """
     cos_ = _st(BRep_Tool, "CurveOnSurface")
+    first, fwd = None, None
     for w in explore(F_new, TopAbs_WIRE):
-        ex = _BRepTools.BRepTools_WireExplorer(_TopoDS.TopoDS.Wire_s(w), F_new)
+        ex = _BRepTools.BRepTools_WireExplorer(td_Wire(w), F_new)
         seq = []
         while ex.More():
             seq.append(td_Edge(ex.Current()))
@@ -6845,24 +7550,176 @@ def _arc_wire_anchor(F_new, E_new):
                 continue
             fwd = e.Orientation() == TopAbs_FORWARD
             if len(seq) == 1:
-                return None, None, fwd
+                return [None], fwd
             pre = seq[i - 1]
             try:
                 c2d = cos_(pre, F_new, 0.0, 0.0)
                 a, b = bt_Range(pre)
                 q = c2d.Value(b if pre.Orientation() == TopAbs_FORWARD else a)
-                return float(q.X()), float(q.Y()), fwd
+                first = (float(q.X()), float(q.Y()))
             except Exception:
-                return None, None, fwd
-    return None, None, None
+                pass
+            break
+        if fwd is not None:
+            break
+    out = [first] if first is not None else []
+    for w in explore(F_new, TopAbs_WIRE):
+        es = [td_Edge(e) for e in explore(w, TopAbs_EDGE)]
+        mine = [e for e in es if e.IsSame(E_new)]
+        if not mine:
+            continue
+        if fwd is None:
+            fwd = mine[0].Orientation() == TopAbs_FORWARD
+        Vs = te_FirstVertex(E_new) if fwd else te_LastVertex(E_new)
+        # predecessors by traversal first, then any edge end at Vs - on BOTH
+        # pcurves of a seam: a wire may carry the seam only once and use its
+        # second side implicitly (test0's countersink cones)
+        cand = []
+        for pre in es:
+            if pre.IsSame(E_new):
+                continue
+            pf = pre.Orientation() == TopAbs_FORWARD
+            a, b = bt_Range(pre)
+            ends = [(b, te_LastVertex(pre)), (a, te_FirstVertex(pre))] if pf else [(a, te_FirstVertex(pre)), (b, te_LastVertex(pre))]
+            sides = [pre]
+            if _st(BRep_Tool, "IsClosed")(pre, F_new):
+                sides.append(td_Edge(pre.Reversed()))
+            for rank, (t, V) in enumerate(ends):
+                if not V.IsSame(Vs):
+                    continue
+                for sd in sides:
+                    try:
+                        q = cos_(sd, F_new, 0.0, 0.0).Value(t)
+                    except Exception:
+                        continue
+                    cand.append((rank, (float(q.X()), float(q.Y()))))
+        for _, c in sorted(cand, key=lambda z: z[0]):
+            if all(abs(c[0] - o[0]) + abs(c[1] - o[1]) > 1e-6 for o in out):
+                out.append(c)
+        break
+    if fwd is None:
+        return [], None
+    return (out or [None]), fwd
+
+
+def face_prim(face) -> Optional["Prim"]:
+    """
+    The analytic primitive of a FINISHED face, read from its Geom surface
+    (plane, cylinder, cone, sphere, torus). None for B-splines and the rest.
+    ⚠️ gp_Cone's reference radius sits at the frame's origin and grows by
+    tan(semi-angle) per unit along the axis: that's exactly Prim's
+    r0 + slope * t, with the same origin.
+    """
+    try:
+        ad = BRepAdaptor_Surface(td_Face(face), True)
+        t = ad.GetType()
+
+        def frame(pos):
+            o, d = pos.Location(), pos.Direction()
+            return np.array([o.X(), o.Y(), o.Z()]), np.array([d.X(), d.Y(), d.Z()])
+
+        if t == GeomAbs_Plane:
+            c, n = frame(ad.Plane().Position())
+            return Prim(PLANE, c, n)
+        if t == GeomAbs_Cylinder:
+            cy = ad.Cylinder()
+            c, n = frame(cy.Position())
+            return Prim(AXIAL, c, n, float(cy.Radius()), 0.0)
+        if t == GeomAbs_Cone:
+            co = ad.Cone()
+            c, n = frame(co.Position())
+            return Prim(AXIAL, c, n, float(co.RefRadius()), float(math.tan(co.SemiAngle())))
+        if t == GeomAbs_Sphere:
+            sp = ad.Sphere()
+            c, _ = frame(sp.Position())
+            return Prim(SPHERE, c, None, float(sp.Radius()))
+        if t == GeomAbs_Torus:
+            to = ad.Torus()
+            c, n = frame(to.Position())
+            return Prim(TORUS, c, n, float(to.MajorRadius()), 0.0, float(to.MinorRadius()))
+    except Exception:
+        return None
+    return None
+
+
+def _plane_circle(P: np.ndarray, pl: "Prim"):
+    """
+    Circle through P constrained to lie IN the plane pl.
+    ⚠️ The SVD plane of a few vertices is off by their noise: a circle fitted
+    there sits BESIDE the planar face it bounds, and its pcurve on the plane
+    is a projection - the edge then carries that gap as tolerance. The
+    face's own plane is the right one: it's the plane the vertices were
+    written on.
+    """
+    n = pl.axis / np.linalg.norm(pl.axis)
+    X, Y = ortho_frame(n)
+    Q = P - pl.center
+    x, y = Q @ X, Q @ Y
+    try:
+        cx, cy, r = taubin_circle(x, y)
+    except Exception:
+        return None
+    if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r)) or r <= 1e-9:
+        return None
+    c = pl.center + cx * X + cy * Y
+    return CCircle(c, n, X, np.cross(n, X), float(r))
+
+
+def _chain_spline(P: np.ndarray, max_turn_deg: float = 25.0) -> Optional["CGeom"]:
+    """
+    Cubic B-spline INTERPOLATING the chain's vertices, for a smooth chain
+    along a free-form face (None if the chain has a corner in it).
+
+    ⚠️ THE RAILS OF A FREE-FORM BAND. Where a chamfer runs around a corner
+    whose wall is tilted against the floor, the band becomes one B-spline
+    face - and its two rails, the edges shared with the wall and with the
+    floor, have no analytic form either (in the CAD they're B-spline
+    curves too). Left as they came, they're the mesh's 16-segment
+    polylines: the band shows up with 35 sides and a kinked outline. The
+    vertices lie on both faces; the spline through them stays within the
+    chord sag of the polyline, and the usual checks (pcurve on both faces,
+    valid faces, area) decide.
+    """
+    P = np.asarray(P, float)
+    if len(P) < 4:
+        return None
+    D = np.diff(P, axis=0)
+    L = np.linalg.norm(D, axis=1)
+    if L.min() <= 1e-9:
+        return None
+    D = D / L[:, None]
+    cosang = np.einsum("ij,ij->i", D[:-1], D[1:])
+    if float(cosang.min()) < math.cos(math.radians(max_turn_deg)):
+        return None
+    try:
+        arr = TColgp_HArray1OfPnt(1, len(P))
+        for i, q in enumerate(P):
+            arr.SetValue(i + 1, _mk_pnt(q))
+        it = _m("GeomAPI").GeomAPI_Interpolate(arr, False, 1e-9)
+        it.Perform()
+        if not it.IsDone():
+            return None
+        return CGeom(_keep(it.Curve()))
+    except Exception:
+        return None
 
 
 def snap_arcs(shape, tol: float, title: str = "Arcs"):
     """
-    Replaces with an exact circular arc every chain of segments that truly
-    sits on a circle. Every replacement is checked on BOTH FACES touching
-    it before being accepted, and at the end the whole part is rechecked:
-    if something doesn't hold up, all of them are given up at once.
+    Replaces every chain of segments running between the SAME two faces
+    with the curve it really sits on. In order of preference:
+      1. the EXACT intersection of the two faces' surfaces, when both are
+         analytic (circle, ellipse, hyperbola, line): the edge then lies on
+         both faces to within rounding, not to within the mesh's noise;
+      2. a circle through the vertices - lying IN the planar face's plane
+         when one of the two faces is a plane;
+      3. along a free-form face, where neither exists: the cubic spline
+         through the vertices, if the chain is smooth (see _chain_spline);
+    Rings closed on themselves (a hole's rim left polygonal because, when the
+    hole was converted, the plane around it was still loose facets) become a
+    single closed edge. Every replacement is checked on BOTH faces touching
+    it, and at the end the whole part is rechecked: if something doesn't
+    hold up, all of them are given up at once.
     """
     t0 = time.perf_counter()
     topo = Topo(shape)
@@ -6871,88 +7728,196 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
         Log.info(f"{title}: no replaceable polyline   "
                  f"[{time.perf_counter() - t0:.2f}s]")
         return shape, 0
-    bb = BRep_Builder()
+    diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0))) if topo.nV else 1.0
+    fprim: Dict[int, Optional[Prim]] = {}
+
+    def prim_of(fi):
+        if fi not in fprim:
+            fprim[fi] = face_prim(topo.faces[fi])
+        return fprim[fi]
+
     rs = BRepTools_ReShape()
-    fatti = 0
+    fatti = n_exact = n_closed = n_spline = 0
+    vt_backup: Dict[int, float] = {}
+    sliver = 0.0  # summed area between the replaced polylines and their curves
     for cat, seq, facce in cands:
         P = topo.vpos[np.array(seq)]
-        dr = P[-1] - P[0]
-        L = float(np.linalg.norm(dr))
-        if L < 1e-12:
-            continue                       # chain closed on itself
-        d0 = P - P[0]
-        dr = dr / L
-        dev_retta = float(np.linalg.norm(d0 - np.outer(d0 @ dr, dr), axis=1).max())
-        fit = _arc_fit_circle(P)
-        if fit is None:
+        closed = seq[0] == seq[-1]
+        Pq = P[:-1] if closed else P
+        if len(Pq) < 3:
             continue
-        cen, rad, nrm, X, Y, dev = fit
-        # (!) the circle has to explain the chain MUCH better than the
-        # line: an almost-straight polyline fits any old circle and it
-        # doesn't mean anything.
-        if not (dev <= tol and dev < 0.2 * dev_retta and rad < 1e4):
+        seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+        if not closed:
+            dr = P[-1] - P[0]
+            L = float(np.linalg.norm(dr))
+            if L < 1e-12:
+                continue
+            d0 = P - P[0]
+            dr = dr / L
+            dev_retta = float(np.linalg.norm(d0 - np.outer(d0 @ dr, dr), axis=1).max())
+        else:
+            dev_retta = math.inf
+        pa, pb = prim_of(facce[0]), prim_of(facce[1])
+        if pa is not None and pb is not None and pa.kind == PLANE and pb.kind == PLANE:
+            continue  # two planes meet along a line: nothing to snap
+        # the polyline is a chord of the true curve: between two vertices the
+        # curve may stand off by the chord's sag, never by more than a slice
+        # of the segment (a 45-degree step sags by a tenth of its chord)
+        arc_tol = max(tol, 0.12 * float(seg.max()))
+        cv, exact = None, False
+        if pa is not None and pb is not None:
+            ex_c = [c for c in surf_surf_curves(pa, pb, tol) if not (closed and c.period is None)]
+            cv = choose_curve(ex_c, Pq, tol, scale=diag, arc_tol=arc_tol)
+            exact = cv is not None
+        if cv is None and len(cat) >= 3:
+            pl = pa if (pa is not None and pa.kind == PLANE) else (pb if (pb is not None and pb.kind == PLANE) else None)
+            circ = _plane_circle(Pq, pl) if pl is not None else None
+            if circ is None:
+                fit = _arc_fit_circle(Pq)
+                if fit is not None:
+                    cen, rad, nrm, X, Y, _ = fit
+                    circ = CCircle(cen, nrm, X, Y, float(rad))
+            if circ is not None and circ.r < 1e4:
+                dev = float(np.abs(circ.dist(Pq)).max())
+                # (!) the circle has to explain the chain MUCH better than the
+                # line: an almost-straight polyline fits any old circle and
+                # that doesn't mean anything.
+                if dev <= tol and dev < 0.2 * dev_retta and arc_deviation(circ, P) <= arc_tol:
+                    cv = circ
+        # 3. along a FREE-FORM face: the spline through the vertices. The
+        # pcurve may stand off as far as the edges it replaces already do
+        # (their tolerance is the fit's deviation on those vertices), no more.
+        spline = False
+        lim_p = tol
+        if cv is None and not closed and len(cat) >= 3 and (pa is None or pb is None) and dev_retta > tol:
+            sp_c = _chain_spline(P)
+            if sp_c is not None and arc_deviation(sp_c, P) <= arc_tol:
+                cv, spline = sp_c, True
+                lim_p = max(tol, 1.2 * max(float(bt_Tolerance(topo.edges[k])) for k in cat))
+        where = f"chain of {len(cat)} at {np.round(P[len(P) // 2], 2)}"
+        if cv is None:
+            Log.debug(f"  arc: {where}: no curve (exact candidates {len(ex_c) if pa is not None and pb is not None else 0})")
             continue
-        ang = np.unwrap(np.arctan2((P - cen) @ Y, (P - cen) @ X))
-        d_ang = np.diff(ang)
-        if not (np.all(d_ang > 0) or np.all(d_ang < 0)):
-            continue                       # doesn't always turn the same way
-        if abs(ang[-1] - ang[0]) >= 2 * math.pi - 1e-9:
-            continue
-        # (!) THE DIRECTION. The new edge takes the place of the chain's
-        # FIRST one and inherits its orientation flag in the two wires: its
-        # natural direction has to match. And the arc must be taken
-        # between the RIGHT two parameters: with the vertices swapped and
-        # the circle left as is, you get the COMPLEMENTARY arc - 300
-        # degrees instead of 60 - which in (u,v) pokes out on the other
-        # side of the surface and produces "UnorientableShape".
-        va, _vb = topo.e_verts[cat[0]]
-        testa = va == seq[0]
-        i1, i2 = (seq[0], seq[-1]) if testa else (seq[-1], seq[0])
-        p1, p2 = (ang[0], ang[-1]) if testa else (ang[-1], ang[0])
-        if p2 < p1:
-            nrm, p1, p2 = -nrm, -p1, -p2
-        ax2 = gp_Ax2(_mk_pnt(cen), _mk_dir(nrm), _mk_dir(X))
-        circ = _keep(Geom_Circle(ax2, float(rad)))
+        # it must turn one way only (no back-and-forth along the curve)
+        if cv.period:
+            tt = np.unwrap(np.asarray(cv.param(P), float))
+            dt = np.diff(tt)
+            if not (np.all(dt > 0) or np.all(dt < 0)):
+                Log.debug(f"  arc: {where}: goes back and forth along the curve")
+                continue
+            span = abs(float(tt[-1] - tt[0]))
+            if (closed and abs(span - 2 * math.pi) > 0.25 * math.pi) or (not closed and span >= 2 * math.pi - 1e-9):
+                Log.debug(f"  arc: {where}: spans {math.degrees(span):.0f} degrees")
+                continue
+        i1, i2 = seq[0], seq[-1]
         V1 = td_Vertex(topo.vmap.FindKey(i1 + 1))
         V2 = td_Vertex(topo.vmap.FindKey(i2 + 1))
-        me = _keep(BRepBuilderAPI_MakeEdge(circ, V1, V2, float(p1), float(p2)))
-        if not me.IsDone():
+        # (!) the endpoints stay where they are: their tolerance has to cover
+        # the distance from the curve, otherwise MakeEdge refuses the pair
+        # (vertex, parameter). Put back if the arc is dropped.
+        bumped: Dict[int, float] = {}  # this arc's bumps: vertex -> tolerance before
+
+        def bump(j, dist):
+            Vj = td_Vertex(topo.vmap.FindKey(j + 1))
+            cur = float(bt_Tolerance(Vj))
+            if 1.2 * dist + 1e-7 > cur:
+                bumped.setdefault(j, cur)
+                vt_backup.setdefault(j, cur)
+                grow_vertex_tolerance(Vj, dist)
+
+        for j in {i1, i2}:
+            bump(j, float(np.abs(cv.dist(topo.vpos[j][None, :]))[0]))
+        Pmid = P[len(P) // 2] if len(P) > 2 else None
+        try:
+            E, fwd_is_v1 = make_edge_on_curve(cv, V1, V2, P[0], P[-1], None if closed else Pmid, closed, P[1])
+        except Exception:
+            E = None
+        if E is None:
+            Log.debug(f"  arc: {where}: MakeEdge refused")
+            for j, t in bumped.items():
+                set_tolerance(td_Vertex(topo.vmap.FindKey(j + 1)), t)
             continue
-        E = td_Edge(me.Edge())
+        E = td_Edge(E)
+        # tangent junctions at the two ends (see tangent_gap)
+        own = set(cat)
+        gap = 0.0
+        for j in {i1, i2}:
+            for k in topo.v_edges.get(j, ()):
+                if k not in own:
+                    g = tangent_gap(cv, topo.edges[k], topo.vpos[j])
+                    if g > 0.0:
+                        gap = max(gap, g)
+                        bump(j, g)
+        # (!) THE DIRECTION. The new edge takes the place of the chain's FIRST
+        # one and inherits its orientation flag in the two wires: its natural
+        # direction has to match. make_edge_on_curve says whether the new
+        # edge runs from seq[0] onward; the first edge runs that way iff its
+        # FirstVertex is seq[0].
+        testa = topo.e_verts[cat[0]][0] == seq[0]
+        E_rep = E if fwd_is_v1 == testa else td_Edge(E.Reversed())
         rl = BRepTools_ReShape()
-        rl.Replace(td_Edge(topo.edges[cat[0]].Oriented(TopAbs_FORWARD)),
-                   td_Edge(E.Oriented(TopAbs_FORWARD)))
+        rl.Replace(td_Edge(topo.edges[cat[0]].Oriented(TopAbs_FORWARD)), E_rep)
         for k in cat[1:]:
             rl.Remove(td_Edge(topo.edges[k].Oriented(TopAbs_FORWARD)))
         buono = True
+        worst = 0.0
+        curve, c0, c1 = edge_curve(E)
         for fi in facce:
             F_new = td_Face(rl.Apply(topo.faces[fi]))
-            up, vp, fwd = _arc_wire_anchor(F_new, E)
-            if fwd is None:
+            anchors, fwd = _arc_wire_anchor(F_new, E)
+            if fwd is None or curve is None:
+                Log.debug(f"  arc: {where}: the new edge isn't in face {fi}'s wire")
                 buono = False
                 break
-            try:
-                sp = _ArcSurf(_st(BRep_Tool, "Surface")(topo.faces[fi]))
-                c2d, _, devp = make_pcurve(sp, circ, float(p1), float(p2), fwd, up, vp)
-            except Exception:
+            sp = _ArcSurf(_st(BRep_Tool, "Surface")(topo.faces[fi]))
+            placed = False
+            for anc in anchors:
+                up, vp = anc if anc is not None else (None, None)
+                try:
+                    c2d, _, devp = make_pcurve(sp, curve, float(c0), float(c1), fwd, up, vp)
+                except Exception as ex_:
+                    Log.debug(f"  arc: {where}: pcurve on face {fi} failed ({type(ex_).__name__}: {ex_})")
+                    continue
+                if c2d is None or not np.isfinite(devp) or devp > lim_p:
+                    Log.debug(f"  arc: {where}: pcurve on face {fi} off by {devp:.1e}")
+                    continue
+                BRep_Builder().UpdateEdge(E, c2d, topo.faces[fi], float(1.2 * max(devp, gap) + 1e-7))
+                # several candidate starts: the right one closes the wire in 2D
+                if len(anchors) > 1 and not is_valid(F_new):
+                    continue
+                worst = max(worst, devp)
+                placed = True
+                break
+            if not placed:
                 buono = False
                 break
-            if c2d is None or not np.isfinite(devp) or devp > tol:
-                buono = False
-                break
-            bb.UpdateEdge(E, c2d, topo.faces[fi], float(tol))
+        # (!) how far the new boundary can move each face: the curve stays
+        # within dev of the polyline, so the face gains or loses at most a
+        # crescent of that width along the chain. An arc taken the wrong way
+        # round, or a curve wandering between the vertices, moves whole
+        # square millimeters and is stopped here - face by face, not by a
+        # volume that can't tell which arc did it.
+        dev_arc = arc_deviation(cv, P)
+        crescent = 1.5 * float(seg.sum()) * max(dev_arc, tol) + 1e-9
         if buono:
             for fi in facce:
-                if not is_valid(td_Face(rl.Apply(topo.faces[fi]))):
+                F_new = td_Face(rl.Apply(topo.faces[fi]))
+                if not is_valid(F_new) or abs(face_area(F_new) - topo.areas[fi]) > crescent:
+                    Log.debug(f"  arc: {where}: face {fi} " + (f"area {topo.areas[fi]:.4f} -> {face_area(F_new):.4f} (crescent {crescent:.1e})" if is_valid(F_new) else "invalid: " + ", ".join(check_detail(F_new, 3))))
                     buono = False
                     break
         if not buono:
+            for j, t in bumped.items():
+                set_tolerance(td_Vertex(topo.vmap.FindKey(j + 1)), t)
             continue
-        rs.Replace(td_Edge(topo.edges[cat[0]].Oriented(TopAbs_FORWARD)),
-                   td_Edge(E.Oriented(TopAbs_FORWARD)))
+        rs.Replace(td_Edge(topo.edges[cat[0]].Oriented(TopAbs_FORWARD)), E_rep)
         for k in cat[1:]:
             rs.Remove(td_Edge(topo.edges[k].Oriented(TopAbs_FORWARD)))
         fatti += 1
+        sliver += crescent
+        n_exact += int(exact)
+        n_closed += int(closed)
+        n_spline += int(spline)
     if not fatti:
         Log.info(f"{title}: no polyline to promote "
                  f"({len(cands)} chains examined)   [{time.perf_counter() - t0:.2f}s]")
@@ -6962,23 +7927,36 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
     # EVERYTHING is given up. A prettier edge isn't worth a broken solid.
     fe0, fe1 = count_free_edges(shape), count_free_edges(nuovo)
     v0, v1 = shape_volume(shape), shape_volume(nuovo)
+    lever = float(np.linalg.norm(topo.vpos, axis=1).max()) if topo.nV else 0.0
     male = ""
     if fe1 > fe0:
         male = f"free edges {fe0} -> {fe1}"
-    elif not is_valid(nuovo):
+    elif not is_valid(nuovo) and is_valid(shape):
+        # (!) only a part that WAS valid can be spoiled: if it arrived invalid
+        # already (a defect of an earlier phase) every arc used to be thrown
+        # away for a fault that isn't theirs
         male = "BRepCheck: " + ", ".join(check_detail(nuovo, 3))
-    elif abs(v1 - v0) > max(1e-4 * abs(v0), 1e-9):
-        # (!) the volume DOES change, and rightly so: the polyline was
-        # cutting inside the arc, the true arc lies outside by a sag. On
-        # test8 that's 0.05 mm3 out of 2,754, i.e. 2 parts in a hundred
-        # thousand - a twentieth of what Phase C allows itself. The ceiling
-        # is only there to catch disasters.
+    elif abs(v1 - v0) > sliver * (lever / 3.0 + 1.0) + 1e-6 * abs(v0) + 1e-9:
+        # (!) the volume DOES change, and not only because the true arc
+        # lies outside the chord. With a polygonal rim the planar face and
+        # the cylinder don't meet exactly: between the polygon and the
+        # circle there's a crescent that belongs to neither, and the "volume"
+        # of a surface with a gap depends on where the origin is (the
+        # divergence theorem charges the gap x.n/3 per unit area). Closing
+        # the gap moves it by that much - on test2 nineteen rims shifted it
+        # by 1.05 mm3, and the old ceiling (1e-4 of the volume) threw away
+        # all nineteen for the correction. The ceiling is now the crescents'
+        # area times the largest lever arm: still an order of magnitude
+        # below what a wrong arc does.
         male = f"volume {v0:.4f} -> {v1:.4f}"
     if male:
+        for j, t in vt_backup.items():
+            set_tolerance(td_Vertex(topo.vmap.FindKey(j + 1)), t)
         Log.warn(f"{title}: {fatti} arcs rejected all together ({male})")
         return shape, 0
     n0, n1 = len(topo.edges), len(Topo(nuovo).edges)
-    Log.ok(f"{title}: {fatti:,} polylines promoted to exact arcs · "
+    Log.ok(f"{title}: {fatti:,} polylines promoted to exact curves "
+           f"({n_exact} exact intersections, {n_spline} splines along free-form faces, {n_closed} closed rings) · "
            f"edges {n0:,} -> {n1:,} · volume {100 * (v1 - v0) / max(abs(v0), 1e-12):+.4f}%"
            f"   [{time.perf_counter() - t0:.2f}s]")
     return nuovo, fatti
@@ -7315,7 +8293,7 @@ def parse_args(argv=None):
         "slightly: with -j 1 the result is reproducible",
     )
     g.add_argument("--validate", action="store_true", help="full BRepCheck at the end of every phase (slow on large shapes)")
-    g.add_argument("--report", action="store_true", help="write <name>_report.txt with the outcome of every region")
+    g.add_argument("--report", action="store_true", help="write <output name>_report.txt, next to the output, with the outcome of every region")
     g.add_argument("--log", metavar="FILE", help="write the log to a file")
     g.add_argument("-v", "--verbose", action="store_true", help="per-region detail: curves tried, attempts, rejection reasons")
     g.add_argument("--quiet", action="store_true", help="only warnings and errors")
@@ -7337,6 +8315,7 @@ def main(argv=None) -> int:
         Log.banner("Environment check")
         Log.ok(f"OpenCascade  : {_NS}")
         try:
+            import importlib.metadata
             import OCP  # noqa
 
             Log.ok(f"cadquery-ocp : {importlib.metadata.version('cadquery-ocp')}")
@@ -7365,6 +8344,10 @@ def main(argv=None) -> int:
     stem, _ = os.path.splitext(args.input)
     only_a = all(w == "A" for w, _ in seq)
     out_path = args.output or (f"{stem}_phaseA.step" if only_a else f"{stem}.step")
+    # ⚠️ with a STEP input, <name>.step IS the input: the default name would
+    # overwrite the file being converted
+    if not args.output and os.path.abspath(out_path).lower() == os.path.abspath(args.input).lower():
+        out_path = f"{stem}_refit.step"
     t_start = time.perf_counter()
 
     shape, before = read_input(args.input)
@@ -7431,7 +8414,8 @@ def main(argv=None) -> int:
     if is_valid(shape) and not is_valid(_ri):
         Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))
     if args.report:
-        write_report(f"{stem}_report.txt", args.input, before, after_a, results)
+        # next to the OUTPUT: with -o elsewhere it used to land beside the input
+        write_report(f"{os.path.splitext(out_path)[0]}_report.txt", args.input, before, after_a, results)
     if args.log:
         Log.dump(args.log)
 

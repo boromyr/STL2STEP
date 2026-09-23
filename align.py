@@ -24,11 +24,11 @@ def tri_of(shape, defl):
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     k = 0
     while ex.More():
-        f = TopoDS.Face_s(ex.Current()); ex.Next()
+        f = R.td_Face(ex.Current()); ex.Next()
         tipi.append(str(BRepAdaptor_Surface(f, True).GetType())[16:].replace("ype.", ""))
         aree.append(R.face_area(f))
         loc = TopLoc_Location()
-        t = BRep_Tool.Triangulation_s(f, loc)
+        t = R.bt_Triangulation(f, loc)
         if t is not None:
             tr = loc.Transformation()
             P = np.array([[t.Node(i).Transformed(tr).X(), t.Node(i).Transformed(tr).Y(),
@@ -43,7 +43,7 @@ def tri_of(shape, defl):
 
 def inertia_frame(shape):
     g = GProp_GProps()
-    BRepGProp.VolumeProperties_s(shape, g)
+    R.gp_Volume(shape, g)
     cm = g.CentreOfMass()
     c = np.array([cm.X(), cm.Y(), cm.Z()])
     M = g.MatrixOfInertia()

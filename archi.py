@@ -60,7 +60,7 @@ def main(path, tol, ang_vivo=20.0):
     archi, rette, corse = [], [], 0
     for f in topo.faces:
         for w in R.explore(f, TopAbs_WIRE):
-            ex = BRepTools_WireExplorer(TopoDS.Wire_s(w))
+            ex = BRepTools_WireExplorer(R.td_Wire(w))
             seq = []
             while ex.More():
                 e = ex.Current()

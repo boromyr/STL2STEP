@@ -27,14 +27,28 @@ python refit.py part.stl -a -b -c -a 0.005
 See the docstring at the top of `refit.py` for the full guide (tolerances, how to read the report,
 the final arc-snapping step).
 
+## Requirements
+
+```
+pip install cadquery-ocp numpy scipy
+```
+
+Works with OCP 7.x and 8.x. `cadquery-ocp` 8.0.1 is built against `vtk==9.6.2`: with a newer vtk
+(e.g. after a blanket `pip` upgrade) `import OCP` fails with "DLL load failed". `scipy` is only
+needed by `qa.py`.
+
 ## Files
 
 - `refit.py` — the main tool.
-- `verify.py` — measures the deviation between an output and the starting mesh.
+- `qa.py` — checks an output against its input mesh: exact two-sided deviation (output → mesh and
+  mesh → output, so holes in the output show up too), validity, free edges, face and edge types,
+  tolerances. `python qa.py part.stl part.step`
+- `verify.py` — measures the deviation between an output and the starting mesh (one-sided, sampled).
 - `archi.py` — counts how many of the mesh's polylines are actually circular arcs.
 - `tassellate.py` — estimates how much curvature is left tessellated in the output.
-- `test0.stl` … `test10.stl` — test meshes, ordered by increasing facet count (`test0` the
-  simplest, `test10` the most complex).
+- `test0.stl` … `test9.stl` — test meshes, ordered by increasing facet count (`test0` the
+  simplest). `test4_original.step` is the CAD file `test4.stl` was exported from: the reference
+  for comparing an output face by face (`extra.py test4_original.step test4.step`).
 - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
   `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
   used during development.

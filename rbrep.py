@@ -20,9 +20,9 @@ def tri_and_edges(shape, defl):
     tris = []
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
-        f = TopoDS.Face_s(ex.Current()); ex.Next()
+        f = R.td_Face(ex.Current()); ex.Next()
         loc = TopLoc_Location()
-        t = BRep_Tool.Triangulation_s(f, loc)
+        t = R.bt_Triangulation(f, loc)
         if t is None: continue
         tr = loc.Transformation()
         pts = []
@@ -37,7 +37,7 @@ def tri_and_edges(shape, defl):
     ex = TopExp_Explorer(shape, TopAbs_EDGE)
     seen = set()
     while ex.More():
-        e = TopoDS.Edge_s(ex.Current()); ex.Next()
+        e = R.td_Edge(ex.Current()); ex.Next()
         h = e.TShape().This()
         if h in seen: continue
         seen.add(h)
