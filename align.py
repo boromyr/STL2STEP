@@ -60,9 +60,10 @@ def best_transform(shA, shB, PA, PB):
     for perm in itertools.permutations(range(3)):
         for sg in itertools.product((1, -1), repeat=3):
             Q = VA[:, list(perm)] * np.array(sg)
-            if np.linalg.det(Q) < 0:
-                continue
             Rm = VB @ Q.T                      # x_B = cB + Rm @ (x_A - cA)
+            # only PROPER rotations; det(Q) alone isn't the test: when the
+            # eigenvector frame of B is left-handed every det(Q)>0 gives a
+            # reflection and no candidate was left (cadcmp died on test12)
             if abs(np.linalg.det(Rm) - 1) > 1e-6:
                 continue
             Pt = cB + (PA - cA) @ Rm.T

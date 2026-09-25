@@ -165,6 +165,37 @@ chamfer planes). Four things were in the way:
 test0 ('-a -b -c -a 0.01'): 158 -> 79 faces, 474 -> 198 edges, the six
 bands one B-spline each, same deviation from the mesh.
 
+WHAT AN EXACT MESH TELLS YOU (test0, test10 and the STEP they came from)
+--------------------------------------------------------------------------
+A mesh exported by a CAD has its vertices ON the surfaces, to the float32
+rounding of the coordinates - except those on edges the CAD itself only
+approximated (a B-spline intersection written with a tolerance of 2-4e-3).
+Compared face by face with the original STEP, that explained most of what
+was still off:
+  - the wrong RADII (R3.015 and R3.0074 on R3 walls): least squares shares
+    the few off vertices' error among all of them. The surface through the
+    most exact vertices (a RANSAC consensus) is taken instead - only when it
+    turns a non-round radius into a round one within 1%, and the off
+    vertices sit on the region's boundary, where the edge tolerance takes
+    them as it does in the CAD. Facets left out by the drifted fit are then
+    picked up by the corrected surface.
+  - SPHERES WHERE THE CAD HAS CONES: a chamfer band with two rims of
+    vertices fits both at 1e-6. The rims are joined by the cone's rulings,
+    whose midpoints lie on the cone and a whole sag below the sphere: the
+    surface the chords sag less from wins.
+  - chamfers of 3-6 facets left as mesh: too few points for a free cone,
+    enough for a cone COAXIAL with the cylinder they run along (2 unknowns),
+    and on an exact mesh their vertices land on it at 1e-6.
+  - the rims of countersunk holes left as 45-segment polygons: the hole's
+    cylinder, converted first, has its seam landing on the rim at one
+    vertex, and the circle replacing the rim started elsewhere. The rim is
+    now split into arcs at that vertex, and the circle's pcurve on the
+    cylinder is shifted by whole turns into the face's own u range.
+  - a collapsed facet (two coincident vertices) made a boundary impossible
+    to close: its direction now comes from the boundary's continuity.
+The STEP also carries the input's name (product, solid, header) instead of
+"Open CASCADE STEP translator 8.0 1".
+
 HOW CLOSE IT GETS TO THE STARTING CAD (test4, measured)
 The original part has 51 faces: 25 planes, 17 cylinders, 6 B-splines, 3
 cones. With 'refit.py test4.stl -a -b -c -a 0.005' you get 54 faces: 28
@@ -231,6 +262,12 @@ With more processes the seeds are tried against a snapshot of the facets
 already claimed, so the set of regions found can differ slightly from
 -j 1; every region is still checked and rejected with the same criteria.
 For a 100% reproducible result, use -j 1.
+On large, mostly doubly-curved parts (a 107k-triangle part of spheres and
+B-splines) the time went into seeds that could never succeed: Phase B now
+skips at once the neighborhoods whose normals span three directions (no
+cylinder there), and the LM fits stop when they crawl instead of running
+80 iterations on a patch that has no primitive; the Jacobian is computed in
+one numpy pass. Phase B on that part: about 12 times faster.
 
 ONE CAD FACE, ONE FACE OF OURS
 -------------------------------
@@ -664,6 +701,9 @@ def _cls(mod, old: str, *new: str):
     raise AttributeError(f"{old} not available in {_NS}")
 
 gp_Pnt, gp_Dir, gp_Vec, gp_Ax2, gp_Ax3, gp_Pnt2d = (_gp.gp_Pnt, _gp.gp_Dir, _gp.gp_Vec, _gp.gp_Ax2, _gp.gp_Ax3, _gp.gp_Pnt2d)
+gp_Vec2d = _gp.gp_Vec2d
+Poly_Triangulation = _m("Poly").Poly_Triangulation
+Poly_Triangle = _m("Poly").Poly_Triangle
 TopAbs_FACE = _TopAbs.TopAbs_FACE
 TopAbs_WIRE = _TopAbs.TopAbs_WIRE
 TopAbs_EDGE = _TopAbs.TopAbs_EDGE
@@ -1049,8 +1089,83 @@ def is_valid(shape) -> bool:
         return False
 
 
+def _face_components(faces) -> List[List[int]]:
+    """Groups of faces connected through shared edges."""
+    c = TopoDS_Compound()
+    b = BRep_Builder()
+    b.MakeCompound(c)
+    for f in faces:
+        b.Add(c, f)
+    fmap = TopTools_IndexedMapOfShape()
+    te_MapShapes(c, TopAbs_FACE, fmap)
+    emap, _, e_faces = face_edges_map(c)
+    parent = list(range(len(faces)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for fs in e_faces:
+        for g in fs[1:]:
+            ra, rb = root(fs[0]), root(g)
+            if ra != rb:
+                parent[rb] = ra
+    groups = defaultdict(list)
+    for i, f in enumerate(faces):
+        groups[root(fmap.FindIndex(f) - 1)].append(i)
+    return list(groups.values())
+
+
+def _solid_with_voids(shape):
+    """
+    ⚠️ A PART WITH INTERNAL CAVITIES IS ONE SOLID WITH SEVERAL SHELLS. test12
+    (the CAD writes it as BREP_WITH_VOIDS, six sealed cavities) arrives as
+    seven closed meshes: the outside one with positive volume, six with
+    negative volume (normals into the cavity). Poured into ONE shell they
+    make a shell of seven disconnected pieces - BRepCheck lets it through,
+    but it isn't what the CAD had and a CAD can take it badly. Here: one
+    shell per piece, the outer one plus the cavities. Only when there is
+    exactly ONE piece of positive volume: several (separate bodies, test1)
+    are left as before. None if it doesn't apply.
+    """
+    faces = explore(shape, TopAbs_FACE)
+    comps = _face_components(faces)
+    if len(comps) < 2:
+        return None
+    b = BRep_Builder()
+    shells = []
+    for comp in comps:
+        sh = TopoDS_Shell()
+        b.MakeShell(sh)
+        for i in comp:
+            b.Add(sh, faces[i])
+        sh.Closed(True)
+        ms = BRepBuilderAPI_MakeSolid()
+        ms.Add(sh)
+        shells.append((shape_volume(ms.Solid()), sh))
+    shells.sort(key=lambda t: -abs(t[0]))
+    sign = 1.0 if shells[0][0] > 0 else -1.0  # the mesh may be inside out
+    if sum(1 for v, _ in shells if sign * v > 0) != 1:
+        return None
+    ms = BRepBuilderAPI_MakeSolid()
+    for _, sh in shells:
+        ms.Add(sh if sign > 0 else td_Shell(sh.Reversed()))
+    if sign < 0:
+        Log.warn("Mesh normals point inward: flipping the shells.")
+    Log.info(f"{len(shells) - 1} internal cavit{'y' if len(shells) == 2 else 'ies'}: one solid with {len(shells)} shells")
+    return ms.Solid()
+
+
 def make_solid_from_faces(shape):
     """Shell (closed, hopefully) + solid, with the orientation checked."""
+    try:
+        sol = _solid_with_voids(shape)
+        if sol is not None:
+            return sol
+    except Exception as ex:
+        Log.debug(f"cavities: {type(ex).__name__}: {ex}")
     b = BRep_Builder()
     shell = TopoDS_Shell()
     b.MakeShell(shell)
@@ -1082,6 +1197,272 @@ def ensure_solid(shape):
 # =============================================================================
 
 
+# Mesh pre-check / repair settings (set by main from the command line).
+MESH_REPAIR = True  # repair the defects that would break the conversion
+MESH_CLOSE_HOLES = 10  # close holes up to this many boundary edges (0 = none)
+
+
+def _tri_arrays(tri):
+    """Poly_Triangulation -> (points n x 3, triangles m x 3, 0-based)."""
+    n, m = tri.NbNodes(), tri.NbTriangles()
+    P = np.array([[q.X(), q.Y(), q.Z()] for q in (tri.Node(i) for i in range(1, n + 1))], dtype=float).reshape(-1, 3)
+    T = (np.array([tri.Triangle(i).Get() for i in range(1, m + 1)], dtype=np.int64) - 1).reshape(-1, 3)
+    return P, T
+
+
+def _tri_from_arrays(P, T):
+    out = Poly_Triangulation(len(P), len(T), False)
+    for i, q in enumerate(P):
+        out.SetNode(i + 1, gp_Pnt(float(q[0]), float(q[1]), float(q[2])))
+    for i, (a, b, c) in enumerate(T):
+        out.SetTriangle(i + 1, Poly_Triangle(int(a) + 1, int(b) + 1, int(c) + 1))
+    return out
+
+
+def _needles(P, T):
+    """Triangles with three DISTINCT but collinear vertices."""
+    A, B, C = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    cr = np.linalg.norm(np.cross(B - A, C - A), axis=1)
+    L2 = np.max(np.stack([((B - A) ** 2).sum(1), ((C - B) ** 2).sum(1), ((A - C) ** 2).sum(1)], 1), axis=1)
+    distinct = (T[:, 0] != T[:, 1]) & (T[:, 1] != T[:, 2]) & (T[:, 0] != T[:, 2])
+    return np.nonzero(distinct & (cr <= 1e-12 * np.maximum(L2, 1e-300)))[0]
+
+
+def _flip_needles(P, T):
+    """
+    Triangles with three DISTINCT but collinear vertices, flipped away.
+    Returns (triangles, how many were flipped).
+
+    ⚠️ MakeShapeOnMesh DROPS A ZERO-AREA TRIANGLE WITHOUT A WORD, and a
+    closed mesh gets a three-edge crack: test12 (54k triangles, closed,
+    every edge shared by two) came out with 3 free edges from one triangle
+    whose third vertex sits ON its long side (a T-junction the exporter
+    closed with a flat triangle). Dropping it isn't the answer (MeshLab's
+    "remove null faces" does exactly that and leaves the crack); keeping it
+    can't be done (no plane). The classic fix: with C on segment AB and
+    ABD the triangle across AB, the pair (ABC, BAD) becomes (BCD, CAD). Same
+    surface, same triangle count, every edge still shared by two faces,
+    orientation carried over from BAD.
+    """
+    bad = _needles(P, T)
+    if not len(bad):
+        return T, 0
+    T = T.tolist()
+    owner = defaultdict(list)  # directed edge -> triangles
+    for t, (a, b, c) in enumerate(T):
+        for e in ((a, b), (b, c), (c, a)):
+            owner[e].append(t)
+    flipped = 0
+    for t in bad:
+        a, b, c = T[t]
+        # the middle vertex is the one opposite the longest side
+        sides = [((a, b), c), ((b, c), a), ((c, a), b)]
+        (x, y), mid = max(sides, key=lambda s: float(((P[s[0][0]] - P[s[0][1]]) ** 2).sum()))
+        nbr = [u for u in owner.get((y, x), []) if u != t]
+        if len(nbr) != 1:
+            continue
+        u = nbr[0]
+        d = [v for v in T[u] if v not in (x, y)]
+        if len(d) != 1 or d[0] == mid:
+            continue
+        d = d[0]
+        # u traverses y -> x -> d; split it at mid on y->x
+        for e in ((x, y), (y, mid), (mid, x)):
+            owner[e].remove(t)
+        uu = T[u]
+        for e in ((uu[0], uu[1]), (uu[1], uu[2]), (uu[2], uu[0])):
+            owner[e].remove(u)
+        T[t] = [y, mid, d]
+        T[u] = [mid, x, d]
+        for tt in (t, u):
+            p, q, r = T[tt]
+            for e in ((p, q), (q, r), (r, p)):
+                owner[e].append(tt)
+        flipped += 1
+    return np.array(T, dtype=np.int64).reshape(-1, 3), flipped
+
+
+def mesh_census(P, T) -> Dict[str, object]:
+    """
+    The mesh's health from the arrays alone (numpy + scipy, no other
+    dependency). Pieces are counted through shared EDGES; the signed volume
+    of each tells a body (positive) from a cavity or an inside-out piece
+    (negative).
+    """
+    out: Dict[str, object] = {"triangles": int(len(T)), "vertices": int(len(P))}
+    rep = (T[:, 0] == T[:, 1]) | (T[:, 1] == T[:, 2]) | (T[:, 0] == T[:, 2])
+    out["repeated_vertex"] = int(rep.sum())
+    out["zero_area"] = int(len(_needles(P, T)))
+    _, cnt = np.unique(np.sort(T, axis=1), axis=0, return_counts=True)
+    out["duplicate"] = int((cnt - 1).sum())
+    nT = len(T)
+    E = np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    owner = np.tile(np.arange(nT), 3)
+    ok = E[:, 0] != E[:, 1]
+    E, owner = E[ok], owner[ok]
+    _, inv, val = np.unique(np.sort(E, axis=1), axis=0, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    out["boundary_edges"] = int((val == 1).sum())
+    out["nonmanifold_edges"] = int((val > 2).sum())
+    # winding: on a manifold edge the two faces run it opposite ways
+    _, d_cnt = np.unique(E, axis=0, return_counts=True)
+    out["same_direction_edges"] = int((d_cnt > 1).sum())
+    try:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+
+        order = np.argsort(inv, kind="stable")
+        a, b = owner[order[:-1]], owner[order[1:]]
+        same = inv[order[:-1]] == inv[order[1:]]
+        g = coo_matrix((np.ones(int(same.sum())), (a[same], b[same])), shape=(nT, nT))
+        k, lab = connected_components(g, directed=False)
+        A_, B_, C_ = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+        vol = np.einsum("ij,ij->i", A_, np.cross(B_, C_)) / 6.0
+        vols = np.bincount(lab, weights=vol, minlength=k)
+        out["components"] = int(k)
+        out["component_volumes"] = sorted((float(v) for v in vols), key=lambda v: -abs(v))
+    except Exception:
+        pass
+    return out
+
+
+def _meshlab_measures(ms) -> Dict[str, int]:
+    """What MeshLab itself says of the mesh (topology + self-intersections)."""
+    tm = ms.get_topological_measures()
+    out = {
+        "boundary_edges": int(tm["boundary_edges"]),
+        "holes": int(tm["number_holes"]) if tm["boundary_edges"] else 0,
+        "nonmanifold_edges": int(tm["non_two_manifold_edges"]),
+        "nonmanifold_vertices": int(tm["non_two_manifold_vertices"]),
+    }
+    try:
+        ms.compute_selection_by_self_intersections_per_face()
+        out["self_intersecting_faces"] = int(ms.current_mesh().selected_face_number())
+        ms.set_selection_none()
+    except Exception:
+        pass
+    return out
+
+
+def mesh_precheck(P, T, name: str = "mesh"):
+    """
+    ⚠️ CHECK THE MESH BEFORE TRUSTING IT. Everything after this assumes a
+    closed, 2-manifold, consistently oriented triangle mesh, and OCC's
+    mesh-to-shape step doesn't complain when it isn't: it drops what it
+    can't build (a zero-area triangle -> a crack), sews what it finds (four
+    triangles on one edge -> an invalid solid: test11, sixty touching
+    bodies) and goes on. Here the defects are counted and reported, and the
+    ones that would break the conversion are repaired - each by the filter
+    for THAT defect (MeshLab, through pymeshlab if installed), never by a
+    global remesh: the vertices of a CAD export are exact and must stay so.
+      - zero-area triangles with a vertex on their side: flipped (ours);
+      - duplicate triangles: removed;
+      - non-manifold edges and vertices: vertices SPLIT, nothing moves
+        (touching bodies come apart instead of losing faces);
+      - inconsistent winding: re-oriented coherently;
+      - holes: closed only up to MESH_CLOSE_HOLES boundary edges (a crack,
+        a missing triangle); bigger ones stay open - no geometry invented;
+      - self-intersections: only reported (fixing them moves the surface).
+    Returns (P, T, report dict).
+    """
+    T, nflip = _flip_needles(P, T)
+    c0 = mesh_census(P, T)
+    ms = None
+    try:
+        import pymeshlab
+
+        ms = pymeshlab.MeshSet()
+        ms.add_mesh(pymeshlab.Mesh(vertex_matrix=np.ascontiguousarray(P, dtype=np.float64), face_matrix=np.ascontiguousarray(T, dtype=np.int32)))
+        c0.update(_meshlab_measures(ms))
+    except ImportError:
+        ms = None
+    except Exception as ex:
+        Log.debug(f"pymeshlab check failed: {type(ex).__name__}: {ex}")
+        ms = None
+    vols = c0.get("component_volumes", [])
+    n_pos = sum(1 for v in vols if v > 0)
+    issues = []
+    if nflip:
+        issues.append(f"{nflip} zero-area triangle(s) flipped with their neighbor")
+    labels = (
+        ("repeated_vertex", "triangles with a repeated vertex"),
+        ("zero_area", "zero-area triangles left"),
+        ("duplicate", "duplicate triangles"),
+        ("boundary_edges", "boundary edges (holes)"),
+        ("nonmanifold_edges", "non-manifold edges"),
+        ("nonmanifold_vertices", "non-manifold vertices"),
+        ("same_direction_edges", "edges with inconsistent winding"),
+        ("self_intersecting_faces", "self-intersecting triangles"),
+    )
+    for k, lab in labels:
+        if c0.get(k):
+            issues.append(f"{c0[k]:,} {lab}")
+    comp = c0.get("components", 1)
+    if comp > 1:
+        kind = "internal cavities" if n_pos == 1 else "separate bodies"
+        issues.append(f"{comp} pieces ({n_pos} of positive volume, {comp - n_pos} negative: {kind})")
+    if vols and vols[0] < 0:
+        issues.append("the largest piece is inside out")
+    if not issues:
+        Log.ok(f"Mesh check: {name} is closed, 2-manifold and consistently oriented")
+        return P, T, c0
+    Log.info("Mesh check: " + "; ".join(issues))
+    need = any(c0.get(k) for k in ("repeated_vertex", "duplicate", "nonmanifold_edges", "nonmanifold_vertices", "same_direction_edges")) or bool(
+        c0.get("boundary_edges") and MESH_CLOSE_HOLES > 0
+    )
+    if not need:
+        return P, T, c0
+    if not MESH_REPAIR:
+        Log.warn("Mesh repair disabled (--no-mesh-repair): the defects above stay in")
+        return P, T, c0
+    if ms is None:
+        Log.warn("Mesh repair needs pymeshlab (pip install pymeshlab): the defects above stay in")
+        return P, T, c0
+    done = []
+    try:
+        if c0.get("repeated_vertex") or c0.get("duplicate"):
+            ms.meshing_remove_duplicate_faces()
+            done.append("duplicates removed")
+        if c0.get("nonmanifold_edges"):
+            ms.meshing_repair_non_manifold_edges(method="Split Vertices")
+            done.append("non-manifold edges split")
+        if c0.get("same_direction_edges"):
+            ms.meshing_re_orient_faces_coherently()
+            done.append("re-oriented")
+        # ⚠️ HOLES BEFORE VERTICES. Two holes sharing a corner make that
+        # vertex non-manifold; splitting it first leaves two coincident
+        # vertices where the closed mesh has one (a pinch the solid carries
+        # forever). Closing the holes usually cures the vertex by itself:
+        # only what is still non-manifold afterwards gets split.
+        if c0.get("boundary_edges") and MESH_CLOSE_HOLES > 0:
+            nf0 = ms.current_mesh().face_number()
+            ms.meshing_close_holes(maxholesize=int(MESH_CLOSE_HOLES), selfintersection=False, newfaceselected=False)
+            added = ms.current_mesh().face_number() - nf0
+            if added:
+                done.append(f"{added} triangles closing holes up to {MESH_CLOSE_HOLES} edges")
+        if ms.get_topological_measures()["non_two_manifold_vertices"]:
+            ms.meshing_repair_non_manifold_vertices(vertdispratio=0.0)
+            done.append("non-manifold vertices split")
+        ms.meshing_remove_unreferenced_vertices()
+        m = ms.current_mesh()
+        P2 = np.array(m.vertex_matrix(), dtype=float)
+        T2 = np.array(m.face_matrix(), dtype=np.int64)
+    except Exception as ex:
+        Log.warn(f"Mesh repair failed ({type(ex).__name__}: {ex}): the mesh is used as it was")
+        return P, T, c0
+    c1 = mesh_census(P2, T2)
+    try:
+        ms2 = pymeshlab.MeshSet()
+        ms2.add_mesh(pymeshlab.Mesh(vertex_matrix=np.ascontiguousarray(P2), face_matrix=np.ascontiguousarray(T2, dtype=np.int32)))
+        c1.update(_meshlab_measures(ms2))
+    except Exception:
+        pass
+    left = [f"{c1[k]:,} {lab}" for k, lab in labels[3:7] if c1.get(k)]
+    Log.ok("Mesh repaired (pymeshlab): " + ", ".join(done) + (" · still: " + ", ".join(left) if left else " · now closed and 2-manifold"))
+    c1["repaired"] = done
+    return P2, T2, c1
+
+
 def read_stl(path: str):
     """Binary or ASCII STL -> solid of triangular faces with SHARED edges."""
     t0 = time.perf_counter()
@@ -1090,6 +1471,10 @@ def read_stl(path: str):
     if tri is None or tri.NbTriangles() == 0:
         Log.error(f"Empty or unreadable STL: {path}")
         sys.exit(3)
+    P, T = _tri_arrays(tri)
+    P2, T2, _ = mesh_precheck(P, T, os.path.basename(path))
+    if P2 is not P or T2.shape != T.shape or not np.array_equal(T2, T):
+        tri = _tri_from_arrays(P2, T2)
     mk = _BRepBuilderAPI.BRepBuilderAPI_MakeShapeOnMesh(tri)
     mk.Build()
     sh = mk.Shape()
@@ -1128,12 +1513,44 @@ def read_input(path: str):
     return read_step(path)
 
 
-def write_step(shape, path: str, schema: str = "AP214IS") -> None:
+def _name_step_model(w, path: str, src: Optional[str]) -> None:
+    """
+    File header and product name: without this every output is called
+    'Open CASCADE STEP translator 8.0 1' in the CAD's feature tree, with no
+    trace of where it came from. The product and the solid take the input's
+    name, the header says what wrote the file and from which mesh.
+    """
+    try:
+        HS = _m("TCollection").TCollection_HAsciiString
+        name = os.path.splitext(os.path.basename(src or path))[0]
+        model = w.Model()
+        Product = _m("StepBasic").StepBasic_Product
+        Brep = _m("StepShape").StepShape_ManifoldSolidBrep
+        for i in range(1, model.NbEntities() + 1):
+            e = model.Value(i)
+            if isinstance(e, Product):
+                e.SetName(HS(name))
+                e.SetId(HS(name))
+            elif isinstance(e, Brep):
+                e.SetName(HS(name))
+        h = _m("APIHeaderSection").APIHeaderSection_MakeHeader(model)
+        h.SetName(HS(os.path.basename(path)))
+        h.SetAuthorValue(1, HS(""))
+        h.SetOrganizationValue(1, HS(""))
+        h.SetOriginatingSystem(HS("refit.py - mesh to analytic B-Rep"))
+        if src:
+            h.SetDescriptionValue(1, HS(f"rebuilt from {os.path.basename(src)}"))
+    except Exception as ex:  # cosmetic: never worth a failed write
+        Log.debug(f"STEP header: {ex}")
+
+
+def write_step(shape, path: str, schema: str = "AP214IS", src: Optional[str] = None) -> None:
     _iface_set("write.step.schema", schema)
     _iface_set("write.step.unit", "MM")
     _iface_set("write.precision.mode", "0")
     w = STEPControl_Writer()
     w.Transfer(shape, STEPControl_AsIs)
+    _name_step_model(w, path, src)
     if w.Write(path) != IFSelect_RetDone:
         Log.error(f"STEP write failed: {path}")
         return
@@ -1284,6 +1701,21 @@ def planar_clusters(V, fv, nrm, areas, e_faces, lin_tol: float, ang_max_deg: flo
         ang = np.degrees(np.arccos(np.clip(cosd, -1.0, 1.0)))
         sin_a = np.sqrt(np.maximum(0.0, 1.0 - cosd**2))
         dev_loc = sin_a * np.maximum(Lmax[pa[:, 0]], Lmax[pa[:, 1]])
+        # ⚠️ sin(angle) x extent IS A BOUND, NOT THE DEVIATION. Two triangles
+        # of 60 mm2 sharing a side (test12: 24.5 mm long, coplanar within
+        # 4e-5 mm) have float32 normals 0.0016 degrees apart: the bound says
+        # 6.8e-4, over the 6.2e-4 limit, and one CAD face stayed two. What
+        # the angle really moves is each face's vertices off the OTHER's
+        # plane: that's measured, for the pairs the bound rejects. (The
+        # 38 mm strip tilted 0.03 degrees still fails: its far vertex is
+        # two hundredths off.)
+        for k in np.nonzero(dev_loc > 2.0 * lin_tol)[0]:
+            a0, b0 = pa[k]
+            if not fv[a0] or not fv[b0]:
+                continue
+            d_ab = float(np.abs((V[fv[b0]] - cent[a0]) @ N[a0]).max())
+            d_ba = float(np.abs((V[fv[a0]] - cent[b0]) @ N[b0]).max())
+            dev_loc[k] = min(dev_loc[k], max(d_ab, d_ba))
         # pairs admitted ONLY because one of the two faces is a sliver:
         # they must be checked against the least-squares plane, not the mean.
         slim = dev_loc > 2.0 * lin_tol
@@ -1410,7 +1842,7 @@ def refit_face_planes(shape, lin_tol: float) -> int:
     return n
 
 
-def removable_vertices(shape, lin_tol: float):
+def removable_vertices(shape, lin_tol: float, planar_only: bool = False):
     """
     Vertices that sit on a STRAIGHT edge between just two faces and are
     aligned (within lin_tol) with the chain: the ones UnifySameDomain can
@@ -1425,7 +1857,18 @@ def removable_vertices(shape, lin_tol: float):
     nE, nV = _size(ef), _size(ve)
     edges = [td_Edge(ef.FindKey(k)) for k in range(1, nE + 1)]
     fkey = [tuple(sorted(fs)) for fs in e_faces]
-    is_line = [BRepAdaptor_Curve(e).GetType() == GeomAbs_Line for e in edges]
+    # ⚠️ planar_only: ONLY BETWEEN TWO PLANES. On the final pass the part
+    # also has cylinders and spheres whose boundary is still the mesh's
+    # polyline: merging those collinear segments rebuilds the curved face's
+    # wire, and on test12 UnifySameDomain got its orientation wrong
+    # ("UnorientableShape" on 24 cylinders and spheres) - and the whole
+    # merge was thrown away. Only asked for when that happened: elsewhere
+    # merging them is harmless and saves edges.
+    if planar_only:
+        fplanar = [BRepAdaptor_Surface(td_Face(fmap.FindKey(i + 1)), True).GetType() == GeomAbs_Plane for i in range(_size(fmap))]
+        is_line = [BRepAdaptor_Curve(e).GetType() == GeomAbs_Line and all(fplanar[i] for i in e_faces[k]) for k, e in enumerate(edges)]
+    else:
+        is_line = [BRepAdaptor_Curve(e).GetType() == GeomAbs_Line for e in edges]
     vp = np.array([vpos(ve.FindKey(j)) for j in range(1, nV + 1)]).reshape(-1, 3)
     e_verts = [(ve.FindIndex(te_FirstVertex(e)) - 1, ve.FindIndex(te_LastVertex(e)) - 1) for e in edges]
     v_edges = [set() for _ in range(nV)]
@@ -1581,6 +2024,77 @@ def recompute_tolerances(shape) -> float:
     return worst
 
 
+def collapse_lenses(shape, area_tol: float = 1e-9):
+    """
+    ⚠️ ZERO-AREA "LENS" FACES. A fan of collinear triangles (a T-junction
+    the exporter closed with needles: test12, eleven at one spot) merges
+    into a planar face of ZERO area bounded by two coincident edges between
+    the same two vertices. It's valid only while its tolerance covers the
+    two edges lying on each other: the tolerance recomputation lowers it,
+    BRepCheck calls the face self-intersecting and the whole Phase A merge
+    was thrown away for it. It isn't a face at all: it goes, and the face
+    on the far side of one of its edges takes the other one - the two faces
+    that the lens kept apart become neighbors, nothing moves. (The merge
+    is validated as a whole afterwards, as always.)
+    Returns (shape, lenses removed).
+    """
+    emap, fmap, e_faces = face_edges_map(shape)
+    f_edges = defaultdict(list)
+    for k, fs in enumerate(e_faces):
+        for i in fs:
+            f_edges[i].append(k)
+    rs = BRepTools_ReShape()
+    used = set()
+    n = 0
+    for i, ks in f_edges.items():
+        if len(ks) != 2:
+            continue
+        f = td_Face(fmap.FindKey(i + 1))
+        if face_area(f) > area_tol:
+            continue
+        k1, k2 = ks
+        e1, e2 = td_Edge(emap.FindKey(k1 + 1)), td_Edge(emap.FindKey(k2 + 1))
+        if e1.IsSame(e2) or any(k in used for k in ks):
+            continue
+        # ⚠️ the face across e2 gets e1 IN PLACE OF e2, and e1 has no pcurve
+        # on it: fine on a plane (computed on the fly), fatal on a torus
+        # (test12: a 0.12 mm2 torus fillet came out with zero area and
+        # "face:Invalid"). The receiving face must be a plane: roles are
+        # swapped if needed, and a lens between two curved faces stays.
+        def _planar_across(k):
+            others = [j for j in e_faces[k] if j != i]
+            return bool(others) and all(BRepAdaptor_Surface(td_Face(fmap.FindKey(j + 1)), True).GetType() == GeomAbs_Plane for j in others)
+        if not _planar_across(k2):
+            if not _planar_across(k1):
+                continue
+            e1, e2 = e2, e1
+        a1, b1 = te_FirstVertex(e1), te_LastVertex(e1)
+        a2, b2 = te_FirstVertex(e2), te_LastVertex(e2)
+        if a1.IsSame(b1):
+            continue
+        if a1.IsSame(a2) and b1.IsSame(b2):
+            rep = e1
+        elif a1.IsSame(b2) and b1.IsSame(a2):
+            rep = td_Edge(e1.Reversed())
+        else:
+            continue
+        rs.Remove(td_Face(f.Oriented(TopAbs_FORWARD)))
+        rs.Replace(td_Edge(e2.Oriented(TopAbs_FORWARD)), rep)
+        used.update(ks)
+        n += 1
+    if not n:
+        return shape, 0
+    try:
+        out = rs.Apply(shape)
+    except Exception as ex:
+        Log.debug(f"lens collapse failed: {ex}")
+        return shape, 0
+    if count_free_edges(out) > count_free_edges(shape):
+        Log.debug("lens collapse opened the shell: skipped")
+        return shape, 0
+    return out, n
+
+
 def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, validate: bool = False, title: str = "PHASE A — merging coplanar faces", use_barrier: bool = True):
     Log.banner(title)
     before = shape_stats(shape)
@@ -1591,7 +2105,7 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
     t0 = time.perf_counter()
     stato: Dict[str, object] = {}
 
-    def _attempt(block_pts):
+    def _attempt(block_pts, planar_only=False):
         """
         ⚠️ WORKING ON A COPY. refit_face_planes, ShapeFix and
         recompute_tolerances modify planes, edges and vertices IN PLACE,
@@ -1610,8 +2124,20 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
         cen = np.array([V[idx].mean(axis=0) if len(idx) else np.zeros(3) for idx in fv])
         bloccati = set()
         if block_pts is not None and len(block_pts) and len(cen):
-            for q in block_pts:
+            # ⚠️ NOT JUST THE NEAREST CENTROID: the centroid of a large
+            # non-convex merged face (183 mm2, 52 edges on test12) falls
+            # near some OTHER group, which got blocked instead, and the bad
+            # face came back at every retry. Every group with facets on the
+            # bad face's plane and inside its box is left alone.
+            for W in block_pts:
+                W = np.atleast_2d(W)
+                q = W.mean(axis=0)
                 bloccati.add(int(lab[int(np.argmin(np.linalg.norm(cen - q, axis=1)))]))
+                if len(W) >= 3:
+                    lo, hi = W.min(axis=0) - 2 * lt, W.max(axis=0) + 2 * lt
+                    _, _, Vt = np.linalg.svd(W - q, full_matrices=False)
+                    inside = np.all((cen >= lo) & (cen <= hi), axis=1) & (np.abs((cen - q) @ Vt[-1]) <= 2 * lt)
+                    bloccati.update(int(x) for x in np.unique(lab[inside]))
         keep = []
         for k, fs in enumerate(e_faces):
             if len(fs) != 2 or lab[fs[0]] != lab[fs[1]] or int(lab[fs[0]]) in bloccati:
@@ -1625,14 +2151,37 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
             )
         m = _unify(work, False, True, lt, 6.0, keep=keep)
         nfix = refit_face_planes(m, lt)
-        keep_v, nrem = removable_vertices(m, lt)
+        keep_v, nrem = removable_vertices(m, lt, planar_only)
+        if bloccati:
+            # ⚠️ a blocked group isn't merged, but its collinear vertices
+            # were: the edge merge rebuilt its wire and that was enough to
+            # leave it "UnorientableShape" (a 183 mm2 plane of test12, at
+            # every retry). Its vertices stay where they are.
+            from scipy.spatial import cKDTree
+
+            bv = [j for i in range(len(fv)) if int(lab[i]) in bloccati for j in fv[i]]
+            if bv:
+                tree = cKDTree(V[sorted(set(bv))])
+                vm = TopTools_IndexedMapOfShape()
+                te_MapShapes(m, TopAbs_VERTEX, vm)
+                have = {vm.FindIndex(v) for v in keep_v}
+                for q in range(1, _size(vm) + 1):
+                    if q not in have and tree.query(vpos(vm.FindKey(q)))[0] < 1e-9:
+                        keep_v.append(vm.FindKey(q))
         if block_pts is None:
             Log.info(f"Re-fitted planes {nfix:,} · removable collinear vertices {nrem:,}")
         m = _unify(m, True, False, lt, 30.0, keep=keep_v)
+        m, nlens = collapse_lenses(m)
+        if nlens and block_pts is None:
+            Log.info(f"Zero-area faces with two coincident edges removed: {nlens}")
         # ⚠️ UnifySameDomain leaves merged faces with the wire marked
         # "UnorientableShape". ShapeFix_Shape fixes it in place.
         try:
-            sf = ShapeFix_Shape(m)
+            # ⚠️ ON A COPY: ShapeFix sets tolerances, pcurves and SameParameter
+            # IN PLACE on the shared sub-shapes. "Discarding" its result when
+            # it opens the shell kept those changes anyway: on test12 the
+            # merge came back with 404 invalid faces instead of 7.
+            sf = ShapeFix_Shape(copy_shape(m))
             sf.SetPrecision(1e-7)
             sf.SetMaxTolerance(max(lt, 1e-6))
             sf.Perform()
@@ -1645,7 +2194,34 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
                 if count_free_edges(fixed) <= count_free_edges(m):
                     m = fixed
                 else:
-                    Log.debug("ShapeFix was opening the shell: discarded")
+                    # ⚠️ AND WITHOUT IT THE TOLERANCES ARE THE OLD ONES. The
+                    # merged, re-fitted planes move the edges they share
+                    # with curved faces off by a few microns: 3,300 faces of
+                    # test12 were "invalid" only for that (edge further from
+                    # the plane than its tolerance). Recomputed here, BEFORE
+                    # the validity check, they were 45.
+                    Log.debug("ShapeFix was opening the shell: discarded, tolerances recomputed instead")
+                    recompute_tolerances(m)
+                    # ⚠️ ...AND THE ONE PART OF SHAPEFIX THAT WAS NEEDED. Its
+                    # in-place side effects used to be what made the merge
+                    # valid (test5): an edge made SameParameter again, with
+                    # the tolerance of its REAL deviation from the re-fitted
+                    # plane (a 20 mm circle at 2.7e-6, off by more: five
+                    # samples in recompute_tolerances don't see it). Done
+                    # here only on the edges of the faces still invalid, and
+                    # without touching the topology.
+                    nsp = 0
+                    for f in explore(m, TopAbs_FACE):
+                        f = td_Face(f)
+                        if check_detail(f):
+                            for e in explore(f, TopAbs_EDGE):
+                                try:
+                                    _ShapeFix.ShapeFix_Edge().FixSameParameter(td_Edge(e), f)
+                                    nsp += 1
+                                except Exception:
+                                    pass
+                    if nsp:
+                        Log.debug(f"SameParameter redone on {nsp} edges of invalid faces")
         except Exception as e:
             Log.debug(f"ShapeFix after Unify skipped: {e}")
         stato["lt"] = lt
@@ -1661,19 +2237,26 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
     # faces came from, and only give up if that isn't enough.
     if base_ok and not is_valid(merged):
         guasti = []
-        for _ in range(1):
+        planar_only = False
+        for _ in range(3):
             nuovi = []
+            curved = 0
             for f in explore(merged, TopAbs_FACE):
                 f = td_Face(f)
-                if check_detail(f):
+                det = check_detail(f)
+                if det:
                     W = face_vertices(f)
                     if len(W):
-                        nuovi.append(W.mean(axis=0))
+                        nuovi.append(W)
+                    curved += BRepAdaptor_Surface(f, True).GetType() != GeomAbs_Plane
+                    if len(nuovi) <= 8:
+                        Log.debug(f"   invalid: {face_surface_type(f)} area {face_area(f):.4g} edges {count_sub(f, TopAbs_EDGE)} at {np.round(W.mean(axis=0), 3) if len(W) else '?'}: {', '.join(det)}")
             if not nuovi:
                 break
             guasti.extend(nuovi)
-            Log.debug(f"Phase A: {len(nuovi)} invalid merged faces, retrying leaving their groups alone ({len(guasti)} total)")
-            merged = _attempt(guasti)
+            planar_only = planar_only or curved > 0
+            Log.debug(f"Phase A: {len(nuovi)} invalid merged faces ({curved} curved), retrying leaving their groups alone ({len(guasti)} total)")
+            merged = _attempt(guasti, planar_only)
             if is_valid(merged):
                 break
         if not is_valid(merged):
@@ -2625,8 +3208,11 @@ LM_MAX_PTS = 900
 LM_MAX_SLOPE = 3.0  # = the fitters' max_slope: atan(3) = 71.6 degrees
 
 
-def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters: int = 80) -> "Prim":
-    """Minimizes the orthogonal points-to-surface distance. Returns a new Prim."""
+def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters: int = 80, fix_r: Optional[float] = None, stall: bool = False) -> "Prim":
+    """Minimizes the orthogonal points-to-surface distance. Returns a new Prim.
+    fix_r: cylinder or sphere with the radius held at that value (only the
+    position and the axis move).
+    stall: give up on a fit that crawls (exploratory fits on a seed only)."""
     if prim is None or len(P) < 4:
         return prim
     if prim.kind == PLANE:
@@ -2643,10 +3229,14 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
 
     if prim.kind == SPHERE:
         c0 = prim.center.astype(float).copy()
-        x = np.array([0.0, 0.0, 0.0, float(prim.r0)])
+        x = np.array([0.0, 0.0, 0.0, float(prim.r0)]) if fix_r is None else np.zeros(3)
 
         def build(v):
-            return Prim(SPHERE, c0 + v[:3], None, float(v[3]))
+            return Prim(SPHERE, c0 + v[:3], None, float(v[3]) if fix_r is None else float(fix_r))
+
+        def batch(X):
+            R_ = X[:, 3:4] if fix_r is None else float(fix_r)
+            return np.linalg.norm(P[None, :, :] - (c0[None, :] + X[:, :3])[:, None, :], axis=2) - R_
 
     elif prim.kind == TORUS:
         a0 = prim.axis / np.linalg.norm(prim.axis)
@@ -2660,59 +3250,127 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
             c = c0 + v[2] * u0 + v[3] * v0 + v[4] * a0
             return Prim(TORUS, c, a, float(v[5]), 0.0, float(v[6]))
 
+        def batch(X):
+            A = a0[None, :] + X[:, 0:1] * u0[None, :] + X[:, 1:2] * v0[None, :]
+            A = A / np.linalg.norm(A, axis=1)[:, None]
+            C = c0[None, :] + X[:, 2:3] * u0[None, :] + X[:, 3:4] * v0[None, :] + X[:, 4:5] * a0[None, :]
+            D = P[None, :, :] - C[:, None, :]
+            T = np.einsum("knj,kj->kn", D, A)
+            rho = np.linalg.norm(D - T[:, :, None] * A[:, None, :], axis=2)
+            return np.hypot(rho - X[:, 5:6], T) - X[:, 6:7]
+
     else:
         a0 = prim.axis / np.linalg.norm(prim.axis)
         u0, v0 = ortho_frame(a0)
         c0 = prim.center.astype(float).copy()
-        is_cyl = abs(prim.slope) < 1e-9
-        x = np.array([0.0, 0.0, 0.0, 0.0, float(prim.r0)]) if is_cyl else np.array([0.0, 0.0, 0.0, 0.0, float(prim.r0), float(prim.slope)])
+        is_cyl = abs(prim.slope) < 1e-9 or fix_r is not None
+        # ⚠️ THE REFERENCE POINT GOES WHERE THE POINTS ARE. With the cone's
+        # origin far along the axis from the data, a tilt of the axis moves
+        # the band by (distance x angle) and the radius has to chase it: the
+        # parameters are strongly coupled and LM crawled for the full 80
+        # iterations on more than a third of the fits (a 107k-triangle part). Same
+        # surface, origin at the data's mean height: well conditioned.
+        tm = float(np.mean((P - c0) @ a0))
+        c0 = c0 + tm * a0
+        r_ref = float(prim.r0) + (0.0 if is_cyl else float(prim.slope) * tm)
+        if fix_r is not None:
+            x = np.zeros(4)
+        else:
+            x = np.array([0.0, 0.0, 0.0, 0.0, r_ref]) if is_cyl else np.array([0.0, 0.0, 0.0, 0.0, r_ref, float(prim.slope)])
 
         def build(v):
             a = a0 + v[0] * u0 + v[1] * v0
             a = a / np.linalg.norm(a)
             c = c0 + v[2] * u0 + v[3] * v0
+            if fix_r is not None:
+                return Prim(AXIAL, c, a, float(fix_r), 0.0)
             return Prim(AXIAL, c, a, float(v[4]), 0.0 if is_cyl else float(v[5]))
 
+        def batch(X):
+            A = a0[None, :] + X[:, 0:1] * u0[None, :] + X[:, 1:2] * v0[None, :]
+            A = A / np.linalg.norm(A, axis=1)[:, None]
+            C = c0[None, :] + X[:, 2:3] * u0[None, :] + X[:, 3:4] * v0[None, :]
+            D = P[None, :, :] - C[:, None, :]
+            T = np.einsum("knj,kj->kn", D, A)
+            rho = np.linalg.norm(D - T[:, :, None] * A[:, None, :], axis=2)
+            if fix_r is not None:
+                return rho - float(fix_r)
+            if is_cyl:
+                return rho - X[:, 4:5]
+            S_ = X[:, 5:6]
+            return (rho - (X[:, 4:5] + S_ * T)) / np.sqrt(1.0 + S_ * S_)
+
+    # ⚠️ ALL THE PERTURBATIONS IN ONE PASS. The Jacobian is numeric: m+1
+    # residual evaluations per step, and building a Prim for each one cost
+    # more than the arithmetic (on a 107k-triangle part, 8.6 million dist() calls were 70%
+    # of phase B). Here the m perturbed parameter vectors go through numpy
+    # together.
+    def resid_batch(X):
+        with np.errstate(all="ignore"):
+            R_ = w[None, :] * batch(np.atleast_2d(X))
+        return np.where(np.isfinite(R_), R_, 1e12)
+
     def resid(v):
-        try:
-            return w * build(v).dist(P)
-        except Exception:
-            return np.full(len(P), 1e12)
+        return resid_batch(v[None, :])[0]
 
     r = resid(x)
     cost = float(r @ r)
     lam = 1e-3
     m = len(x)
     converged = False
-    for _ in range(iters):
+    hist = []
+    for it_ in range(iters):
         if converged:
             break
-        J = np.empty((len(P), m))
-        for k in range(m):
-            h = 1e-7 * max(1.0, abs(x[k]))
-            xp = x.copy()
-            xp[k] += h
-            J[:, k] = (resid(xp) - r) / h
+        # ⚠️ A FIT THAT CRAWLS IS A FIT ON THE WRONG DATA: a 25 mm cone on
+        # a 0.05 mm patch of tiny facets drifts for the full 80 iterations,
+        # the cost halving every 10 or 20 - 37% of all the fits on a 107k-triangle part,
+        # most of the segmentation time. A real surface converges in under
+        # twenty... but not always: a wall whose rail vertices are off by
+        # the CAD's own approximation takes longer, and stopping those -
+        # even only the seeds' exploratory fits - changes what the seeds grow
+        # into (test4's R3 corner split in two, 52 -> 61 faces). So only
+        # Phase B's seed fits give up (past twenty iterations, less than a
+        # halving over ten): Phase B keeps nothing but closed holes, whose
+        # fits converge at once, and Phase C redoes the segmentation anyway.
+        hist.append(cost)
+        if stall and it_ >= 20 and cost > 0.5 * hist[-11]:
+            break
+        h = 1e-7 * np.maximum(1.0, np.abs(x))
+        J = ((resid_batch(x[None, :] + np.diag(h)) - r[None, :]) / h[:, None]).T
         A = J.T @ J
         g = J.T @ r
+        dA = np.diag(np.maximum(np.diag(A), 1e-12))
+        xs = 1e-13 * (1.0 + float(np.linalg.norm(x)))
         for _try in range(30):
             try:
-                dx = np.linalg.solve(A + lam * np.diag(np.maximum(np.diag(A), 1e-12)), -g)
+                dx = np.linalg.solve(A + lam * dA, -g)
             except np.linalg.LinAlgError:
                 lam *= 10.0
                 continue
+            # ⚠️ at the minimum every step fails, and lambda used to climb
+            # from 1e-12 to 1e10 - 22 more solves and residuals per fit -
+            # before giving up. A step already below the rounding of the
+            # parameters can't improve anything: that IS convergence.
+            if float(np.linalg.norm(dx)) < xs:
+                converged = True
+                break
             xn = x + dx
             rn = resid(xn)
             cn = float(rn @ rn)
             if cn < cost:
-                converged = (cost - cn) < 1e-9 * max(cost, 1e-300)
+                # ⚠️ 1e-9 relative kept LM going ~40 iterations per fit on
+                # exact data (the cost shrinks linearly under a numeric
+                # Jacobian): 1e-7 relative, or residuals at a picometer,
+                # is already far below any tolerance downstream
+                converged = (cost - cn) < 1e-7 * max(cost, 1e-300) or cn < 1e-24 * len(P)
                 x, r, cost = xn, rn, cn
                 lam = max(lam * 0.3, 1e-12)
                 break
             lam *= 10.0
             if lam > 1e10:
                 break
-        if lam > 1e10:
+        if lam > 1e10 or converged:
             break
         if np.linalg.norm(dx) < 1e-14 * (1.0 + np.linalg.norm(x)):
             break
@@ -2767,12 +3425,12 @@ def _refit(region, verts, norms, areas, kind) -> Optional[Prim]:
 # --- 5.7  full segmentation ----------------------------------------------------
 
 
-def refit_exact(faces_idx, verts, norms, areas, kind) -> Optional["Prim"]:
+def refit_exact(faces_idx, verts, norms, areas, kind, stall: bool = False) -> Optional["Prim"]:
     """_refit() followed by the LM refinement."""
     p = _refit(set(faces_idx), verts, norms, areas, kind)
     P = np.vstack([verts[i] for i in faces_idx])
     Wt = np.concatenate([np.full(len(verts[i]), max(areas[i], 1e-12) / max(len(verts[i]), 1)) for i in faces_idx])
-    q = lm_refine(p, P, Wt) if p is not None else None
+    q = lm_refine(p, P, Wt, stall=stall) if p is not None else None
     # ⚠️ second path for cylinders and cones: if the normals-based fit is
     # missing or poor (thin band, normals on a short arc), retry with the
     # revolution axis, which on those bands is the only one that holds up.
@@ -2787,7 +3445,7 @@ def refit_exact(faces_idx, verts, norms, areas, kind) -> Optional["Prim"]:
             Nr = np.vstack([np.tile(norms[i], (len(verts[i]), 1)) for i in faces_idx])
             r = fit_axial_rev(P, Nr, Wt)
             if r is not None:
-                r = lm_refine(r, P, Wt)
+                r = lm_refine(r, P, Wt, stall=stall)
                 if r is not None and float(np.abs(r.dist(P)).max()) < dq:
                     q = r
     if q is None:
@@ -3797,6 +4455,15 @@ def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 
 # =============================================================================
 
 
+# ⚠️ Topo.update (incremental, ~40 times cheaper per conversion on a 77k-face
+# part) is equivalent to the full rebuild UP TO THE NUMBERING: verified face
+# by face and edge by edge on ~600 conversions. The numbering used to matter:
+# on test2 a closed cone (R1.75-2.05) got its wire started on the closed
+# circle and BRepCheck called it self-intersecting (see _build_wires). Fixed
+# there; the suite comes out with the same faces and edges either way.
+INCREMENTAL_TOPO = True
+
+
 class Topo:
     """
     Faces, edges, vertices of the shape with integer indices stable as long
@@ -3875,6 +4542,167 @@ class Topo:
                 for b in range(a + 1, len(fs)):
                     self.adj[fs[a]].add(fs[b])
                     self.adj[fs[b]].add(fs[a])
+
+    # ⚠️ INCREMENTAL UPDATE. The rebuild above walks the WHOLE shape: on a
+    # 108k-triangle part (77k faces after phase A) it's 3.5 s, and phase C
+    # does it after every accepted region - 2,400 of them, over two hours
+    # of pure bookkeeping for replacements that each touch a few dozen
+    # faces. A replacement only removes faces (the region's, the rebuilt
+    # neighbors') and adds their replacements: here only those are touched.
+    # Removal works like the OCC indexed maps' RemoveFromIndex - the LAST
+    # element moves into the freed slot - so fmap/emap/vmap stay aligned
+    # with the lists, and every other index stays put.
+    def update(self, shape, gone: List[int], born: List) -> bool:
+        """
+        In place: `gone` = indices of the faces no longer in the shape
+        (removed or rebuilt), `born` = the faces that took their place, as
+        they sit in the new shape. False if a new face is already there
+        (the replacement wasn't what the caller described): the Topo is
+        then unusable and must be rebuilt. The equivalence with a full
+        rebuild was checked face by face, edge by edge, on ~600 conversions
+        of five parts.
+        """
+        gs = set(gone)
+        cand_e = sorted({k for i in gone for k in self.f_edges[i]})
+        for k in cand_e:
+            self.e_faces[k] = [f for f in self.e_faces[k] if f not in gs]
+        for i in gone:
+            for j in self.adj[i]:
+                if j not in gs:
+                    self.adj[j].discard(i)
+        for i in sorted(gs, reverse=True):
+            self._drop_face(i)
+        # new faces, their new edges, their new vertices
+        new_idx = []
+        for f in born:
+            if self.fmap.FindIndex(f) > 0:
+                return False
+            i = self.fmap.Add(f) - 1
+            self.faces.append(td_Face(f))
+            self.f_edges.append([])
+            self.adj.append(set())
+            self.nF += 1
+            ks = set()
+            ex = TopExp_Explorer(f, TopAbs_EDGE)
+            while ex.More():
+                e = ex.Current()
+                k = self.emap.FindIndex(e) - 1
+                if k < 0:
+                    k = self._add_edge(e)
+                ks.add(k)
+                ex.Next()
+            self.f_edges[i] = sorted(ks)
+            for k in ks:
+                self.e_faces[k] = sorted(self.e_faces[k] + [i])
+            new_idx.append(i)
+        # edges nobody uses any more, then vertices nobody uses any more
+        dead_e = [k for k in cand_e if not self.e_faces[k]]
+        dead_v = set()
+        for k in dead_e:
+            for v in set(self.e_verts[k]):
+                self.v_edges[v] = [x for x in self.v_edges.get(v, []) if x != k]
+                if not self.v_edges[v]:
+                    dead_v.add(v)
+        for k in sorted(dead_e, reverse=True):
+            self._drop_edge(k)
+        for v in sorted(dead_v, reverse=True):
+            self._drop_vertex(v)
+        for i in new_idx:
+            f = self.faces[i]
+            m = TopTools_IndexedMapOfShape()
+            te_MapShapes(f, TopAbs_VERTEX, m)
+            idx = [j for j in (self.vmap.FindIndex(m.FindKey(q)) - 1 for q in range(1, _size(m) + 1)) if j >= 0]
+            V = self.vpos[idx] if idx else np.zeros((0, 3))
+            self.verts[i] = V
+            self.nverts[i] = len(idx)
+            self.cents[i] = V.mean(axis=0) if len(V) else np.zeros(3)
+            self.areas[i] = face_area(f)
+            n = face_plane_normal(f)
+            self.planar[i] = n is not None
+            self.norms[i] = n if n is not None else np.zeros(3)
+            for k in self.f_edges[i]:
+                for j in self.e_faces[k]:
+                    if j != i:
+                        self.adj[i].add(j)
+                        self.adj[j].add(i)
+        self.shape = shape
+        return True
+
+    def _add_edge(self, e) -> int:
+        e = td_Edge(e.Oriented(TopAbs_FORWARD))
+        k = self.emap.Add(e) - 1
+        self.edges.append(e)
+        self.e_faces.append([])
+        self.nE += 1
+        ab = []
+        for v in (te_FirstVertex(e), te_LastVertex(e)):
+            j = self.vmap.FindIndex(v) - 1
+            if j < 0:
+                j = self.vmap.Add(v) - 1
+                self.vpos = np.vstack([self.vpos, vpos(v)[None]])
+                self.nV += 1
+            ab.append(j)
+        a, b = ab
+        self.e_verts.append((a, b))
+        self.v_edges[a].append(k)
+        if b != a:
+            self.v_edges[b].append(k)
+        return k
+
+    def _drop_face(self, i: int) -> None:
+        """Face i, already unreferenced, leaves; the last one takes its index."""
+        last = self.nF - 1
+        if i != last:
+            self.faces[i] = self.faces[last]
+            for d in (self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar):
+                d[i] = d[last]
+            for k in self.f_edges[last]:
+                self.e_faces[k] = sorted(i if x == last else x for x in self.e_faces[k])
+            self.f_edges[i] = self.f_edges[last]
+            for j in self.adj[last]:
+                self.adj[j].discard(last)
+                self.adj[j].add(i)
+            self.adj[i] = self.adj[last]
+        for d in (self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar):
+            d.pop(last, None)
+        self.fmap.RemoveFromIndex(i + 1)
+        self.faces.pop()
+        self.f_edges.pop()
+        self.adj.pop()
+        self.nF -= 1
+
+    def _drop_edge(self, k: int) -> None:
+        """Edge k, already unreferenced, leaves; the last one takes its index."""
+        last = self.nE - 1
+        if k != last:
+            self.edges[k] = self.edges[last]
+            self.e_faces[k] = self.e_faces[last]
+            self.e_verts[k] = self.e_verts[last]
+            for i in self.e_faces[last]:
+                self.f_edges[i] = sorted(k if x == last else x for x in self.f_edges[i])
+            for v in set(self.e_verts[last]):
+                self.v_edges[v] = sorted(k if x == last else x for x in self.v_edges.get(v, []))
+        self.emap.RemoveFromIndex(k + 1)
+        self.edges.pop()
+        self.e_faces.pop()
+        self.e_verts.pop()
+        self.nE -= 1
+
+    def _drop_vertex(self, j: int) -> None:
+        """Vertex j, already unused, leaves; the last one takes its index."""
+        last = self.nV - 1
+        moved = self.v_edges.pop(last, [])
+        self.v_edges.pop(j, None)
+        if j != last:
+            self.vpos[j] = self.vpos[last]
+            for k in moved:
+                a, b = self.e_verts[k]
+                self.e_verts[k] = (j if a == last else a, j if b == last else b)
+            if moved:
+                self.v_edges[j] = moved
+        self.vmap.RemoveFromIndex(j + 1)
+        self.vpos = self.vpos[:-1]
+        self.nV -= 1
 
     def face_index(self, face) -> int:
         return self.fmap.FindIndex(face) - 1
@@ -4045,6 +4873,19 @@ def region_sag(prim: "Prim", topo: Topo, faces: List[int]) -> float:
     return float(np.abs(prim.dist(np.array(pts))).max())
 
 
+def _arc_coverage(prim: "Prim", topo: Topo, faces: List[int]) -> float:
+    """Fraction of the turn around the axis covered by the vertices (as in describe_region)."""
+    if prim.kind not in (AXIAL, TORUS) or prim.axis is None:
+        return 0.0
+    dd = np.vstack([topo.verts[i] for i in faces]) - prim.center
+    u, v = ortho_frame(prim.axis)
+    ang = np.sort(np.unique(np.round(np.arctan2(dd @ v, dd @ u), 6)))
+    if len(ang) < 3:
+        return 0.0
+    gmax = float(np.diff(np.concatenate([ang, [ang[0] + 2 * math.pi]])).max())
+    return min(1.0, (2 * math.pi - gmax) / (2 * math.pi))
+
+
 def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
     P = np.vstack([topo.verts[i] for i in faces])
     d = prim.dist(P)
@@ -4177,6 +5018,7 @@ class Segmenter:
         self.only_cyl = only_cyl
         self.max_radius = 1.5 * diag
         self.taken = [False] * topo.nF
+        self._used = None  # facets a seed's search depended on (see _seed_loop_parallel)
 
     # --- criteria ------------------------------------------------------------------
     def face_tol(self, p, i) -> float:
@@ -4212,6 +5054,24 @@ class Segmenter:
     def within(self, p, i) -> bool:
         V = self.topo.verts[i]
         return bool(V.size) and float(np.abs(p.dist(V)).max()) <= self.face_tol(p, i)
+
+    def _use(self, faces) -> None:
+        """
+        Records facets the current seed's search USED (in a neighborhood or
+        a grown region). ⚠️ taken[] is read only by _ring and grow_region,
+        and both return exactly the free facets they went through: a facet
+        claimed later can change the search only if it is in here.
+        """
+        if self._used is not None:
+            self._used.update(faces)
+
+    def _concave(self, p, faces) -> bool:
+        """Material outside the surface (a hole), as in describe_region."""
+        topo = self.topo
+        C = np.array([topo.cents[i] for i in faces])
+        N = np.array([topo.norms[i] for i in faces])
+        W = np.array([max(topo.areas[i], 1e-12) for i in faces])
+        return float(np.sum(W * np.einsum("ij,ij->i", p.normal_at(C), N))) < 0.0
 
     def _excess(self, p, reg):
         """residual of each facet MEASURED IN ITS OWN threshold (1.0 = at the limit)."""
@@ -4323,6 +5183,17 @@ class Segmenter:
         pl = fit_plane(P)
         if pl is not None and float(np.abs(pl.dist(P)).max()) <= 3.0 * self.tol_fit:
             return []
+        # ⚠️ PHASE B ON A DOUBLY CURVED ZONE: ALL COST, NO CYLINDER. Under a
+        # cylinder the facet normals are all perpendicular to the axis: the
+        # normals matrix has rank 2 (third singular value ~ 0). On a sphere,
+        # a torus, a free-form patch they span all three directions. Phase B
+        # only wants cylinders, and every seed there costs a dozen LM fits
+        # that never converge: a 107k-triangle part (37k faces, mostly spheres and
+        # B-splines) spent 40 minutes in phase B for three holes.
+        if self.only_cyl and len(N) >= 4:
+            sv = np.linalg.svd(N, compute_uv=False)
+            if sv[1] > 1e-3 * sv[0] and sv[2] > 0.25 * sv[1]:
+                return []
         out = []
         raw = rank_primitives(
             P, Nrep, N, W, self.allow_sphere and not self.only_cyl, self.allow_cone and not self.only_cyl, max_ndev=60.0, allow_torus=self.allow_torus and not self.only_cyl
@@ -4362,7 +5233,7 @@ class Segmenter:
                 if set(inl2) == set(inl) and _ > 0:
                     break
                 inl = inl2
-                c2 = refit_exact(inl, topo.verts, topo.norms, topo.areas, c.kind)
+                c2 = refit_exact(inl, topo.verts, topo.norms, topo.areas, c.kind, stall=self.only_cyl)
                 if c2 is None:
                     break
                 if self.only_cyl:
@@ -4417,6 +5288,7 @@ class Segmenter:
                         p = p3
                         reg = trimmed
             reg2, _ = grow_region(reg, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False)
+            self._use(reg2)
             keep = largest_component([i for i in reg2 if self.within(p, i)], topo.adj)
             if len(keep) < self.min_faces:
                 return None, f"too small ({len(keep)} faces within tolerance)"
@@ -4454,11 +5326,13 @@ class Segmenter:
         # threshold - and in the end the candidate with the most support is
         # tried first.
         MIN_SUPPORT = 6
+        self.last_dead = []
         cands = []
         for cs in (self.cos_seed, self.cos_seed_wide):
             last_n = 0
             for rings, cap in ((1, 40), (2, 80), (4, 250)):
                 seed = _ring(s, topo.adj, self.taken, rings, cap=cap, norms=topo.norms, cos_smooth=cs)
+                self._use(seed)
                 seed = [i for i in seed if topo.planar[i] and topo.verts[i].size]
                 if len(seed) < 4 or len(seed) == last_n:
                     if len(seed) == last_n:
@@ -4473,12 +5347,36 @@ class Segmenter:
         if not cands:
             return None, "no candidate on the seed"
         cands.sort(key=lambda t: (-len(t[1]), _rank(t[0])))
+        # ⚠️ PHASE B WANTS HOLES, AND A HOLE IS CONCAVE. A boss, a pin, the
+        # rounding of an outer edge: convex cylinders that phase B throws
+        # away at the end anyway - after paying growth and consolidation
+        # (65 ms each) and, for every facet that stays unclaimed, a new seed.
+        # On a 108k-triangle part phase B spent 1000 s on 2017 regions to
+        # keep 6. Here the convex candidate grows once (cheap, no refit) and
+        # its facets stop being seeds: they're still free for the growth of
+        # a real hole next to them.
+        if self.only_cyl:
+            conc = [(p, inl) for p, inl in cands if self._concave(p, inl)]
+            if not conc:
+                p, inl = cands[0]
+                reg, _ = grow_region(inl, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False)
+                self._use(reg)
+                self.last_dead = list(reg)
+                return None, "convex"
+            cands = conc
         why = ""
         for prim, inl in cands:
             reg, p2 = grow_region(inl, prim, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang)
+            self._use(reg)
             if len(reg) < self.min_faces:
                 why = "insufficient growth"
                 continue
+            # ⚠️ ...AND A HOLE GOES ALL THE WAY ROUND. A concave band that
+            # has grown and still covers less than a quarter turn is the
+            # rounding of an inside corner: phase B has nothing to do with it.
+            if self.only_cyl and p2 is not None and _arc_coverage(p2, topo, reg) < 0.25:
+                self.last_dead = list(reg)
+                return None, "open arc"
             keep, pk = self.settle(reg, p2)
             if keep is None:
                 why = pk
@@ -4499,6 +5397,8 @@ class Segmenter:
             res, why = self.try_seed(s)
             if res is None:
                 tries[s] += 2
+                for i in self.last_dead:
+                    tries[i] = 2
                 continue
             pk, keep = res
             for i in keep:
@@ -4509,20 +5409,27 @@ class Segmenter:
     # --- seed loop, on multiple processes --------------------------------------------
     def _seed_loop_parallel(self, order, tries, pool) -> Tuple[list, int]:
         """
-        Same search, but the seeds are split across the processes: each one
-        runs its own greedy pass on its own slice (marking the facets it
-        takes, so it doesn't pass over the same region twenty times), and
-        then the main process accepts the regions ONE AT A TIME, largest
-        first.
+        The SAME search as _seed_loop, on several processes, with the SAME
+        result.
 
-        ⚠️ Seed growth reads which facets are already taken: in parallel,
-        each process works on a SNAPSHOT of that list, so two processes can
-        claim the same facets. The check is here: a region that touches
-        facets already assigned is thrown away and its seed goes back in
-        the queue for the next round, with the updated list. In the end,
-        the remaining seeds are done sequentially, so the result doesn't
-        depend on the number of processes any more than it depends on seed
-        order.
+        ⚠️ THE RESULT USED TO DEPEND ON -j. Each process ran its own greedy
+        pass on a slice of the seeds, against a snapshot of the claimed
+        facets, and the regions were reconciled afterwards: the growth order
+        changed, and with it the part. test8 came out with 1,150 faces with
+        eight processes and 1,083 with one; test9 1,901 and 1,942. Since the
+        default is 22 processes, the suite (-j 1) wasn't even measuring what
+        the user gets.
+        Now it's speculative execution with an in-order replay. The
+        processes compute a batch of the next seeds, each one as a pure
+        function of the same snapshot, recording which facets the search
+        went through (_use). The main process then replays the batch in the
+        sequential order, exactly as _seed_loop would: a seed already
+        claimed or dead is skipped, and a result is accepted only if none of
+        the facets it used has been claimed since the snapshot - otherwise
+        the replay stops there and the next batch starts from that seed,
+        with the updated snapshot (so the first seed of a batch is always
+        valid, and the loop always moves forward). Same decisions, in the
+        same order: the same regions as -j 1.
         """
         import pickle
         import tempfile
@@ -4535,44 +5442,71 @@ class Segmenter:
             pickle.dump((TopoLite(topo), self._kw), fh, protocol=pickle.HIGHEST_PROTOCOL)
         key = os.path.basename(path)
         pending = [s for s in order if topo.planar[s]]
+        n = max(1, _POOL_N or self.threads)
+        K = 2 * n
+        pos = 0
+        n_batch = n_stop = n_spec = 0
         try:
-            for _round in range(4):
-                pending = [s for s in pending if not self.taken[s] and tries[s] < 2]
-                if len(pending) < 24:
+            while pos < len(pending):
+                batch, j = [], pos
+                while j < len(pending) and len(batch) < K:
+                    s = pending[j]
+                    if not self.taken[s] and tries[s] < 2:
+                        batch.append(s)
+                    j += 1
+                if not batch:
                     break
+                if len(batch) < 4:
+                    # the tail: not worth a round trip
+                    f2, t2 = self._seed_loop(pending[pos:], tries)
+                    return found + f2, tried + t2
                 taken_b = bytes(1 if t else 0 for t in self.taken)
-                # interleaved slices: each process sees seeds scattered
-                # across the whole part, so two processes rarely chase the
-                # same region, and the load stays balanced
-                n = min(_POOL_N or self.threads, max(1, len(pending) // 8))
-                tasks = [(key, path, taken_b, pending[i::n]) for i in range(n)]
+                n_batch += 1
+                n_spec += len(batch)
+                m = min(n, len(batch))
+                tasks = [(key, path, taken_b, batch[q::m]) for q in range(m)]
                 try:
-                    res = []
+                    res = {}
                     for part in pool.map(_worker_seeds, tasks):
-                        res.extend(part)
+                        for r in part:
+                            res[r[0]] = r
                 except Exception as ex:
                     Log.warn(f"worker processes unavailable ({type(ex).__name__}: {ex}): continuing on a single core")
-                    break
-                # larger regions first: in case of overlap, the one the
-                # sequential loop would have found first wins
-                res.sort(key=lambda t: (t[1] is None, -sum(topo.areas[i] for i in t[2]) if t[1] is not None else 0.0))
-                for s, prim, keep in res:
+                    f2, t2 = self._seed_loop(pending[pos:], tries)
+                    return found + f2, tried + t2
+                newly: set = set()
+                stop = None
+                for s in batch:
+                    if self.taken[s] or tries[s] >= 2:
+                        continue  # the sequential loop would skip it too
+                    _, prim, keep, dead, used = res[s]
+                    if newly and not newly.isdisjoint(used):
+                        stop = s  # computed on a state that no longer exists
+                        break
                     tried += 1
                     if prim is None:
                         tries[s] += 2
+                        for i in dead:
+                            tries[i] = 2
                         continue
-                    if any(self.taken[i] for i in keep):
-                        continue  # conflict: retried later
                     for i in keep:
                         self.taken[i] = True
+                    newly.update(keep)
                     found.append((prim, keep))
+                if stop is None:
+                    pos = j
+                    K = min(2 * K, 16 * n)
+                else:
+                    pos = pending.index(stop, pos)
+                    K = max(n, K // 2)
+                    n_stop += 1
         finally:
+            Log.debug(f"Parallel seeds: {n_batch} batches, {n_stop} replays cut short, {n_spec} seeds computed for {tried} tried")
             try:
                 os.unlink(path)
             except OSError:
                 pass
-        f2, t2 = self._seed_loop([s for s in pending if not self.taken[s]], tries)
-        return found + f2, tried + t2
+        return found, tried
 
     @staticmethod
     def _pinch_count(topo, rf) -> int:
@@ -4732,6 +5666,17 @@ class Segmenter:
         # makes them merge on their own.
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
         found = self._merge_cosurface(found, "after the seeds")
+        if self.only_cyl:
+            # ⚠️ phase B converts only walls closed 360 degrees and concave:
+            # the rest (outer fillets, arcs of slots, concave corner
+            # roundings) would still go through relabel, the recovery and
+            # the exact consensus - 260 s out of 1700 on a 108k-triangle part
+            # - to be thrown away at the end. Half a turn is the margin for a
+            # wall that closes only once the free facets are recovered.
+            def _hole_like(p, rf):
+                R = describe_region(p, topo, rf)
+                return R.concave and R.coverage >= 0.5
+            found = [(p, rf) for p, rf in found if _hole_like(p, rf)]
 
         found = self.relabel(found)
         regions = [describe_region(p, topo, rf) for p, rf in found]
@@ -4799,6 +5744,7 @@ class Segmenter:
         # them unclaimed.
         found = self._absorb_free([(R.prim, list(R.faces)) for R in regions])
         found = self._wedged(found)
+        found = self._coaxial_bands(found)
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
         # ⚠️ AND IT MERGES AGAIN. The first pass looks at the regions AS
         # THEY COME OUT OF THE SEEDS: two pieces of the same wall separated
@@ -4809,6 +5755,12 @@ class Segmenter:
         # split into two faces of 10.5 and 2.4 mm2 with three slivers in
         # between, and in the CAD it's ONE single face.
         found = self._merge_cosurface(found, "after recovery")
+        found = self._absorb_regions(found)
+        found = [(self._review_type(pp, rf), rf) for pp, rf in found]
+        cons = [self._exact_consensus(pp, rf) for pp, rf in found]
+        changed = [k for k, (q, (pp, _)) in enumerate(zip(cons, found)) if q is not pp]
+        found = [(q, rf) for q, (_, rf) in zip(cons, found)]
+        found = self._absorb_exact(found, changed)
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
         regions = self._blend_patches(regions, frags)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
@@ -4959,6 +5911,373 @@ class Segmenter:
             d_cono = float(np.abs(p.dist(P)).max())
             d_cil = float(np.abs(q.dist(P)).max())
             if d_cil <= max(1.05 * d_cono, self.tol_fit):
+                return q
+        except Exception:
+            pass
+        return p
+
+    def _coaxial_bands(self, found):
+        """
+        ⚠️ THE CHAMFER TOO SMALL TO FIT, WHOSE AXIS IS KNOWN ANYWAY.
+        A 0.2-0.5 mm2 chamfer on the rim of a boss is tessellated with 3 to
+        6 facets: 4-7 distinct vertices for a free cone's 6 unknowns. The
+        seeds can't get it (the DOF filter rightly throws such fits away),
+        and it stays as a fan of flat triangles between two exact faces
+        (test10: four chamfers, 1.5 mm2 of mesh).
+        But in a CAD part that chamfer is not a free cone: it's COAXIAL
+        with the cylinder or cone it runs along, already found. With the
+        axis fixed the cone has two unknowns (radius and taper), and 4+
+        exact vertices determine it with points to spare: on an exact mesh
+        they sit at 1e-6, a wrong guess at tenths of a millimeter. Groups
+        of unclaimed facets are tried against the axis of every axial
+        region they touch; the facets that don't fit are peeled off one at
+        a time (the worst first) and whatever is left must still be one
+        connected band.
+        """
+        if self.only_cyl or not self.allow_cone:
+            return found
+        topo = self.topo
+        owner = {}
+        for k, (_, rf) in enumerate(found):
+            for i in rf:
+                owner[i] = k
+        loose = [i for i in range(topo.nF) if i not in owner and 3 <= len(topo.verts[i]) <= 6 and topo.planar[i]]
+        if not loose:
+            return found
+        lset = set(loose)
+        cos_smooth = math.cos(math.radians(30.0))
+        par = {i: i for i in loose}
+
+        def find(a):
+            while par[a] != a:
+                par[a] = par[par[a]]
+                a = par[a]
+            return a
+
+        for i in loose:
+            for j in topo.adj[i]:
+                if j in lset and abs(float(topo.norms[i] @ topo.norms[j])) >= cos_smooth:
+                    a, b = find(i), find(j)
+                    if a != b:
+                        par[a] = b
+        comps = defaultdict(list)
+        for i in loose:
+            comps[find(i)].append(i)
+
+        def fit_on(p, g):
+            P = np.unique(np.round(np.vstack([topo.verts[i] for i in g]), 9), axis=0)
+            if len(P) < 4:
+                return None
+            a = p.axis / np.linalg.norm(p.axis)
+            t = (P - p.center) @ a
+            rho = np.linalg.norm(P - p.center - np.outer(t, a), axis=1)
+            if float(t.max() - t.min()) < 1e-3 * max(float(rho.mean()), 1e-9):
+                return None  # a flat ring around the axis: that's a plane
+            A = np.c_[np.ones_like(t), t]
+            r0, s = np.linalg.lstsq(A, rho, rcond=None)[0]
+            if not (np.isfinite(r0) and np.isfinite(s)) or abs(s) > LM_MAX_SLOPE:
+                return None
+            if float((r0 + s * t).min()) <= 1e-6:
+                return None
+            # origin at the band's middle: the reference radius must be the
+            # band's own, not the one at the neighbor's origin (which can be
+            # past the apex, and a negative radius is a ConstructionError)
+            tm = 0.5 * float(t.min() + t.max())
+            q = Prim(AXIAL, p.center + tm * a, a.copy(), float(r0 + s * tm), 0.0 if abs(s) < 1e-9 else float(s))
+            q.rms = float(np.sqrt(np.mean(q.dist(P) ** 2)))
+            return q
+
+        # ⚠️ ONLY WHERE THE MESH IS EXACT. Two unknowns through four or five
+        # points always fit somewhere near a tenth of the tolerance; what
+        # makes the coaxial cone THE surface is that its vertices land on
+        # it to a float's precision. On test0, without this, a 3-facet
+        # "cone" at rms 2.4e-4 was carved out of a real chamfer.
+        vmax = max((float(np.abs(topo.verts[i]).max()) for i in loose), default=1.0)
+        lim = min(0.1 * self.tol_fit, max(1e-6, 64.0 * 2.0**-24 * vmax))
+        new = []
+        for g in comps.values():
+            if len(g) > 60:
+                continue
+            axes = {owner[j] for i in g for j in topo.adj[i] if j in owner and found[owner[j]][0] is not None and found[owner[j]][0].kind == AXIAL}
+            best = None
+            for k in axes:
+                p = found[k][0]
+                sub = list(g)
+                q = None
+                while len(sub) >= 2:
+                    q = fit_on(p, sub)
+                    if q is None:
+                        break
+                    res = [float(np.abs(q.dist(topo.verts[i])).max()) for i in sub]
+                    worst = int(np.argmax(res))
+                    if res[worst] <= lim:
+                        break
+                    sub.pop(worst)
+                    sub = largest_component(sub, topo.adj) if sub else sub
+                    q = None
+                if q is None or len(sub) < 2:
+                    continue
+                P = np.vstack([topo.verts[i] for i in sub])
+                Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in sub])
+                if normal_deviation(q, P, Nrep) > 10.0 or prims_equal(q, p, self.tol_fit):
+                    continue
+                if best is None or q.rms < best[0].rms:
+                    best = (q, sorted(sub), p)
+            if best is not None:
+                Log.debug(f"  coaxial band: {best[0].label()} r {best[0].r0:.4f} slope {best[0].slope:.4f} rms {best[0].rms:.1e} on {len(best[1])} facets, axis of {best[2].label()} r {best[2].r0:.4f}")
+                new.append(best[:2])
+        if new:
+            Log.debug(f"Coaxial bands: {len(new)} ({sum(len(s) for _, s in new)} facets)")
+        return found + new
+
+    def _absorb_regions(self, found):
+        """
+        ⚠️ A SMALLER REGION LYING ENTIRELY ON ITS NEIGHBOR'S SURFACE IS ITS
+        NEIGHBOR. A band of a torus tessellated with two rings of vertices
+        also fits a sphere exactly (two coaxial circles always lie on one),
+        and whichever seed gets there first claims it: test6's R1.5 r0.5
+        fillet came out as 70 facets of torus plus a 14-facet "sphere"
+        o4.31 in the middle of it. _merge_cosurface only compares regions of
+        the same kind. Here: if every vertex of the smaller region is
+        within the fit tolerance of the bigger neighbor's surface, with the
+        normals agreeing, the smaller one is handed over - without a refit,
+        the neighbor's surface already explains it.
+        """
+        topo = self.topo
+        alive = [True] * len(found)
+        faces = [list(rf) for _, rf in found]
+        changed = True
+        n_abs = 0
+        while changed:
+            changed = False
+            owner = {}
+            for k, rf in enumerate(faces):
+                if alive[k]:
+                    for i in rf:
+                        owner[i] = k
+            for a in sorted((k for k in range(len(found)) if alive[k]), key=lambda k: len(faces[k])):
+                if not alive[a]:
+                    continue
+                nbs = {owner[j] for i in faces[a] for j in topo.adj[i] if j in owner and owner[j] != a}
+                for b in sorted(nbs, key=lambda k: -len(faces[k])):
+                    pb = found[b][0]
+                    if pb is None or pb.kind == FREE or len(faces[b]) < len(faces[a]):
+                        continue
+                    P = np.vstack([topo.verts[i] for i in faces[a]])
+                    if float(np.abs(pb.dist(P)).max()) > self.tol_fit:
+                        continue
+                    Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in faces[a]])
+                    if normal_deviation(pb, P, Nrep) > 5.0 or not all(self.within(pb, i) for i in faces[a]):
+                        continue
+                    faces[b] = sorted(set(faces[b]) | set(faces[a]))
+                    alive[a] = False
+                    n_abs += 1
+                    changed = True
+                    break
+        if n_abs:
+            Log.debug(f"Regions lying on a neighbor's surface, absorbed: {n_abs}")
+        return [(found[k][0], faces[k]) for k in range(len(found)) if alive[k]]
+
+    def _absorb_exact(self, found, which, rounds: int = 3):
+        """
+        After the exact consensus: the facets the least-squares surface had
+        left out because it was off by a hundredth can now sit on the
+        corrected one (test0: the triangle where the R3 wall meets the
+        chamfer band, 4.6e-4 from R3.000 and further from R3.015). Loose
+        neighbors within their own tolerance and parallel within 5 degrees
+        join, WITHOUT a refit - refitting is exactly what would undo the
+        consensus.
+        """
+        if not which:
+            return found
+        topo = self.topo
+        taken = set()
+        for _, rf in found:
+            taken.update(rf)
+        n_add = 0
+        for k in which:
+            p, rf = found[k]
+            cur = set(rf)
+            for _ in range(rounds):
+                add = []
+                for i in {j for f in cur for j in topo.adj[f]} - taken:
+                    V = topo.verts[i]
+                    if len(V) < 3 or not self.within(p, i):
+                        continue
+                    nd = normal_deviation(p, V, np.tile(topo.norms[i], (len(V), 1)))
+                    if np.isfinite(nd) and nd <= 5.0:
+                        add.append(i)
+                if not add:
+                    break
+                cur.update(add)
+                taken.update(add)
+                n_add += len(add)
+            found[k] = (p, sorted(cur))
+        if n_add:
+            Log.debug(f"Facets recovered by the exact surfaces: +{n_add}")
+        return found
+
+    def _exact_consensus(self, p, rf):
+        """
+        ⚠️ THE SURFACE THE CAD HAD, NOT THE ONE THE LEAST SQUARES LIKES.
+        An exact mesh isn't exact everywhere. Vertices on a circle the CAD
+        knows analytically sit on the surface to a float's precision
+        (5e-7 on test0's R3 corner walls), but the ones on an edge the CAD
+        itself only APPROXIMATED - the B-spline where the wall meets a
+        ruled chamfer - are 1-4e-3 off (test0's own STEP writes those edges
+        with tolerances 2.4e-3 and 3.6e-3). Least squares shares that error
+        among all the vertices: R3.015 and R3.0074 with the axis shifted by
+        a hundredth, not a single vertex left exact, where the drawing
+        says R3.
+        The model "a vertex is either exact or off by the CAD's own
+        approximation" has a better estimator: the surface through the
+        MOST exact vertices (RANSAC on minimal subsets, then a refit on the
+        consensus). It wins if it clearly beats the free fit and still
+        explains every facet - the off vertices being allowed only on the
+        region's boundary, where the edge tolerance takes them, as in the
+        CAD. On a noisy or re-meshed mesh no subset is exact, the search
+        gives up after a few tries and nothing changes.
+        """
+        if p is None or p.kind not in (AXIAL, SPHERE, TORUS) or (p.kind == AXIAL and abs(p.slope) > 1e-9):
+            return p
+        topo = self.topo
+        try:
+            P = np.unique(np.round(np.vstack([topo.verts[i] for i in rf]), 9), axis=0)
+            # "exact" = within a few float32 roundings of the coordinates
+            # (an STL stores float32: 1e-6 at 20 mm, 1.5e-5 at 160 mm)
+            eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(P).max()))
+            d0 = np.abs(p.dist(P))
+            if len(P) < 10 or float(d0.max()) <= 10.0 * eps:
+                return p
+            n0 = int((d0 <= eps).sum())
+            dof = {SPHERE: 4, TORUS: 7}.get(p.kind, 5 if abs(p.slope) < 1e-9 else 6)
+            m = dof + 1
+            rng = np.random.default_rng(len(P))
+            hyp = []
+            for it in range(60):
+                if it == 30 and not hyp:
+                    break  # nothing exact to be found: noisy mesh
+                S_ = rng.choice(len(P), m, replace=False)
+                q = lm_refine(p, P[S_])
+                if q is None:
+                    continue
+                inl = np.abs(q.dist(P)) <= 10.0 * eps
+                if int(inl.sum()) <= m:
+                    continue
+                q = lm_refine(q, P[inl])
+                d = np.abs(q.dist(P))
+                n = int((d <= eps).sum())
+                if n > m:
+                    hyp.append((n, float(d.max()), it, q))
+            need = max(m + 3, n0 + 3, int(0.3 * len(P)))
+            hyp = sorted((h for h in hyp if h[0] >= need), key=lambda h: (-h[0], h[1]))
+            if not hyp:
+                return p
+            # ⚠️ the vertices the consensus leaves off are the ones on the
+            # CAD's approximated edges, i.e. on the region's BOUNDARY: there
+            # the edge tolerance absorbs them (test0's own CAD writes those
+            # B-spline edges at 2.4e-3 and 3.6e-3 from the wall). Inside the
+            # region every facet must still be within its own tolerance.
+            rset = set(rf)
+            bverts = set()
+            for i in rf:
+                for k in topo.f_edges[i]:
+                    if sum(1 for f in topo.e_faces[k] if f in rset) == 1:
+                        bverts.update(topo.e_verts[k])
+            bkeys = {tuple(np.round(topo.vpos[j], 9)) for j in bverts}
+
+            def radii(x):
+                return [x.r0, x.r1] if x.kind == TORUS else [x.r0]
+
+            def round_(r):
+                return any(abs(r - round(r / g) * g) <= max(3.0 * eps, 2e-5 * r) for g in (0.05, 25.4 / 64.0))
+
+            def acceptable(q, dmax):
+                # ⚠️ AND THE CONSENSUS MUST LAND ON A DRAWING'S NUMBER. On a
+                # mesh that is only NEARLY exact (test4: rms 5e-6 against a
+                # float step of 1.5e-5) a dozen vertices agree by chance,
+                # and on a short arc that is enough to swing a radius from
+                # 3.5000 to 3.6276 and double the deviation. What a CAD
+                # really draws has round radii: the consensus is taken only
+                # when it turns a non-round radius into a round one (test0:
+                # 3.0150 and 3.0074 -> 3.0000), never the other way round.
+                if not all(round_(r) for r in radii(q)) or all(round_(r) for r in radii(p)):
+                    return False
+                # a correction of the least squares' drift (0.5% on test0),
+                # not a different surface that happens to hit a round number
+                if any(abs(a - b) > 0.01 * max(abs(b), 1e-9) for a, b in zip(radii(q), radii(p))):
+                    return False
+                if dmax > max(3.0 * float(d0.max()), self.tol_fit):
+                    return False
+                for i in rf:
+                    V = topo.verts[i]
+                    d = np.abs(q.dist(V))
+                    ft = self.face_tol(q, i)
+                    if float(d.max()) <= ft:
+                        continue
+                    on_b = np.array([tuple(np.round(x, 9)) in bkeys for x in V])
+                    if float(d[~on_b].max(initial=0.0)) > ft or float(d.max()) > self.tol_grow:
+                        return False
+                return True
+
+            # a sparse consensus can pass exactly through its few points and
+            # swing away elsewhere: the most exact hypothesis that ALSO holds
+            # everywhere else wins, not merely the most exact one
+            for n, dmax, _, q in hyp[:10]:
+                if acceptable(q, dmax):
+                    if q.kind == AXIAL and abs(q.slope) < 1e-9:
+                        q.slope = 0.0
+                    Log.debug(f"Exact consensus: {p.label()} r {p.r0:.5f} -> {q.r0:.5f} ({n0} -> {n} exact vertices of {len(P)})")
+                    return q
+            Log.debug(f"Exact consensus refused: {p.label()} {n0} -> {hyp[0][0]} exact of {len(P)}, deviation {float(d0.max()):.1e} -> {hyp[0][1]:.1e}")
+            return p
+        except Exception:
+            return p
+
+    def _review_type(self, p, rf):
+        """
+        ⚠️ SPHERE OR CONE? THE VERTICES CAN'T TELL, THE CHORDS CAN.
+        A 45-degree chamfer band tessellated with its two rims only has
+        vertices on two coaxial circles - and two coaxial circles always lie
+        on a sphere as well as on a cone. Both fit at 1e-6; which one wins
+        is down to the seed (test10: two chamfers r7.8 and r2.9 came out as
+        spheres o22.1 and o5.7, and the CAD has cones).
+        What separates them is the rest of the tessellation: the facet sides
+        joining the two rims are the cone's RULINGS, so their midpoints lie
+        on the cone and a whole sag below the sphere. The surface under
+        which the mesh's chords sag less is the one the mesh was cut from
+        (a tessellator would have added a ring if the sphere's meridian
+        sagged that much).
+        Only on exact meshes (vertices within a quarter of the tolerance):
+        on noisy ones the sag says nothing a residual doesn't.
+        """
+        if p is None or p.kind not in (SPHERE, AXIAL) or self.only_cyl or len(rf) < 4:
+            return p
+        topo = self.topo
+        try:
+            P = np.vstack([topo.verts[i] for i in rf])
+            d0 = float(np.abs(p.dist(P)).max())
+            if d0 > 0.25 * self.tol_fit:
+                return p
+            if p.kind == SPHERE and self.allow_cone:
+                q = refit_exact(rf, topo.verts, topo.norms, topo.areas, AXIAL)
+            elif p.kind == AXIAL and self.allow_sphere:
+                q = refit_exact(rf, topo.verts, topo.norms, topo.areas, SPHERE)
+            else:
+                return p
+            if q is None or q.kind == p.kind or prim_radius(q) > self.max_radius:
+                return p
+            if float(np.abs(q.dist(P)).max()) > max(2.0 * d0, 0.05 * self.tol_fit):
+                return p
+            Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in rf])
+            if normal_deviation(q, P, Nrep) > 15.0 or not all(self.within(q, i) for i in rf):
+                return p
+            Q = sag_points(topo, rf)
+            s_p = float(np.sqrt(np.mean(p.dist(Q) ** 2)))
+            s_q = float(np.sqrt(np.mean(q.dist(Q) ** 2)))
+            pen = lambda x: 1.10 if x.kind == SPHERE else (1.0 if abs(x.slope) < 1e-9 else 1.15)
+            if s_q * pen(q) < 0.5 * s_p * pen(p):
+                Log.debug(f"Type review: {p.label()} -> {q.label()} on {len(rf)} facets (chord sag {s_p:.1e} -> {s_q:.1e})")
                 return q
         except Exception:
             pass
@@ -5410,17 +6729,26 @@ class TopoLite:
     """Only the topology fields the segmentation needs: numpy and lists,
     so it can be shipped to another process."""
 
-    __slots__ = ("nF", "verts", "norms", "areas", "nverts", "planar", "adj")
+    __slots__ = ("nF", "verts", "cents", "norms", "areas", "nverts", "planar", "adj")
+    # ⚠️ cents too: face_tol and _concave read it. Without it face_tol fell
+    # into its except and returned the bare tol_fit IN EVERY WORKER - the
+    # multi-process runs (the default) judged coarse facets more strictly
+    # than -j 1 - and phase B's concavity test raised on every seed and
+    # found nothing at all.
 
     def __init__(self, topo):
         n = topo.nF
         self.nF = n
         self.verts = [topo.verts[i] for i in range(n)]
+        self.cents = [topo.cents[i] for i in range(n)]
         self.norms = [topo.norms[i] for i in range(n)]
         self.areas = [topo.areas[i] for i in range(n)]
         self.nverts = [topo.nverts[i] for i in range(n)]
         self.planar = [topo.planar[i] for i in range(n)]
-        self.adj = [sorted(topo.adj[i]) for i in range(n)]
+        # ⚠️ SAME ORDER AS THE SET: growth visits the neighbors in adj's
+        # order, and with a sorted list the workers grew 1% of the regions
+        # differently from a single-process run - the result depended on -j.
+        self.adj = [list(topo.adj[i]) for i in range(n)]
 
     def __getstate__(self):
         return {k: getattr(self, k) for k in self.__slots__}
@@ -5499,7 +6827,11 @@ def close_pool() -> None:
 
 
 def _worker_seeds(task):
-    """Tries a list of seeds against a snapshot of the facets already claimed."""
+    """
+    Tries a list of seeds, EACH against the same snapshot of the claimed
+    facets (nothing is marked here: see _seed_loop_parallel). Returns
+    (seed, prim, faces, dead facets, facets used) per seed.
+    """
     import pickle
 
     global _W_KEY, _W_SEG
@@ -5513,22 +6845,18 @@ def _worker_seeds(task):
     seg.taken = [b != 0 for b in taken_b]
     out = []
     for s in seeds:
-        if seg.taken[s]:
-            continue
+        seg._used = set()
         try:
             res, why = seg.try_seed(s)
-        except Exception as ex:
-            out.append((s, None, [f"{type(ex).__name__}: {ex}"]))
-            continue
+        except Exception:
+            res = None
+            seg.last_dead = []
+        used = sorted(seg._used)
+        seg._used = None
         if res is None:
-            out.append((s, None, []))
-            continue
-        prim, keep = res
-        # ⚠️ the process marks what it took: without this it would redo the
-        # same region starting from every facet that's part of it
-        for i in keep:
-            seg.taken[i] = True
-        out.append((s, prim, keep))
+            out.append((s, None, [], [int(i) for i in seg.last_dead], used))
+        else:
+            out.append((s, res[0], res[1], [], used))
     return out
 
 
@@ -6126,12 +7454,29 @@ class Engine:
         # the outward normal (independent of OCC's orientation conventions)
         dir_edge: Dict[int, Tuple[int, int]] = {}
         out_v: Dict[int, List[int]] = defaultdict(list)
+        undecided: List[int] = []
         for k, i in bnd.items():
             a, b = topo.e_verts[k]
             A, B = topo.vpos[a], topo.vpos[b]
             n = topo.norms[i]
             inward = np.cross(n, B - A)
-            if float((topo.cents[i] - 0.5 * (A + B)) @ inward) < 0:
+            s = float((topo.cents[i] - 0.5 * (A + B)) @ inward)
+            # ⚠️ A COLLAPSED FACET (two coincident vertices, area 4e-13 on
+            # test10) has its centroid ON the edge: s = 0 and no side to
+            # tell. Its direction is taken from the boundary's continuity
+            # instead - with a coin toss, one chamfer in two was left as
+            # mesh ("boundary can't be closed").
+            if abs(s) <= 1e-9 * max(float((B - A) @ (B - A)), 1e-30):
+                undecided.append(k)
+                continue
+            if s < 0:
+                a, b = b, a
+            dir_edge[k] = (a, b)
+            out_v[a].append(k)
+        for k in undecided:
+            a, b = topo.e_verts[k]
+            n_in_a = sum(1 for e in dir_edge.values() if e[1] == a)
+            if n_in_a <= len(out_v.get(a, [])):
                 a, b = b, a
             dir_edge[k] = (a, b)
             out_v[a].append(k)
@@ -6236,6 +7581,8 @@ class Engine:
     def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
         mt0 = max_tolerance(self.shape) if self.verbose else 0.0
         ok, why = self._safe(R, strict_hole)
+        if not ok and self.verbose:
+            Log.debug(f"    first strategy: {why}")
         # ⚠️ SECOND STRATEGY: if the planar neighbor rebuilt with the exact
         # arc comes out invalid (or the orientation doesn't work out, which
         # is the same case seen from the other attempt), retry leaving the
@@ -6378,6 +7725,7 @@ class Engine:
             why = self._align_closed_chains(loops, sp)
             if why:
                 return False, why
+        self._split_pinned(loops, rotate=not R.closed_u)
 
         # --- chains -> edges -----------------------------------------------------
         new_edges: Dict[int, Tuple[object, bool]] = {}  # id(chain) -> (edge, fwd)
@@ -6567,7 +7915,7 @@ class Engine:
                         need = float(np.abs((Q3 - face_plane_point(topo.faces[ch.nb])) @ topo.norms[ch.nb]).max())
                     except Exception:
                         need = 0.0
-                own = set(ch.edges)
+                own = set(ch.edges) | getattr(ch, "ring", set())
                 for j in {j1, j2}:
                     for k in topo.v_edges.get(j, ()):
                         if k not in own:
@@ -6688,11 +8036,12 @@ class Engine:
                 for k in ch.edges[1:]:
                     rs.Remove(topo.edges[k])
             try:
-                new_shape = rs.Apply(self.shape)
+                new_shape, rs = self._apply_local(rs, rf, replaced)
             except Exception as ex:
                 self._restore_all(vtol_backup)
                 return False, f"ReShape: {type(ex).__name__}: {ex}"
-            ok, why = self._validate(new_shape, Fo, rf, replaced, R, a_mesh, sp)
+            gone, born = self._reshaped(rs, rf, replaced)
+            ok, why = self._validate(new_shape, Fo, rf, replaced, R, a_mesh, sp, gone, born)
             if self.verbose:
                 Log.debug(f"    attempt {attempt + 1} (Fo {Fo.Orientation()}): {'ok' if ok else why}")
             if ok:
@@ -6711,10 +8060,11 @@ class Engine:
         # the next region would bring them back and break this face.
         self._etol_backup = {}
         self._vtol_backup = {}
-        self._carry_registry(rs, new_shape)
+        self._carry_registry(rs, new_shape, gone)
         self._register(Fo, prim)
         self.shape = new_shape
-        self.topo = Topo(new_shape, prev=self.topo)
+        if not (INCREMENTAL_TOPO and self.topo.update(new_shape, gone, born)):
+            self.topo = Topo(new_shape, prev=self.topo) if not INCREMENTAL_TOPO else Topo(new_shape)
         R.note = f"{n_analytic} analytic edges · {n_reused} reused · {n_poly} polygonal"
         return True, ""
 
@@ -6813,6 +8163,71 @@ class Engine:
                         cnt[j] += 1
         return {j for j, c in cnt.items() if c > 2}
 
+    def _pinned(self, ch: "Chain") -> List[int]:
+        """
+        Vertices of a CLOSED chain that the neighbor needs as they are.
+
+        ⚠️ A RING BECOMES ONE CLOSED EDGE, WITH ONE VERTEX: WHICH ONE MATTERS.
+        When the neighbor is an already-converted closed face (the hole's
+        cylinder, before its countersink), its seam lands on the ring at a
+        precise vertex. The circle replacing the ring must keep a vertex
+        THERE: otherwise the neighbor's wire has the seam ending on a vertex
+        that no longer exists ("face:NotConnected"), the conversion falls
+        back to the third strategy and the rim of every countersunk hole
+        stayed a 45-segment polygon (test0, test10). Forcing the ring to
+        START at the pin isn't the answer either: on a 360-degree region the
+        start is where the region's own seam lands, and moving it off the
+        aligned vertex leaves a seam made of the mesh's chords (test2:
+        1.8e-2 of tolerance). _split_pinned cuts the circle into arcs.
+        Here: the ring's vertices where the neighbor has another edge.
+        """
+        topo = self.topo
+        own = set(ch.edges)
+        return [j for j in ch.verts[:-1] if any(k not in own and ch.nb in topo.e_faces[k] for k in topo.v_edges[j])]
+
+    def _split_pinned(self, loops, rotate: bool) -> None:
+        """
+        A closed chain that the neighbor pins (see _pinned) can't become ONE
+        closed edge unless its single vertex is the pin: it becomes arcs
+        instead, split at the pins and at its current start (which, on a
+        360-degree region, is where the region's own seam lands). The
+        neighbor keeps its vertex, the seam keeps its alignment, and the
+        arcs all lie on the same exact circle.
+        """
+        for L in loops:
+            out = []
+            for ch in L.chains:
+                pins = self._pinned(ch) if ch.closed else []
+                if not pins:
+                    out.append(ch)
+                    continue
+                if rotate:
+                    self._rotate_chain(ch, pins[0])
+                keep = set(pins) | {ch.verts[0]}
+                idx = [k for k, v in enumerate(ch.verts[:-1]) if v in keep]
+                if len(idx) < 2:
+                    out.append(ch)  # the start IS the only pin: one closed edge
+                    continue
+                ring = set(ch.edges)
+                for a, b in zip(idx, idx[1:] + [len(ch.edges)]):
+                    sub = Chain(ch.edges[a:b], ch.fwd[a:b], ch.verts[a : b + 1], ch.nb, closed=False)
+                    sub.ring = ring  # the sibling arcs get replaced too: not a junction to check
+                    out.append(sub)
+            L.chains = out
+
+    @staticmethod
+    def _rotate_chain(ch: "Chain", j: int) -> bool:
+        """Closed chain: makes vertex j its start (and end)."""
+        if not ch.closed or j not in ch.verts[:-1]:
+            return False
+        s = ch.verts.index(j)
+        ch.edges = ch.edges[s:] + ch.edges[:s]
+        ch.fwd = ch.fwd[s:] + ch.fwd[:s]
+        core = ch.verts[:-1]
+        core = core[s:] + core[:s]
+        ch.verts = core + [core[0]]
+        return True
+
     def _align_closed_chains(self, loops, sp: SurfParam) -> str:
         """
         Region closed 360 degrees: the seam will run from vertex A of the
@@ -6822,17 +8237,7 @@ class Engine:
         created.
         """
         topo = self.topo
-
-        def rotate(ch: Chain, j: int) -> bool:
-            if not ch.closed or j not in ch.verts[:-1]:
-                return False
-            s = ch.verts.index(j)
-            ch.edges = ch.edges[s:] + ch.edges[:s]
-            ch.fwd = ch.fwd[s:] + ch.fwd[:s]
-            core = ch.verts[:-1]
-            core = core[s:] + core[:s]
-            ch.verts = core + [core[0]]
-            return True
+        rotate = self._rotate_chain
 
         def candidates(L: Loop) -> List[int]:
             out = []
@@ -7024,6 +8429,21 @@ class Engine:
         for seq in sequences:
             if flip:
                 seq = [(e, not f, tag) for e, f, tag in reversed(seq)]
+            # ⚠️ NEVER START A WIRE WITH A CLOSED EDGE. A 360-degree region's
+            # wire is [seam, ring, seam, ring] and a ring can be one closed
+            # circle (one vertex, start = end). If that circle is the FIRST
+            # edge, BRepCheck gets the wrap-around of the wire wrong and
+            # reports "SelfIntersectingWire" on a face that is fine: the SAME
+            # twelve edges, started from any other edge, are valid (checked
+            # all twelve rotations on test2's R1.75-2.05 countersink). Which
+            # edge came first depended on the edge numbering, so the region
+            # converted or not depending on the order of earlier conversions.
+            if len(seq) > 1:
+                for s in range(len(seq)):
+                    e0 = td_Edge(seq[s][0])
+                    if not te_FirstVertex(e0).IsSame(te_LastVertex(e0)):
+                        seq = seq[s:] + seq[:s]
+                        break
             w = TopoDS_Wire()
             bb.MakeWire(w)
             u_prev = v_prev = None
@@ -7122,11 +8542,98 @@ class Engine:
             Log.debug(f"    normal check failed: {type(ex).__name__}: {ex}")
             return True
 
-    def _validate(self, new_shape, Fo, rf, replaced, R: Region, a_mesh: float, sp: "SurfParam" = None):
-        fe = count_free_edges(new_shape)
+    def _apply_local(self, rs, rf, replaced):
+        """
+        rs.Apply(self.shape), in two steps. ⚠️ ReShape walks the WHOLE
+        shape down to the vertices looking for what to replace: 0.3 s on
+        77k faces, twice per region. The edge-level requests only concern
+        the region's faces and the neighbors across the replaced chains:
+        they're applied to those faces alone, and the solid only gets
+        face-for-face replacements, with the walk stopping at the faces
+        (0.05 s). Returns the new shape and the face-level ReShape, whose
+        Value() answers for the old faces as the single-step one did.
+        """
+        topo = self.topo
+        cand = set(rf)
+        for ch, _, _ in replaced:
+            for k in ch.edges:
+                cand.update(topo.e_faces[k])
+        rs2 = BRepTools_ReShape()
+        for i in sorted(cand):
+            key = td_Face(topo.faces[i].Oriented(TopAbs_FORWARD))
+            nf = rs.Apply(key)
+            if nf.IsNull():
+                rs2.Remove(key)
+            elif not (nf.IsSame(key) and nf.Orientation() == key.Orientation()):
+                rs2.Replace(key, nf)
+        return rs2.Apply(self.shape, TopAbs_FACE), rs2
+
+    def _reshaped(self, rs, rf, replaced):
+        """
+        Faces the replacement took out of the shape (indices) and the ones
+        that took their place, as they sit in the new shape. ReShape only
+        rebuilds the ancestors of what it replaced: the region's faces and
+        the neighbors across the replaced chains.
+        """
+        topo = self.topo
+        cand = set(rf)
+        for ch, _, _ in replaced:
+            for k in ch.edges:
+                cand.update(topo.e_faces[k])
+        gone, born = [], []
+        for i in sorted(cand):
+            old = topo.faces[i]
+            nw = rs.Value(old)
+            if not nw.IsNull() and nw.IsSame(old):
+                continue
+            gone.append(i)
+            if not nw.IsNull() and not any(nw.IsSame(b) for b in born):
+                born.append(td_Face(nw))
+        return gone, born
+
+    def _local_edge_map(self, new_shape, gone, born):
+        """
+        (change in free edges, edge -> faces map) computed on the touched
+        faces and their neighbors only. None if the new shape doesn't have
+        the expected face count (something else changed: global check).
+        ⚠️ the whole-shape map was 0.5 s per attempt on 77k faces, for an
+        answer that only depends on a few dozen of them.
+        """
+        topo = self.topo
+        if count_sub(new_shape, TopAbs_FACE) != topo.nF - len(gone) + len(born):
+            return None
+        gs = set(gone)
+        around = [topo.faces[j] for j in sorted({j for i in gone for j in topo.adj[i]} - gs)]
+
+        def _map(faces):
+            b = BRep_Builder()
+            c = TopoDS_Compound()
+            b.MakeCompound(c)
+            for f in faces + around:
+                b.Add(c, f)
+            m = edge_face_map(c)
+            own = TopTools_IndexedMapOfShape()
+            for f in faces:
+                te_MapShapes(f, TopAbs_EDGE, own)
+            free = sum(1 for q in range(1, _size(own) + 1) if _size(m.FindFromKey(own.FindKey(q))) == 1)
+            return free, m
+
+        f_new, m_new = _map(list(born))
+        f_old, _ = _map([topo.faces[i] for i in gone])
+        return f_new - f_old, m_new
+
+    def _validate(self, new_shape, Fo, rf, replaced, R: Region, a_mesh: float, sp: "SurfParam" = None, gone=None, born=None):
+        loc = self._local_edge_map(new_shape, gone, born) if gone is not None else None
+        if loc is not None:
+            fe = self.free0 + loc[0]
+            emap = loc[1]
+        else:
+            fe = count_free_edges(new_shape)
+            emap = None
         if fe != self.free0:
             return False, f"free edges {fe} (was {self.free0})"
-        emap = edge_face_map(new_shape)
+        if emap is None:
+            emap = edge_face_map(new_shape)
         # consistent orientation: every new edge must be traversed in
         # opposite directions by the two faces sharing it
         check_edges = [e for _, e, _ in replaced]
@@ -7184,6 +8691,16 @@ class Engine:
                         break
             if fo_in is not None:
                 break
+        # ⚠️ THE NEW FACE IS CHECKED BEFORE GOING IN, BUT FORWARD. When the
+        # second attempt inserts it REVERSED, a wire that pinches at a vertex
+        # (a figure eight: one lobe winds the other way) passes FORWARD and is
+        # "face:Invalid" reversed - test12, an R0.57 cone of 0.023 mm2 with a
+        # three-edge notch hanging off one vertex: accepted, and the finished
+        # solid failed BRepCheck. It's checked again as it sits in the solid.
+        if fo_in is not None:
+            det = check_detail(fo_in)
+            if det:
+                return False, "new face invalid as oriented in the solid: " + ", ".join(det)
         old_f = [self.topo.faces[i] for i in rf] + [self.topo.faces[j] for j in {ch.nb for ch, _, _ in replaced}]
         new_f = [self.registry.FindKey(k) for k in touched] + [fo_in if fo_in is not None else Fo]
         defl = max(0.1 * dev, 1e-5)
@@ -7259,6 +8776,22 @@ class Engine:
             c2d, _, dev = make_pcurve(spn, curve, t0, t1, True, None, None)
             if c2d is None:
                 return "pcurve on the neighbor can't be computed"
+            # ⚠️ THE NEIGHBOR'S u RUNS BETWEEN ITS SEAMS. make_pcurve unwraps
+            # from the start point's principal angle and follows the curve:
+            # a closed rim traversed at decreasing u lands on [-4.15, 2.13]
+            # while the hole's face lives on [2.13, 8.41], and its wire gets
+            # a 2*pi hole ("face:Invalid"). The pcurve is shifted by whole
+            # periods to sit in the middle of the face's own domain.
+            if prim.kind in (AXIAL, SPHERE, TORUS):
+                try:
+                    u_lo, u_hi, _, _ = _st(_BRepTools.BRepTools, "UVBounds")(f)
+                    a_, b_ = c2d.FirstParameter(), c2d.LastParameter()
+                    um = 0.5 * (c2d.Value(a_).X() + c2d.Value(b_).X())
+                    k_ = round((0.5 * (u_lo + u_hi) - um) / (2.0 * math.pi))
+                    if k_ != 0 and u_hi - u_lo < 4.0 * math.pi:
+                        c2d.Translate(gp_Vec2d(2.0 * math.pi * k_, 0.0))
+                except Exception:
+                    pass
             tol = max(float(bt_Tolerance(e)), 1.2 * dev + 1e-7)
             if tol > self.max_edge_tol:
                 return f"pcurve on the neighbor: deviation {dev:.1e} beyond the ceiling"
@@ -7307,10 +8840,16 @@ class Engine:
         except Exception:
             return None
 
-    def _carry_registry(self, rs, new_shape) -> None:
+    def _carry_registry(self, rs, new_shape, gone: Optional[List[int]] = None) -> None:
         """Analytic faces rebuilt by ReShape keep their primitive."""
         upd = {}
-        for k, prim in list(self.analytic.items()):
+        if gone is not None:
+            # only the faces the replacement touched can have been rebuilt
+            keys = [self.registry.FindIndex(self.topo.faces[i]) for i in gone]
+            items = [(k, self.analytic[k]) for k in keys if k in self.analytic]
+        else:
+            items = list(self.analytic.items())
+        for k, prim in items:
             old = self.registry.FindKey(k)
             try:
                 if rs.IsRecorded(old):
@@ -8278,6 +9817,23 @@ def parse_args(argv=None):
     g.add_argument("--no-torus", action="store_true", help="[C] don't recognize tori")
     g.add_argument("--no-free", action="store_true", help="[C] don't rebuild free-form fillet patches (B-spline): they stay tessellated or split into little cylinders")
 
+    g = p.add_argument_group("mesh input (STL)")
+    g.add_argument(
+        "--no-mesh-repair",
+        action="store_true",
+        help="only CHECK the mesh (holes, non-manifold edges, winding, duplicates, self-intersections) without repairing it. "
+        "By default the defects that would break the conversion are repaired with MeshLab (pip install pymeshlab), "
+        "one filter per defect, without moving any vertex",
+    )
+    g.add_argument(
+        "--close-holes",
+        type=int,
+        default=10,
+        metavar="N",
+        help="close holes of up to N boundary edges (default 10: cracks, a missing triangle). Bigger holes stay open: "
+        "no geometry is invented. 0 = never close",
+    )
+
     g = p.add_argument_group("system / output")
     g.add_argument(
         "-j",
@@ -8310,6 +9866,9 @@ def main(argv=None) -> int:
         pass
     Log.no_color = args.no_color or not sys.stdout.isatty()
     Log.level = 10 if args.verbose else (30 if args.quiet else 20)
+    global MESH_REPAIR, MESH_CLOSE_HOLES
+    MESH_REPAIR = not args.no_mesh_repair
+    MESH_CLOSE_HOLES = max(0, int(args.close_holes))
 
     if args.check:
         Log.banner("Environment check")
@@ -8322,6 +9881,12 @@ def main(argv=None) -> int:
         except Exception:
             pass
         Log.ok(f"numpy        : {np.__version__}")
+        try:
+            import importlib.metadata
+
+            Log.ok(f"pymeshlab    : {importlib.metadata.version('pymeshlab')} (STL check and repair)")
+        except Exception:
+            Log.warn("pymeshlab    : not installed - STL defects are reported but not repaired (pip install pymeshlab)")
         Log.ok(f"python       : {sys.version.split()[0]} ({sys.platform})")
         for name, fn in (
             ("BRep_Tool.Pnt", bt_Pnt),
@@ -8373,7 +9938,7 @@ def main(argv=None) -> int:
                 # report would say "994 input faces" instead of 5,682.
                 if n_a == 1:
                     if args.keep_a and not only_a:
-                        write_step(shape, f"{stem}_phaseA.step")
+                        write_step(shape, f"{stem}_phaseA.step", src=args.input)
             elif w == "B":
                 rb = run_phase(shape, "B", args.tol, args.max_edge_tol, args.min_faces, True, True, True, validate=args.validate, threads=args.threads)
                 shape = rb.shape
@@ -8409,7 +9974,7 @@ def main(argv=None) -> int:
     # but the checks are local: if something slipped through, this is where it shows.
     if not is_valid(shape):
         Log.warn("the finished part doesn't pass BRepCheck: " + ", ".join(check_detail(shape, 4)))
-    write_step(shape, out_path)
+    write_step(shape, out_path, src=args.input)
     _ri, _ = read_step(out_path)
     if is_valid(shape) and not is_valid(_ri):
         Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))

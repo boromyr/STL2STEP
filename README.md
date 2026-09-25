@@ -8,6 +8,25 @@ and is discarded if it doesn't pass the check. Whatever can't be converted stays
 was: the output file is always consistent with the input one, at worst it's just less "clean". There
 is no global Sewing and nothing is rebuilt globally.
 
+## Mesh check (STL input)
+
+Before anything else the mesh is checked: triangles with a repeated vertex or zero area, duplicate
+triangles, holes, non-manifold edges and vertices, inconsistent winding, self-intersections, separate
+pieces (bodies, or internal cavities: a piece of negative volume inside the body becomes a void of
+the solid, as in the CAD's `BREP_WITH_VOIDS`). The defects that would break the conversion are
+repaired with [MeshLab](https://www.meshlab.net/) through `pymeshlab`, one filter per defect and never
+by remeshing, so the vertices of a CAD export stay exact:
+
+- zero-area triangles with a vertex on their side: flipped with the neighbor (no crack);
+- duplicate triangles: removed;
+- non-manifold edges and vertices: vertices split (bodies that touch come apart, nothing moves);
+- inconsistent winding: re-oriented coherently;
+- holes up to `--close-holes N` boundary edges (default 10): closed; bigger ones stay open;
+- self-intersections: only reported (repairing them would move the surface).
+
+`--no-mesh-repair` only checks. Without `pymeshlab` the check still runs (numpy) and the defects
+are reported but left in.
+
 ## Phases
 
 - **Phase A** (`-a`): merging of coplanar faces and collinear edges.
@@ -30,12 +49,12 @@ the final arc-snapping step).
 ## Requirements
 
 ```
-pip install cadquery-ocp numpy scipy
+pip install cadquery-ocp numpy scipy pymeshlab
 ```
 
 Works with OCP 7.x and 8.x. `cadquery-ocp` 8.0.1 is built against `vtk==9.6.2`: with a newer vtk
-(e.g. after a blanket `pip` upgrade) `import OCP` fails with "DLL load failed". `scipy` is only
-needed by `qa.py`.
+(e.g. after a blanket `pip` upgrade) `import OCP` fails with "DLL load failed". `scipy` is needed by the mesh
+check and by `qa.py`; `pymeshlab` (optional) repairs the mesh defects.
 
 ## Files
 
@@ -46,9 +65,13 @@ needed by `qa.py`.
 - `verify.py` — measures the deviation between an output and the starting mesh (one-sided, sampled).
 - `archi.py` — counts how many of the mesh's polylines are actually circular arcs.
 - `tassellate.py` — estimates how much curvature is left tessellated in the output.
-- `test0.stl` … `test9.stl` — test meshes, ordered by increasing facet count (`test0` the
-  simplest). `test4_original.step` is the CAD file `test4.stl` was exported from: the reference
-  for comparing an output face by face (`extra.py test4_original.step test4.step`).
+- `cadcmp.py` — compares an output face by face with the CAD file the mesh came from: faces
+  reproduced one to one, split or of the wrong type, radii and angles, mesh left over, polylines
+  where the CAD has a curve. `python cadcmp.py test10_original.step test10.step -v`
+- `test0.stl` … `test13.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10` and
+  `test12` come with the CAD file they were exported from (`testN_original.step`): the reference
+  for `cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six internal
+  cavities.
 - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
   `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
   used during development.
