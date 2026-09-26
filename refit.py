@@ -5012,6 +5012,49 @@ def _arc_coverage(prim: "Prim", topo: Topo, faces: List[int]) -> float:
     return min(1.0, (2 * math.pi - gmax) / (2 * math.pi))
 
 
+def _boundary_winds(prim: "Prim", topo: Topo, faces: List[int]) -> bool:
+    """A loop of the region's boundary goes once around the axis."""
+    rset = set(faces)
+    bed = [k for i in faces for k in topo.f_edges[i] if sum(1 for f in topo.e_faces[k] if f in rset) == 1]
+    if not bed:
+        return False
+    at = defaultdict(list)
+    for k in set(bed):
+        a, b = topo.e_verts[k]
+        at[a].append(k)
+        at[b].append(k)
+    u, v = ortho_frame(prim.axis)
+
+    def ang(j):
+        d = topo.vpos[j] - prim.center
+        return math.atan2(float(d @ v), float(d @ u))
+
+    used = set()
+    for k0 in set(bed):
+        if k0 in used:
+            continue
+        used.add(k0)
+        start, cur = topo.e_verts[k0]
+        total = 0.0
+        prev_a = ang(start)
+        for _ in range(len(bed) + 1):
+            a_ = ang(cur)
+            total += (a_ - prev_a + math.pi) % (2 * math.pi) - math.pi
+            prev_a = a_
+            if cur == start:
+                break
+            nxt = [k for k in at[cur] if k not in used]
+            if not nxt:
+                break
+            k = nxt[0]
+            used.add(k)
+            a, b = topo.e_verts[k]
+            cur = b if a == cur else a
+        if cur == start and abs(total) > math.pi:
+            return True
+    return False
+
+
 def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
     P = np.vstack([topo.verts[i] for i in faces])
     d = prim.dist(P)
@@ -5038,6 +5081,15 @@ def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
             gmax = float(gaps.max())
             R.coverage = float(min(1.0, (2 * math.pi - gmax) / (2 * math.pi)))
             R.closed_u = gmax <= max(4.0 * med, math.radians(2.0)) and R.coverage > 0.9
+            # ⚠️ THE GAPS CAN'T TELL, THE BOUNDARY CAN. A bore crossed by
+            # another hole (test13: R10.25, 402 facets) is a full ring at one
+            # end and two tongues elsewhere: the ring's vertices sit 3.4
+            # degrees apart, the tongues' edges crowd the median gap down to
+            # 0.45, and "3.4 > 4 x 0.45" called it open - then "ambiguous
+            # coverage" rejected the whole bore. Closed means a boundary loop
+            # goes once around the axis.
+            if not R.closed_u and R.coverage > 0.97:
+                R.closed_u = _boundary_winds(prim, topo, faces)
         else:
             R.coverage = 0.0
     elif prim.kind == SPHERE:
@@ -5245,7 +5297,8 @@ class Segmenter:
             return None
         P = np.vstack([topo.verts[i] for i in idx])
         Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in idx])
-        fallback = [None]
+        failed = []
+        Q = []
 
         def judge(p):
             if p is None or prim_radius(p) > self.max_radius:
@@ -5259,9 +5312,31 @@ class Segmenter:
                 return False
             if mx <= self.tol_fit:
                 return True
-            if fallback[0] is None or mx < fallback[0][0]:
-                fallback[0] = (mx, p)
+            if not Q:
+                Q.append(sag_points(topo, idx))
+            try:
+                sg = float(np.abs(p.dist(Q[0])).max()) if len(Q[0]) else 0.0
+            except Exception:
+                sg = math.inf
+            failed.append((mx, sg if np.isfinite(sg) else math.inf, p))
             return False
+
+        def fallback_prim():
+            # ⚠️ NONE HOLDS: THE CLOSEST ONE - INSIDE THE FACETS TOO. The
+            # vertices alone picked, on test8's outer fingers, a torus of the
+            # wrong family (axis along the fillet, tube R44) at 1.3e-3 over
+            # the r0.5 cylinder at 2.6e-3: the fillet's strips are 8 mm
+            # long with vertices only at their ends, and between them that
+            # torus leaves the strips by 0.19 mm where the cylinder stays
+            # within 4.3e-3. The engine then rejected the torus and the
+            # fillet stayed five planar strips. What a candidate strays
+            # inside the facets BEYOND the best one counts as much as its
+            # vertices do; between candidates that sag alike nothing
+            # changes.
+            if not failed:
+                return None
+            s0 = min(sg for _, sg, _ in failed)
+            return min(failed, key=lambda t: max(t[0], t[1] - s0) if t[2].kind == TORUS else t[0])[2]
 
         ax = refit_exact(idx, topo.verts, topo.norms, topo.areas, AXIAL)
         if ax is not None:
@@ -5281,7 +5356,7 @@ class Segmenter:
                 tr = refit_exact(idx, topo.verts, topo.norms, topo.areas, TORUS)
                 if judge(tr):
                     return tr
-        return fallback[0][1] if fallback[0] else None
+        return fallback_prim()
 
     # --- seeds ---------------------------------------------------------------------
     def seed_candidates(self, seed: List[int]):
@@ -5384,7 +5459,7 @@ class Segmenter:
                 p2 = self.choose_prim(reg)
                 last_n = len(reg)
             else:
-                p2 = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind)
+                p2 = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind, init=p)
                 if p2 is not None and prim_radius(p2) > self.max_radius:
                     p2 = None
             if not self.kind_ok(p2) and len(reg) >= 6:
@@ -5409,7 +5484,7 @@ class Segmenter:
                 cut = max(1.0, float(np.median(res)))
                 trimmed = largest_component([i for i, r_ in zip(reg, res) if r_ <= cut], topo.adj)
                 if len(trimmed) >= 3:
-                    p3 = refit_exact(trimmed, topo.verts, topo.norms, topo.areas, p.kind)
+                    p3 = refit_exact(trimmed, topo.verts, topo.norms, topo.areas, p.kind, init=p)
                     if p3 is not None and prim_radius(p3) <= self.max_radius:
                         p = p3
                         reg = trimmed
@@ -5421,7 +5496,7 @@ class Segmenter:
             if set(keep) == set(reg):
                 break
             reg = keep
-        p = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind)
+        p = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind, init=p)
         if not self.kind_ok(p) or prim_radius(p) > self.max_radius:
             return None, "final fit invalid"
         if abs(p.slope) < 1e-9:
@@ -6773,6 +6848,7 @@ class Segmenter:
             # section as it is.
             a_sec = float(sum(topo.areas[i] for i in m))
             if any(regions[q].rms <= 0.05 * self.tol_fit and tot[q] >= 8 and sum(topo.areas[i] for i in regions[q].faces) > 0.25 * a_sec for q in dentro):
+                Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)} left alone: a strong region owns it")
                 continue
             dentro_f = [q for q, (c0, ok) in enumerate(f_sec) if ok and c0 == c]
             # ⚠️ TWO PIECES ARE ENOUGH. How many quadrics a band breaks into
@@ -6803,7 +6879,29 @@ class Segmenter:
             sag_old = max([region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro] + [region_sag(frags[q].prim, topo, list(frags[q].faces)) for q in dentro_f])
             chk = sag_points(topo, faces)
             pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
+            # ⚠️ A TORUS REBUILT FROM STRIPS STAYS, THE BLEND GOES AROUND IT.
+            # On test8's finger tips two r0.3 cylinders, one inside the tip's
+            # blend and one straddling its edge (so left out of the patch),
+            # were merged into one torus by _merge_promote: now wholly inside
+            # the section, it dragged the patch over the rim where the height
+            # field folds, the fit failed, and the tip stayed a mosaic of
+            # fifteen quadrics (17 -> 35 faces). If that's why it fails, the
+            # patch is tried again on the rest, the torus kept as it is.
+            prom = [q for q in dentro if getattr(regions[q].prim, "promoted", False)]
+            if pr is None and prom:
+                keep_out = {i for q in prom for i in regions[q].faces}
+                faces2 = [i for i in faces if i not in keep_out]
+                dentro2 = [q for q in dentro if q not in prom]
+                if len(faces2) >= 4 * self.min_faces and len(dentro2) + len(dentro_f) >= min(2, self.blend_min):
+                    P2 = np.vstack([topo.verts[i] for i in faces2])
+                    N2 = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in faces2])
+                    sag2 = max([region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro2] + [region_sag(frags[q].prim, topo, list(frags[q].faces)) for q in dentro_f])
+                    chk2 = sag_points(topo, faces2)
+                    pr = fit_free(P2, N2, self.tol_fit, check=chk2, check_tol=2.0 * sag2 + 2.0 * self.tol_fit, soft=chk2)
+                    if pr is not None:
+                        faces, dentro, sag_old = faces2, dentro2, sag2
             if pr is None:
+                Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)}: no B-spline holds on its {len(faces)} facets ({len(dentro)} regions, {len(dentro_f)} fragments)")
                 continue
             drop |= set(dentro)
             busy = {i for k, R in enumerate(regions) if k not in drop for i in R.faces}
@@ -7116,12 +7214,23 @@ class Segmenter:
         for i in loose:
             comps[find(i)].append(i)
         add = defaultdict(list)
+        enclosed_add = defaultdict(list)
         for g in comps.values():
             if len(g) > 12:
                 continue
             nbrs = {owner[j] for i in g for j in topo.adj[i] if j in owner}
             if not nbrs:
                 continue
+            # ⚠️ AN ISLAND INSIDE ONE REGION IS A HOLE IN ITS FACE. Left out,
+            # it becomes an inner wire of the new face - and when it touches
+            # the outer boundary at a vertex, the face is valid in memory
+            # but "IntersectingWires" once written to STEP and read back
+            # (test13: one 0.04 mm2 triangle 1.5 microns off a torus, its
+            # normal 5.3 degrees off where 5 was the limit). There's no
+            # other surface it could go to: within the growth tolerance and
+            # 15 degrees it's taken, as it is, without a refit.
+            enclosed = len(nbrs) == 1
+            nd_max = 15.0 if enclosed else 5.0
             a_g = sum(topo.areas[i] for i in g)
             best, best_d = None, None
             for k in nbrs:
@@ -7134,14 +7243,18 @@ class Segmenter:
                     V = topo.verts[i]
                     d = float(np.abs(pk.dist(V)).max())
                     nd = normal_deviation(pk, V, np.tile(topo.norms[i], (len(V), 1)))
-                    if d > self.tol_grow or not np.isfinite(nd) or nd > 5.0:
+                    if d > self.tol_grow or not np.isfinite(nd) or nd > nd_max:
                         ok = False
                         break
                     dmax = max(dmax, d)
                 if ok and (best_d is None or dmax < best_d):
                     best, best_d = k, dmax
             if best is not None:
-                add[best] += g
+                (enclosed_add if enclosed else add)[best] += g
+        for k, g in enclosed_add.items():
+            found[k] = (found[k][0], sorted(set(found[k][1]) | set(g)))
+        if enclosed_add:
+            Log.debug(f"Islands enclosed by one region taken in: +{sum(len(g) for g in enclosed_add.values())}")
         if not add:
             return found
         n_add = 0
@@ -7763,6 +7876,37 @@ def edge_is_analytic(edge) -> bool:
         return False
 
 
+def _pin_ends(g, t1: float, t2: float, V1, V2):
+    """
+    ⚠️ AN INTERSECTION CURVE MUST END ON ITS VERTICES, NOT NEAR THEM. The
+    vertices come from the mesh, and the exact intersection of the two new
+    surfaces passes next to them, not through them: 0.7-3.7 microns on
+    test13's torus-torus edges. In memory the vertex tolerance covers it,
+    but STEP carries no tolerances: reading the file back, OpenCascade
+    closed the gap on ONE of the two faces with a "lacking" micro-edge,
+    and the part came back with two free edges. The curve between the
+    two parameters is made a B-spline whose end poles ARE the vertices
+    (clamped: the ends are the poles), so the pcurves computed from it
+    end there too. The change fades within the first and last span and
+    is no bigger than the gap. Returns (curve, t1, t2).
+    """
+    try:
+        GC = _m("GeomConvert").GeomConvert
+        tc = _m("Geom").Geom_TrimmedCurve(g, float(t1), float(t2))
+        bs = _st(GC, "CurveToBSplineCurve")(tc)
+        p1, p2 = bt_Pnt(V1), bt_Pnt(V2)
+        a, b = bs.FirstParameter(), bs.LastParameter()
+        gap = max(bs.Value(a).Distance(p1), bs.Value(b).Distance(p2))
+        if gap <= 1e-9 or gap > 0.2 * bs.Value(a).Distance(bs.Value(b)) or bs.NbPoles() < 4:
+            return g, t1, t2
+        bs.SetPole(1, p1)
+        bs.SetPole(bs.NbPoles(), p2)
+        return _keep(bs), float(a), float(b)
+    except Exception as ex:
+        Log.debug(f"pinning the intersection curve's ends failed: {ex}")
+        return g, t1, t2
+
+
 def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmid: Optional[np.ndarray], closed: bool, Pnext: Optional[np.ndarray] = None):
     """
     Analytic edge between two EXISTING vertices (shared with the
@@ -7812,6 +7956,8 @@ def make_edge_on_curve(cv: "_Curve", V1, V2, P1: np.ndarray, P2: np.ndarray, Pmi
             fwd_is_v1 = True
     if t2 - t1 < 1e-12:
         return None, fwd_is_v1
+    if isinstance(cv, CGeom):
+        g, t1, t2 = _pin_ends(g, t1, t2, V1, V2)
     me = _keep(BRepBuilderAPI_MakeEdge(g, V1, V2, t1, t2))
     if not me.IsDone():
         return None, fwd_is_v1
@@ -8790,6 +8936,55 @@ class Engine:
         ch.verts = core + [core[0]]
         return True
 
+    def _seam_clearance(self, loops, sp: SurfParam, A: int, B: int, r_eff: float) -> float:
+        """
+        ⚠️ THE SEAM MUST RUN INSIDE THE REGION, CLEAR OF ITS BOUNDARY. A
+        bore crossed by another hole (test13) is a full ring at one end and
+        two tongues elsewhere: the vertex pair best aligned in u sat on a
+        window's edge, the window's boundary ran alongside the seam and
+        crossed it, and the face came out "SelfIntersectingWire". This is
+        the margin, in u (as a length), between the seam line from A to B
+        and every boundary vertex lying between its two ends: the widest
+        wins, and the seam goes where the surface spans the whole band.
+        """
+        topo = self.topo
+        key = id(loops)
+        cache = getattr(self, "_clear_cache", None)
+        if cache is None or cache[0] != key:
+            allv = sorted({j for L in loops for ch in L.chains for j in ch.verts})
+            U_, V_ = sp.uv(topo.vpos[allv])
+            pos = {j: n for n, j in enumerate(allv)}
+            segs = np.array([(pos[a], pos[b]) for L in loops for ch in L.chains for a, b in zip(ch.verts[:-1], ch.verts[1:])], dtype=int).reshape(-1, 2)
+            cache = (key, U_, V_, segs, np.array(allv))
+            self._clear_cache = cache
+        _, Ub, Vb, segs, allv = cache
+        (ua,), (va,) = sp.uv(topo.vpos[A][None, :])
+        (_,), (vb,) = sp.uv(topo.vpos[B][None, :])
+        if sp.periodic_v:
+            rel = np.angle(np.exp(1j * (Vb - va)))
+            tgt = float(np.angle(np.exp(1j * (vb - va))))
+        else:
+            rel = Vb - va
+            tgt = float(vb - va)
+        lo, hi = (0.0, tgt) if tgt >= 0 else (tgt, 0.0)
+        # a boundary segment crossing the seam line: no seam there
+        if len(segs):
+            du = np.angle(np.exp(1j * (Ub - ua)))
+            d1, d2 = du[segs[:, 0]], du[segs[:, 1]]
+            opp = (d1 * d2 < 0) & (np.abs(d1) < math.pi / 2) & (np.abs(d2) < math.pi / 2)
+            ends = np.isin(allv[segs[:, 0]], (A, B)) | np.isin(allv[segs[:, 1]], (A, B))
+            opp &= ~ends
+            if opp.any():
+                r1, r2 = rel[segs[opp, 0]], rel[segs[opp, 1]]
+                w = d1[opp] / (d1[opp] - d2[opp])
+                vc = r1 + (r2 - r1) * w
+                if np.any((vc > lo + 1e-9) & (vc < hi - 1e-9)):
+                    return -1.0
+        m = (rel > lo + 1e-9) & (rel < hi - 1e-9)
+        if not m.any():
+            return math.inf
+        return float(np.abs(np.angle(np.exp(1j * (Ub[m] - ua)))).min()) * r_eff
+
     def _align_closed_chains(self, loops, sp: SurfParam) -> str:
         """
         Region closed 360 degrees: the seam will run from vertex A of the
@@ -8817,6 +9012,16 @@ class Engine:
         u2, _ = sp.uv(topo.vpos[c2])
         D = np.abs(np.angle(np.exp(1j * (u2[None, :] - u1[:, None]))))
         ia, ib = np.unravel_index(int(np.argmin(D)), D.shape)
+        r_eff = max(prim_radius(sp.prim), 1e-6)
+        # among the aligned pairs (each A with its best B), the seam with
+        # the widest margin from the boundary (see _seam_clearance)
+        pairs = [(a, int(np.argmin(D[a]))) for a in range(len(c1))]
+        pairs = [(a, b) for a, b in pairs if D[a, b] * r_eff <= self.max_edge_tol]
+        crossing = False
+        if pairs:
+            scored = [(self._seam_clearance(loops, sp, c1[a], c2[b], r_eff), -D[a, b], a, b) for a, b in pairs]
+            cl, _, ia, ib = max(scored)
+            crossing = cl < 0  # every aligned seam cuts the boundary: a path of mesh edges instead
         A, B = c1[ia], c2[ib]
         # ⚠️ HOLES WITH MULTIPLE ROWS OF FACETS: the two rings' vertices
         # aren't aligned (deviation up to 0.1 mm) and a straight seam
@@ -8825,10 +9030,11 @@ class Engine:
         # the surface, with both pcurves computed the same way as any other
         # edge.
         self._seam_path = None
-        r_eff = max(prim_radius(sp.prim), 1e-6)
-        if D[ia, ib] * r_eff > self.max_edge_tol:
+        if D[ia, ib] * r_eff > self.max_edge_tol or crossing:
             path = self._seam_path_search(set(c1), set(c2), sp, r_eff)
             if path is None:
+                if crossing:
+                    return "seam: every aligned seam crosses the region's boundary"
                 return f"seam: no aligned vertex on the second ring (deviation {D[ia, ib] * r_eff:.1e} mm)"
             A, B, edges = path
             self._seam_path = (A, B, edges)
@@ -8900,16 +9106,19 @@ class Engine:
         # B: the one in L2 with the closest u
         u1, _ = sp.uv(topo.vpos[v1])
         u2, _ = sp.uv(topo.vpos[v2])
-        best = None
+        cands = []
         for ia, ja in enumerate(v1):
             du = np.abs(np.angle(np.exp(1j * (u2 - u1[ia]))))
             ib = int(np.argmin(du))
-            if best is None or du[ib] < best[0]:
-                best = (float(du[ib]), ja, v2[ib])
+            cands.append((float(du[ib]), ja, v2[ib]))
             if id(L1.chains[0]) in new_edges and L1.chains[0].closed:
                 break  # A is forced
-        du, A, B = best
+        cands.sort(key=lambda c: c[0])
         r_eff = prim_radius(R.prim)
+
+        ok = [c for c in cands if c[0] * r_eff <= self.max_edge_tol]
+        best = max(ok, key=lambda c: (self._seam_clearance(loops, sp, c[1], c[2], r_eff), -c[0])) if len(ok) > 1 else (ok[0] if ok else cands[0])
+        du, A, B = best
         if du * r_eff > self.max_edge_tol:
             return None, f"seam: no aligned vertex on the second ring (deviation {du * r_eff:.1e} mm)"
         uA = float(sp.uv(topo.vpos[A][None, :])[0][0])

@@ -14,7 +14,7 @@ of the original. Reported:
 -v lists the details."""
 import sys, os, math
 import numpy as np
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import refit as R
 from collections import defaultdict, Counter
 from scipy.spatial import cKDTree

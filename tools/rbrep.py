@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Renders a B-Rep the way a CAD viewer would: shaded faces + black edges."""
-import sys, numpy as np
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+import sys, os, numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import PolyCollection, LineCollection

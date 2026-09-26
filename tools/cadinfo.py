@@ -1,7 +1,7 @@
 """Anatomy of a B-Rep: faces by surface type, edges by curve type."""
-import sys
+import sys, os
 import numpy as np
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import refit as R
 from collections import Counter
 from OCP.BRepAdaptor import BRepAdaptor_Surface, BRepAdaptor_Curve

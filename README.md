@@ -8,6 +8,52 @@ and is discarded if it doesn't pass the check. Whatever can't be converted stays
 was: the output file is always consistent with the input one, at worst it's just less "clean". There
 is no global Sewing and nothing is rebuilt globally.
 
+## Getting started
+
+### Requirements
+
+- Python 3.9+
+- [OpenCascade bindings](https://github.com/CadQuery/OCP) (`cadquery-ocp`), `numpy`, `scipy`
+- `pymeshlab` (optional but recommended: enables mesh repair, see below)
+
+```bash
+pip install cadquery-ocp numpy scipy pymeshlab
+```
+
+Works with OCP 7.x and 8.x. `cadquery-ocp` 8.0.1 is built against `vtk==9.6.2`: with a newer vtk
+(e.g. after a blanket `pip` upgrade) `import OCP` fails with "DLL load failed" — pin `vtk==9.6.2` if
+that happens. `scipy` is needed by the mesh check and by `tools/qa.py`; without `pymeshlab` the mesh
+check still runs (on `numpy` alone) and defects are reported but left unrepaired.
+
+### First run
+
+```bash
+python refit.py part.stl -a -b -c -a 0.005
+```
+
+This runs the default phase sequence (`A B C A`, see below) with tolerance `0.005` and writes
+`part.step` next to the input. A few of the bundled test meshes are a good first try:
+
+```bash
+python refit.py test0.stl -a -b -c -a 0.005
+```
+
+Then check the result against the input mesh:
+
+```bash
+python tools/qa.py test0.stl test0.step
+```
+
+and, for the test files that ship with their original CAD (`test0`, `test4`, `test10`, `test12`),
+compare face-by-face against the ground truth:
+
+```bash
+python tools/cadcmp.py test0_original.step test0.step -v
+```
+
+See the docstring at the top of [`refit.py`](refit.py) for the full guide (every flag, how to read
+the report, the final arc-snapping step).
+
 ## Mesh check (STL input)
 
 Before anything else the mesh is checked: triangles with a repeated vertex or zero area, duplicate
@@ -45,42 +91,35 @@ are reported but left in.
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A B C A` (the last one re-merges the planar faces split by the replacements).
 
-```
+```bash
 python refit.py part.stl -a -b -c -a 0.005
 ```
 
-See the docstring at the top of `refit.py` for the full guide (tolerances, how to read the report,
-the final arc-snapping step).
+## Repository layout
 
-## Requirements
-
-```
-pip install cadquery-ocp numpy scipy pymeshlab
-```
-
-Works with OCP 7.x and 8.x. `cadquery-ocp` 8.0.1 is built against `vtk==9.6.2`: with a newer vtk
-(e.g. after a blanket `pip` upgrade) `import OCP` fails with "DLL load failed". `scipy` is needed by the mesh
-check and by `qa.py`; `pymeshlab` (optional) repairs the mesh defects.
-
-## Files
-
-- `refit.py` — the main tool.
-- `qa.py` — checks an output against its input mesh: exact two-sided deviation (output → mesh and
-  mesh → output, so holes in the output show up too), validity, free edges, face and edge types,
-  tolerances. `python qa.py part.stl part.step`
-- `verify.py` — measures the deviation between an output and the starting mesh (one-sided, sampled).
-- `archi.py` — counts how many of the mesh's polylines are actually circular arcs.
-- `tassellate.py` — estimates how much curvature is left tessellated in the output.
-- `cadcmp.py` — compares an output face by face with the CAD file the mesh came from: faces
-  reproduced one to one, split or of the wrong type, radii and angles, mesh left over, polylines
-  where the CAD has a curve. `python cadcmp.py test10_original.step test10.step -v`
+- [`refit.py`](refit.py) — the main tool, run directly from the repo root.
+- [`tools/`](tools) — QA, analysis and debug scripts, all run from the repo root
+  (e.g. `python tools/qa.py ...`); each imports `refit.py` by locating it relative to its own path,
+  so the repo can be moved around freely as long as this layout is kept:
+  - [`tools/qa.py`](tools/qa.py) — checks an output against its input mesh: exact two-sided deviation
+    (output → mesh and mesh → output, so holes in the output show up too), validity, free edges,
+    face and edge types, tolerances. `python tools/qa.py part.stl part.step`
+  - [`tools/verify.py`](tools/verify.py) — measures the deviation between an output and the starting
+    mesh (one-sided, sampled).
+  - [`tools/archi.py`](tools/archi.py) — counts how many of the mesh's polylines are actually
+    circular arcs.
+  - [`tools/tassellate.py`](tools/tassellate.py) — estimates how much curvature is left tessellated
+    in the output.
+  - [`tools/cadcmp.py`](tools/cadcmp.py) — compares an output face by face with the CAD file the mesh
+    came from: faces reproduced one to one, split or of the wrong type, radii and angles, mesh left
+    over, polylines where the CAD has a curve. `python tools/cadcmp.py test10_original.step test10.step -v`
+  - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
+    `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
+    used during development.
 - `test0.stl` … `test13.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10` and
   `test12` come with the CAD file they were exported from (`testN_original.step`): the reference
-  for `cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six internal
+  for `tools/cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six internal
   cavities.
-- other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
-  `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
-  used during development.
 
 ## Branches
 

@@ -6,8 +6,8 @@ For every wire, the maximal runs of consecutive straight edges are taken and
 we try to fit: a line (meaning Phase A failed to merge it) or a circle. If it
 fits within tolerance, that run is a single curve in disguise as a polyline.
 """
-import sys, math
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+import sys, os, math
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import refit as R
 from collections import Counter

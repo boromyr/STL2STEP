@@ -3,9 +3,9 @@
 Ground truth: the original STEP file, aligned via ICP. A RAW mesh edge is
 "CAD" if the two facets sharing it belong to different original faces.
 """
-import sys, math
+import sys, os, math
 import numpy as np
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import refit as R
 from align import tri_of
 from icp import align, closest_on_tris

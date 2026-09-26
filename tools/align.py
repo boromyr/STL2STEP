@@ -2,9 +2,11 @@
 
 usage:  python align.py original.step ours.step
 """
-import sys, itertools
+import sys, os, itertools
+
 import numpy as np
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import refit as R
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRep import BRep_Tool

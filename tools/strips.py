@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-import sys, numpy as np, collections
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+import sys, os, numpy as np, collections
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import refit as R
 
 def main(path):

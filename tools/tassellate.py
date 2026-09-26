@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """How much CURVATURE is left tessellated in the output: planar faces bordering
 other planar faces with a dihedral angle between 1 and 30 degrees = a curved band cut into pieces."""
-import sys, math
-sys.path.insert(0, "D:/Users/PC/Desktop/refit")
+import sys, os, math
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import refit as R
 from OCP.BRepAdaptor import BRepAdaptor_Surface
