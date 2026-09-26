@@ -35,6 +35,12 @@ are reported but left in.
 - **Phase C** (`-c`): fillets, chamfers, countersinks, spotfaces, corner spheres, bosses — every
   region of facets that sits on a cylinder / cone / sphere / torus gets replaced by the analytic
   surface. Where no quadric describes the surface, the region is rebuilt with a B-spline.
+  A fillet along a curved edge that the tessellator cut into strips (each strip alone looks like a
+  cylinder or a cone) is merged back into one torus when the torus explains the strips better
+  than their own cylinders did. The walls of an extruded outline — a sketch with splines, embossed
+  or engraved text — become one surface swept along the extrusion direction: a cylinder when the
+  profile is a circular arc, otherwise a B-spline profile. Stretches tessellated so coarsely that
+  the mesh doesn't say where the curve runs stay planar.
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A B C A` (the last one re-merges the planar faces split by the replacements).

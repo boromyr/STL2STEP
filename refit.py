@@ -30,6 +30,13 @@ PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
                along a curved edge, a three-way fillet at a corner - the
                region is rebuilt with a B-spline (see "CURVED FILLETS"
                below). Disabled with --no-free.
+               A fillet along a curved edge cut by the tessellator into
+               strips (each one alone passes for a cylinder or a cone) is
+               merged back into one torus (Segmenter._merge_promote), and
+               the walls of an extruded outline - a spline sketch, embossed
+               text - become one surface swept along the extrusion
+               direction: a cylinder on a circular profile, otherwise a
+               B-spline profile (Segmenter._extrusion_bands).
 
 THE PHASES RUN IN THE ORDER THEY'RE WRITTEN, and none pulls another one in.
 Without flags the sequence is A B C A (the last one re-merges the planar
@@ -3075,6 +3082,108 @@ def fit_free(
     return None
 
 
+def fit_extrusion(P: np.ndarray, Nrep: np.ndarray, d: np.ndarray, tol: float, check: Optional[np.ndarray] = None, check_tol: Optional[float] = None, max_tilt_deg: float = 70.0, max_radius: float = math.inf, spline: bool = True) -> Optional[Prim]:
+    """
+    A B-spline profile swept along d: the wall of an extruded sketch.
+
+    ⚠️ AN EXTRUDED SPLINE IS NOT A QUADRIC, AND IT ISN'T A BLEND EITHER.
+    A pocket or a boss drawn with a spline outline (test9's whole outer
+    wall, the letters of the embossed text on test8 and test9) is a
+    surface of linear extrusion: the tessellator cuts it into planar
+    strips along the rulings, with every crease parallel to d. No
+    cylinder holds more than a strip or two (the curvature changes along
+    the outline), and _blend_patches never sees it (no quadric fragment
+    in the section): it stayed as 3 to 14 planar faces per curved stretch,
+    591 faces on test9.
+    The profile is a height field h(u) over the chord, fitted in 1D (a
+    strip has vertices only on its two rims, which project onto the SAME
+    profile point: a 2D fit would have nothing across the band), then
+    swept along d as a FreeForm whose poles don't change along v - the
+    exact extrusion, in the representation the engine already converts.
+    None when it doesn't hold within tol on the vertices and check_tol in
+    the facets' interior: better tessellated than invented.
+    ⚠️ A CIRCLE FIRST. A slot end or a small bore cut into three or four
+    strips is a cylinder the seeds can't see: five unknowns against the
+    handful of vertices, and the DOF filter rightly drops the fit. With
+    the axis known from the creases the circle has three unknowns in the
+    profile plane, and the cylinder is what the CAD had (test6: twelve
+    such bands would otherwise have become B-splines).
+    """
+    P_all = np.asarray(P, float)  # one row per Nrep row
+    P = np.unique(np.round(P_all, 9), axis=0)
+    Nrep = np.atleast_2d(np.asarray(Nrep, float))
+    d = np.asarray(d, float) / np.linalg.norm(d)
+    Nt = Nrep - np.outer(Nrep @ d, d)
+    Z = Nt.sum(axis=0)
+    if float(np.linalg.norm(Z)) < 1e-9:
+        return None
+    Z = Z / np.linalg.norm(Z)
+    ct = Nrep @ Z
+    if float(ct.min()) < math.cos(math.radians(max_tilt_deg)):
+        return None  # the profile folds back on itself
+    Y = d
+    X = np.cross(Y, Z)
+    X = X / np.linalg.norm(X)
+    C = P.mean(axis=0)
+    D = P - C
+    x, y, z = D @ X, D @ Y, D @ Z
+    ex, ey = float(np.ptp(x)), float(np.ptp(y))
+    if ex < 1e-9 or ey < 1e-9:
+        return None
+    xu = np.unique(np.round(x, 7))
+    if len(xu) < 4:
+        return None
+    prof = np.unique(np.round(np.c_[x, z], 9), axis=0)
+    if len(prof) >= 4:
+        try:
+            cx, cz, r = taubin_circle(prof[:, 0], prof[:, 1])
+        except Exception:
+            r = math.inf
+        if np.isfinite(r) and 0.0 < r <= max_radius:
+            cyl = lm_refine(Prim(AXIAL, C + cx * X + cz * Z, Y.copy(), float(r), 0.0), P, fix_r=None)
+            if cyl is not None and abs(cyl.slope) < 1e-9 and float(np.abs(cyl.axis @ Y)) >= math.cos(math.radians(1.0)):
+                cyl.slope = 0.0
+                dm = float(np.abs(cyl.dist(P)).max())
+                ok = dm <= tol and normal_deviation(cyl, P_all, Nrep) <= 10.0
+                if ok and check is not None and len(check) and check_tol is not None:
+                    ok = float(np.abs(cyl.dist(np.asarray(check, float))).max()) <= check_tol
+                if ok:
+                    cyl.rms = float(np.sqrt(np.mean(cyl.dist(P) ** 2)))
+                    return cyl
+    if not spline:
+        return None  # --no-free: circular profiles only
+    x0, x1 = x.min() - 0.06 * ex, x.max() + 0.06 * ex
+    y0, y1 = y.min() - 0.06 * ey, y.max() + 0.06 * ey
+    kv = _bs_knots(y0, y1, 4)
+    for nu in (4, 5, 6, 8, 10, 13, 16, 20, 25, 32, 40):
+        if nu > len(xu) + 2:
+            break
+        ku = _bs_knots(x0, x1, nu)
+        try:
+            B = _bs_basis(x, ku, nu)
+            Du = _d2_matrix(nu)
+            sc = float(np.linalg.norm(B)) / max(float(np.linalg.norm(Du)), 1e-12)
+            BtB, Btz, RtR = B.T @ B, B.T @ z, Du.T @ Du
+        except Exception:
+            continue
+        for lam in (1e-4, 1e-5, 1e-6, 1e-8):
+            try:
+                c = np.linalg.solve(BtB + (lam * sc**2) * RtR + 1e-10 * np.eye(nu), Btz)
+            except Exception:
+                continue
+            ff = FreeForm(C, X, Y, Z, np.repeat(c[:, None], 4, axis=1), ku, kv)
+            dv = float(np.abs(ff.dist(P)).max())
+            if dv > tol or not _free_tame(ff, x, y, z):
+                continue
+            pr = Prim(FREE, C, Z, 0.0, 0.0, 0.0, dv)
+            pr.free = ff
+            if check is None or not len(check) or check_tol is None:
+                return pr
+            if float(np.abs(ff.dist(np.asarray(check, float))).max()) <= check_tol:
+                return pr
+    return None
+
+
 def normal_deviation(prim: Prim, P: np.ndarray, Nrep: np.ndarray) -> float:
     """
     Mean angular deviation (degrees) between the faces' normals and the
@@ -3425,12 +3534,29 @@ def _refit(region, verts, norms, areas, kind) -> Optional[Prim]:
 # --- 5.7  full segmentation ----------------------------------------------------
 
 
-def refit_exact(faces_idx, verts, norms, areas, kind, stall: bool = False) -> Optional["Prim"]:
-    """_refit() followed by the LM refinement."""
+def refit_exact(faces_idx, verts, norms, areas, kind, stall: bool = False, init: Optional["Prim"] = None) -> Optional["Prim"]:
+    """_refit() followed by the LM refinement.
+    init: the region's current torus, also refined as a starting point."""
     p = _refit(set(faces_idx), verts, norms, areas, kind)
     P = np.vstack([verts[i] for i in faces_idx])
     Wt = np.concatenate([np.full(len(verts[i]), max(areas[i], 1e-12) / max(len(verts[i]), 1)) for i in faces_idx])
     q = lm_refine(p, P, Wt, stall=stall) if p is not None else None
+    # ⚠️ A THIN TORUS BAND HAS NO AXIS OF ITS OWN. fit_torus takes the
+    # revolution axis from the normals, and on a fillet band spanning a few
+    # degrees of its major circle the normals fit a cylinder's axis just as
+    # well: the construction degenerates (None) or LM lands on a different
+    # surface (test8: a r0.3 fillet corner refitted after the boundary
+    # reassignment came back as r0.08 at rms 1.5e-2). The torus the region
+    # already had is the better starting point: both are refined, the one
+    # closer to the points wins. Only for the tori _merge_promote built:
+    # elsewhere a torus the refit loses was a seed's guess, and keeping it
+    # alive turned a B-spline of test4's CAD into a spindle torus.
+    if init is not None and kind == TORUS and init.kind == TORUS and getattr(init, "promoted", False):
+        r = lm_refine(init, P, Wt, stall=stall)
+        if r is not None and (q is None or float(np.abs(r.dist(P)).max()) < float(np.abs(q.dist(P)).max())):
+            q = r
+        if q is not None:
+            q.promoted = True
     # ⚠️ second path for cylinders and cones: if the normals-based fit is
     # missing or poor (thin band, normals on a short arc), retry with the
     # revolution axis, which on those bands is the only one that holds up.
@@ -5597,7 +5723,7 @@ class Segmenter:
                     if pb is None or not self._worth_merging(pa, pb, tol_len):
                         continue
                     union = sorted(set(ra) | set(rb))
-                    p = refit_exact(union, topo.verts, topo.norms, topo.areas, pa.kind)
+                    p = refit_exact(union, topo.verts, topo.norms, topo.areas, pa.kind, init=pa)
                     if p is None:
                         continue
                     if abs(p.slope) < 1e-9:
@@ -5644,6 +5770,297 @@ class Segmenter:
             Log.debug(f"Co-surface merge ({tag}): {n0} -> {len(found)} regions")
         return found
 
+    def _tangent_join(self, pa, ra, pb, rb, cos_max: float) -> bool:
+        """
+        The two regions share facet edges, and along them the two surfaces
+        have the same normal (within acos(cos_max)): a smooth continuation,
+        not a crease.
+        """
+        topo = self.topo
+        sa, sb = set(ra), set(rb)
+        X = []
+        for i in ra:
+            for k in topo.f_edges[i]:
+                if any(f in sb for f in topo.e_faces[k]):
+                    X.extend(topo.e_verts[k])
+        if not X:
+            return False
+        X = topo.vpos[sorted(set(X))]
+        try:
+            c = np.abs(np.einsum("ij,ij->i", pa.normal_at(X), pb.normal_at(X)))
+        except Exception:
+            return False
+        return bool(np.all(np.isfinite(c)) and float(c.min()) >= cos_max)
+
+    def _torus_from_strips(self, pa, ra, pb, rb) -> Optional["Prim"]:
+        """
+        The torus two cylinder strips were cut from: their axes are tangent
+        to its spine circle, so the torus axis is normal to both, and the
+        center is where the two perpendiculars through the tangent points
+        meet. (fit_torus can't get there: see refit_exact.)
+        """
+        if pa.kind != AXIAL or pb.kind != AXIAL or abs(pa.slope) > 1e-9 or abs(pb.slope) > 1e-9:
+            return None
+        a1 = pa.axis / np.linalg.norm(pa.axis)
+        a2 = pb.axis / np.linalg.norm(pb.axis)
+        n = np.cross(a1, a2)
+        s = float(np.linalg.norm(n))
+        if s < math.sin(math.radians(0.2)):
+            return None
+        A = n / s
+        T = []
+        for p, a, rf in ((pa, a1, ra), (pb, a2, rb)):
+            c = np.vstack([self.topo.verts[i] for i in rf]).mean(axis=0)
+            T.append(p.center + float((c - p.center) @ a) * a)
+        try:
+            O = np.linalg.solve(np.array([a1, a2, A]), np.array([a1 @ T[0], a2 @ T[1], A @ (0.5 * (T[0] + T[1]))]))
+        except np.linalg.LinAlgError:
+            return None
+        R = 0.5 * float(np.linalg.norm(O - T[0]) + np.linalg.norm(O - T[1]))
+        if not np.isfinite(R) or R <= 0:
+            return None
+        return Prim(TORUS, O, A, R, 0.0, 0.5 * float(pa.r0 + pb.r0))
+
+    def _promote_plausible(self, pa, pb) -> bool:
+        """
+        Could these two be pieces of ONE surface of revolution? A cheap
+        geometric filter before the fits: _merge_promote tried every
+        tangent pair, and on test8 2,800 of 2,970 attempts (50 s of LM
+        fits) were fillets meeting a corner sphere or a different fillet.
+        What the successful ones have in common: cylinder strips of a torus
+        share the tube radius and their axes lie in one plane, tangent to
+        the spine circle; latitude bands (cones, spheres, tori) share the
+        axis. Generous margins: a pair let through costs only a fit.
+        """
+        tol = self.tol_grow
+        cyl = lambda p: p.kind == AXIAL and abs(p.slope) < 1e-9
+        a, b = (pa, pb) if _rank(pa) <= _rank(pb) else (pb, pa)
+
+        def unit(v):
+            return v / max(float(np.linalg.norm(v)), 1e-300)
+
+        def pt_line(q, c, ax):
+            d = q - c
+            return float(np.linalg.norm(d - float(d @ ax) * ax))
+
+        def close(x, y, f):
+            return abs(x - y) <= f * max(abs(x), abs(y)) + tol
+
+        def coaxial(p, q):
+            if p.axis is None or q.axis is None:
+                return False
+            ap, aq = unit(p.axis), unit(q.axis)
+            if abs(float(ap @ aq)) < math.cos(math.radians(2.0)):
+                return False
+            return pt_line(q.center, p.center, ap) <= 0.02 * max(prim_radius(p), prim_radius(q)) + tol
+
+        if a.kind == AXIAL and b.kind == AXIAL:
+            if cyl(a) and cyl(b):
+                a1, a2 = unit(a.axis), unit(b.axis)
+                n = np.cross(a1, a2)
+                s = float(np.linalg.norm(n))
+                if s < math.sin(math.radians(0.2)) or not close(a.r0, b.r0, 0.05):
+                    return False
+                return abs(float((b.center - a.center) @ (n / s))) <= 0.05 * a.r0 + tol
+            return coaxial(a, b)
+        if a.kind == AXIAL and b.kind == SPHERE:
+            if cyl(a):
+                return close(a.r0, b.r0, 0.2)
+            return pt_line(b.center, a.center, unit(a.axis)) <= 0.02 * b.r0 + tol
+        if a.kind == AXIAL and b.kind == TORUS:
+            if not cyl(a):
+                return coaxial(a, b)
+            at = unit(b.axis)
+            if not close(a.r0, b.r1, 0.05) or abs(float(unit(a.axis) @ at)) > math.sin(math.radians(3.0)):
+                return False
+            if abs(float((a.center - b.center) @ at)) > 0.05 * b.r1 + tol:
+                return False
+            return abs(pt_line(b.center, a.center, unit(a.axis)) - b.r0) <= 0.1 * b.r0 + 0.2 * b.r1 + tol
+        if a.kind == SPHERE and b.kind == SPHERE:
+            return close(a.r0, b.r0, 0.05) and float(np.linalg.norm(a.center - b.center)) <= 0.05 * a.r0 + tol
+        if a.kind == SPHERE and b.kind == TORUS:
+            return close(a.r0, b.r1, 0.2)
+        if a.kind == TORUS and b.kind == TORUS:
+            return close(a.r1, b.r1, 0.05) and abs(float(unit(a.axis) @ unit(b.axis))) >= math.cos(math.radians(5.0))
+        return True
+
+    def _promote_fit(self, pa, ra, pb, rb, union) -> Optional["Prim"]:
+        """
+        One surface for the union of two neighboring regions, or None.
+        The simplest type that explains every facet within its tolerance
+        wins, and it must also explain them about as well as the two pieces
+        did on their own.
+        ⚠️ WITHIN TOLERANCE IS NOT ENOUGH. A ø0.6 sphere corner and the
+        cylinder fillet tangent to it are two exact CAD surfaces (vertices
+        at 1e-7); a spindle torus passes through both within the tolerance
+        (6.6e-4) and merged them into one approximate face - test8's finger
+        tips. A torus cut into strips goes the other way: every strip's
+        cylinder is only an approximation (1e-5) and the true torus explains
+        the union BETTER than the pieces explained themselves. So the union
+        must explain EACH piece at most twice as badly (rms) as the piece's
+        own surface did, or within 5% of the tolerance, below which nothing
+        is visible. Per piece, not overall: an exact ø1 fillet merged with
+        a sloppy neighbor (rms 3e-4) into a "torus" R47.7 r47.4 because the
+        sloppy one set the bar for both.
+        And the tube keeps its size: a cylinder strip of a torus has the
+        tube's radius, a sphere or torus taking in a cylinder must have it
+        too (5%).
+        """
+        topo = self.topo
+        P = np.vstack([topo.verts[i] for i in union])
+        Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in union])
+        Wt = np.concatenate([np.full(len(topo.verts[i]), max(topo.areas[i], 1e-12) / max(len(topo.verts[i]), 1)) for i in union])
+        pieces = []
+        for p, rf in ((pa, ra), (pb, rb)):
+            Q = np.vstack([topo.verts[i] for i in rf])
+            pieces.append((p, Q, max(2.0 * float(np.sqrt(np.mean(p.dist(Q) ** 2))), 0.05 * self.tol_fit)))
+
+        # "exact" = a few float32 roundings of the coordinates (as in _exact_consensus)
+        eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(P).max()))
+
+        def fits_pieces(c):
+            improved = False
+            exact = True
+            for p, Q, lim in pieces:
+                r_c = float(np.sqrt(np.mean(c.dist(Q) ** 2)))
+                r_p = float(np.sqrt(np.mean(p.dist(Q) ** 2)))
+                if r_c > lim:
+                    return False
+                if p.kind == AXIAL and abs(p.slope) < 1e-9 and c.kind in (TORUS, SPHERE):
+                    tube = c.r1 if c.kind == TORUS else c.r0
+                    if abs(tube - p.r0) > 0.05 * p.r0 + self.tol_fit:
+                        return False
+                improved = improved or r_c < 0.5 * r_p
+                exact = exact and r_c <= 2.0 * eps
+            # ⚠️ AND IT MUST EXPLAIN SOMETHING. On test4's free-form zones
+            # (the CAD's B-splines) the seeds leave OSCULATING cylinders
+            # r4.2-5.3, and a torus through two of them is just as
+            # approximate as they are (union/piece rms 0.6-1.6): merged, it
+            # kept _blend_patches from replacing the zone with ONE B-spline,
+            # +5 faces. A torus cut into cylinder strips explains at least
+            # one strip far better than its cylinder did (ratio 0.0-0.3); a
+            # stack of latitude cones, each exact through its two circles,
+            # is explained exactly by the torus as well (1e-7). Either one.
+            return improved or exact
+
+        cands = []
+        c0 = self.choose_prim(union)
+        if c0 is not None:
+            cands.append(c0)
+        if self.allow_torus:
+            seeds = [x for x, rf in sorted(((pa, ra), (pb, rb)), key=lambda t: -len(t[1])) if x.kind == TORUS]
+            if not seeds:
+                seeds = [self._torus_from_strips(pa, ra, pb, rb)]
+            for t0 in seeds:
+                if t0 is None:
+                    continue
+                try:
+                    t = lm_refine(t0, P, Wt)
+                except Exception:
+                    t = None
+                if t is not None and t.r0 > 0 and t.r1 > 0:
+                    cands.append(t)
+        best = None
+        for c in cands:
+            if not self.kind_ok(c) or prim_radius(c) > self.max_radius:
+                continue
+            try:
+                d = float(np.abs(c.dist(P)).max())
+                nd = normal_deviation(c, P, Nrep)
+            except Exception:
+                continue
+            if not (np.isfinite(d) and np.isfinite(nd)) or nd > 15.0 or not fits_pieces(c):
+                continue
+            if not all(self.within(c, i) for i in union):
+                continue
+            key = (_rank(c), d)
+            if best is None or key < best[0]:
+                best = (key, c)
+        return None if best is None else best[1]
+
+    def _merge_promote(self, found, tag: str = ""):
+        """
+        ⚠️ A TORUS CUT INTO CYLINDERS. A fillet running along a CURVED edge
+        is a torus, and the tessellator cuts it into strips across the
+        edge: each strip has its vertices on just two meridian circles, and
+        a cylinder through those two circles holds them within a few
+        tenths of a micron. choose_prim tries the simplest surface first,
+        so every strip came out as its OWN cylinder, with the axis turned by
+        the strip's angle; _merge_cosurface only merges regions of the same
+        surface, and they aren't. test8: the fillet round the rim of the
+        disk (R14.75 r0.5) left as 18 cylinders 4 degrees apart, the one
+        along each finger's bend (R7) as 6. It's the same with the latitude
+        bands of a torus or a sphere: two coaxial circles always lie on one
+        cone, and a corner came out as a stack of cones.
+        Here two NEIGHBORING regions meeting TANGENTIALLY are refitted
+        together, the type reopened (cylinder, cone, sphere, torus: the
+        simplest that holds up), and merged when the single surface explains
+        every facet within its own tolerance - the same test each piece
+        passed on its own. A real crease, or a straight fillet meeting its
+        curved continuation, fails that test and stays two faces.
+        """
+        if self.only_cyl or len(found) < 2:
+            return found
+        topo = self.topo
+        kinds = (AXIAL, SPHERE, TORUS)
+        cos_max = math.cos(math.radians(8.0))
+        prims = [p for p, _ in found]
+        faces = [set(rf) for _, rf in found]
+        alive = [p is not None and p.kind in kinds for p in prims]
+        owner = {}
+        for k, fs in enumerate(faces):
+            for i in fs:
+                owner[i] = k
+        # ⚠️ A FAILED PAIR IS RETRIED ONLY ONCE THE UNION HAS GROWN BY A
+        # THIRD. A torus chain absorbs its strips one at a time, and every
+        # merge used to retry all its neighbors - the straight fillet the
+        # bend continues into was refitted after each of the 18 strips.
+        failed: Dict[Tuple[int, int], int] = {}
+        n_merge = 0
+        order = sorted(range(len(found)), key=lambda k: -len(faces[k]))
+        for k in order:
+            grew = True
+            while alive[k] and grew:
+                grew = False
+                nbrs = {owner[j] for i in faces[k] for j in topo.adj[i] if j in owner and owner[j] != k}
+                for q in sorted(nbrs, key=lambda q: -len(faces[q])):
+                    if not alive[q]:
+                        continue
+                    key = (min(k, q), max(k, q))
+                    n_u = len(faces[k]) + len(faces[q])
+                    if key in failed and n_u < 1.3 * failed[key]:
+                        continue
+                    failed[key] = n_u
+                    if not self._promote_plausible(prims[k], prims[q]):
+                        continue
+                    if not self._tangent_join(prims[k], faces[k], prims[q], faces[q], cos_max):
+                        continue
+                    union = sorted(faces[k] | faces[q])
+                    p = self._promote_fit(prims[k], faces[k], prims[q], faces[q], union)
+                    if p is None:
+                        continue
+                    if self._pinch_count(topo, union) > max(self._pinch_count(topo, faces[k]), self._pinch_count(topo, faces[q])):
+                        continue
+                    failed.pop(key, None)
+                    if abs(p.slope) < 1e-9:
+                        p.slope = 0.0
+                    p.promoted = True
+                    Log.debug(f"  promoted merge: {prims[k].label()} r {prims[k].r0:.4f} ({len(faces[k])}) + {prims[q].label()} r {prims[q].r0:.4f} ({len(faces[q])}) -> {p.label()} r {p.r0:.4f}{f' r1 {p.r1:.4f}' if p.kind == TORUS else ''} at {np.round(topo.vpos[topo.e_verts[topo.f_edges[union[0]][0]][0]], 2)}")
+                    prims[k] = p
+                    faces[k] = set(union)
+                    for i in faces[q]:
+                        owner[i] = k
+                    faces[q] = set()
+                    alive[q] = False
+                    prims[q] = None
+                    n_merge += 1
+                    grew = True
+                    break
+        if not n_merge:
+            return found
+        Log.debug(f"Promoted merge ({tag}): {len(found)} -> {len(found) - n_merge} regions")
+        return [(prims[k], sorted(faces[k])) for k in range(len(found)) if prims[k] is not None and faces[k]]
+
     def run(self) -> List[Region]:
         topo = self.topo
         nF = topo.nF
@@ -5666,6 +6083,7 @@ class Segmenter:
         # makes them merge on their own.
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
         found = self._merge_cosurface(found, "after the seeds")
+        found = self._merge_promote(found, "after the seeds")
         if self.only_cyl:
             # ⚠️ phase B converts only walls closed 360 degrees and concave:
             # the rest (outer fillets, arcs of slots, concave corner
@@ -5755,6 +6173,7 @@ class Segmenter:
         # split into two faces of 10.5 and 2.4 mm2 with three slivers in
         # between, and in the CAD it's ONE single face.
         found = self._merge_cosurface(found, "after recovery")
+        found = self._merge_promote(found, "after recovery")
         found = self._absorb_regions(found)
         found = [(self._review_type(pp, rf), rf) for pp, rf in found]
         cons = [self._exact_consensus(pp, rf) for pp, rf in found]
@@ -5763,6 +6182,7 @@ class Segmenter:
         found = self._absorb_exact(found, changed)
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
         regions = self._blend_patches(regions, frags)
+        regions = self._extrusion_bands(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
@@ -6395,6 +6815,148 @@ class Segmenter:
         Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
         return [R for k, R in enumerate(regions) if k not in drop] + extra
 
+    def _extrusion_bands(self, regions):
+        """
+        Unclaimed planar facets that are strips of an EXTRUDED outline
+        (see fit_extrusion): neighbors meeting at 0.3-30 degrees along a
+        crease, all the creases parallel to one direction d (within 3
+        degrees) and every facet's normal perpendicular to it. Each band
+        becomes one free-form face swept along d; a band that doesn't fit
+        is cut at its sharpest crease (a real corner of the outline, e.g.
+        the tip of a letter) and the pieces are tried again.
+        """
+        if self.only_cyl:
+            return regions
+        topo = self.topo
+        claimed = {i for R in regions for i in R.faces}
+        cand = [i for i in range(topo.nF) if i not in claimed and topo.planar[i] and len(topo.verts[i]) >= 3]
+        cset = set(cand)
+        c_lo, c_hi = math.cos(math.radians(30.0)), math.cos(math.radians(0.3))
+        cos3, sin3 = math.cos(math.radians(3.0)), math.sin(math.radians(3.0))
+        crease = {}
+        for i in cand:
+            ni = topo.norms[i]
+            for j in topo.adj[i]:
+                if j <= i or j not in cset:
+                    continue
+                c = float(ni @ topo.norms[j])
+                if c_lo <= c <= c_hi:
+                    dd = np.cross(ni, topo.norms[j])
+                    crease[(i, j)] = (dd / np.linalg.norm(dd), math.acos(min(1.0, c)))
+        if not crease:
+            return regions
+        nb = defaultdict(list)
+        for (i, j), (dd, _) in crease.items():
+            nb[i].append((j, dd))
+            nb[j].append((i, dd))
+        done = set()
+        bands = []
+        for (i, j), (d0, _) in sorted(crease.items(), key=lambda kv: -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]])):
+            if i in done or j in done:
+                continue
+            g = {i, j}
+            st = [i, j]
+            while st:
+                a = st.pop()
+                for b, dd in nb[a]:
+                    if b in g or b in done:
+                        continue
+                    if abs(float(dd @ d0)) >= cos3 and abs(float(topo.norms[b] @ d0)) <= sin3:
+                        g.add(b)
+                        st.append(b)
+            if len(g) >= 3:
+                done |= g
+                bands.append((g, d0))
+
+        out = []
+
+        def links(g):
+            return [(k, v[1]) for k, v in crease.items() if k[0] in g and k[1] in g]
+
+        def fit_band(g, d0, cut, depth):
+            if len(g) < 3:
+                return
+            fs = sorted(g)
+            # the extrusion direction: the band's creases averaged (sign-aligned)
+            ds = [crease[k][0] * (1.0 if float(crease[k][0] @ d0) >= 0 else -1.0) for k, _ in links(g) if k not in cut]
+            d = np.mean(ds, axis=0) if ds else d0
+            d = d / np.linalg.norm(d)
+            P = np.vstack([topo.verts[i] for i in fs])
+            Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in fs])
+            # a strip is a chord of the profile: its interior sits the chord's
+            # sag (w * angle / 8 on an arc) inside the true surface; twice that
+            ang = defaultdict(float)
+            for (a, b), th in links(g):
+                if (a, b) not in cut:
+                    ang[a] = max(ang[a], th)
+                    ang[b] = max(ang[b], th)
+            sag = 0.0
+            width = {}
+            for i in fs:
+                V = topo.verts[i] - np.outer(topo.verts[i] @ d, d)
+                w = float(np.max(np.linalg.norm(V[:, None, :] - V[None, :, :], axis=2)))
+                width[i] = w
+                sag = max(sag, w * ang[i] / 8.0)
+            # ⚠️ ...BUT NEVER PAST THE EDGE CEILING. On test9's big walls the
+            # strips are 11 mm wide: their chords sit 0.1-0.2 mm inside the
+            # curve, the spline through the vertices took all of it, and the
+            # rims came out with 0.14 mm tolerances. That coarse, the mesh
+            # doesn't say where the wall is: it stays as it was.
+            ceiling = max(20.0 * self.tol_fit, 2e-4 * self.diag)
+            pr = fit_extrusion(P, Nrep, d, self.tol_fit, check=sag_points(topo, fs), check_tol=min(2.0 * sag + 2.0 * self.tol_fit, ceiling), max_radius=self.max_radius, spline=self.allow_free)
+            if pr is not None:
+                if Log.level <= 10:
+                    chk = sag_points(topo, fs)
+                    Log.debug(f"  extruded band: {pr.label()}{f' r {pr.r0:.4f}' if pr.kind == AXIAL else ''} on {len(fs)} strips, d {np.round(d, 3)}, at {np.round(P.mean(axis=0), 2)}, vertices {float(np.abs(pr.dist(P)).max()):.1e}, inside the strips {float(np.abs(pr.dist(chk)).max()):.1e} (chord sag estimate {sag:.1e})")
+                out.append((pr, fs))
+                return
+            if depth >= 12:
+                return
+            live = [(k, th) for k, th in links(g) if k not in cut]
+            if not live:
+                return
+            # ⚠️ A STRAIGHT STRETCH IS A PLANE, NOT PART OF THE CURVE. A
+            # letter's outline runs straight, then bends: the tessellator
+            # makes the straight stretch ONE wide strip (a real planar face
+            # of the CAD) and the bend a row of narrow ones. A cubic through
+            # both overshoots along the straight chord by a tenth of a
+            # millimeter and the whole band failed (test8's "3 mm": 5 strips,
+            # one 1.45 mm wide next to four of 0.15). The strip far wider than
+            # the others leaves the band first; only then the sharpest crease.
+            i_w = max(fs, key=lambda i: width[i])
+            others = [w for i, w in width.items() if i != i_w]
+            if len(fs) >= 4 and others and width[i_w] > 3.0 * float(np.median(others)):
+                cut2 = cut | {k for k, _ in live if i_w in k}
+                g = set(g) - {i_w}
+                live = [(k, th) for k, th in live if i_w not in k]
+            else:
+                k_max = max(live, key=lambda t: t[1])[0]
+                cut2 = cut | {k_max}
+            # connected pieces over the creases left
+            par = {i: i for i in g}
+
+            def find(a):
+                while par[a] != a:
+                    par[a] = par[par[a]]
+                    a = par[a]
+                return a
+
+            for (a, b), _ in live:
+                if (a, b) not in cut2:
+                    par[find(a)] = find(b)
+            comps = defaultdict(set)
+            for i in g:
+                comps[find(i)].add(i)
+            for c in comps.values():
+                fit_band(c, d, cut2, depth + 1)
+
+        for g, d0 in bands:
+            fit_band(g, d0, frozenset(), 0)
+        if not out:
+            return regions
+        Log.debug(f"Extruded bands: {len(out)} swept faces ({sum(1 for p, _ in out if p.kind == AXIAL)} cylinders) in place of {sum(len(f) for _, f in out)} planar strips")
+        return regions + [describe_region(p, topo, fs) for p, fs in out]
+
     def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
         """
         A free-form patch takes the loose facets next to it that lie near its
@@ -6586,7 +7148,7 @@ class Segmenter:
         for k, g in add.items():
             p0, rf = found[k]
             union = sorted(set(rf) | set(g))
-            p2 = refit_exact(union, topo.verts, topo.norms, topo.areas, p0.kind)
+            p2 = refit_exact(union, topo.verts, topo.norms, topo.areas, p0.kind, init=p0)
             if p2 is None or prim_radius(p2) > self.max_radius:
                 continue
             if any(not self.within(p2, i) for i in rf):
@@ -6631,7 +7193,7 @@ class Segmenter:
             if not add:
                 continue
             union = sorted(base | set(add))
-            p2 = refit_exact(union, topo.verts, topo.norms, topo.areas, p.kind)
+            p2 = refit_exact(union, topo.verts, topo.norms, topo.areas, p.kind, init=p)
             if p2 is None or prim_radius(p2) > self.max_radius:
                 continue
             # ⚠️ the STARTING facets must stay explained by the refitted
@@ -6697,7 +7259,7 @@ class Segmenter:
             moved_total += moved
             for k in range(len(found)):
                 if len(sets[k]) >= 3:
-                    p2 = refit_exact(sorted(sets[k]), topo.verts, topo.norms, topo.areas, prims[k].kind)
+                    p2 = refit_exact(sorted(sets[k]), topo.verts, topo.norms, topo.areas, prims[k].kind, init=prims[k])
                     if p2 is not None:
                         if abs(p2.slope) < 1e-9:
                             p2.slope = 0.0
@@ -8503,9 +9065,24 @@ class Engine:
                 # deviation in parameters: the vertices lie on the surface
                 # within the noise, so a small deviation is normal and the
                 # tolerance covers it; a deviation of ~2pi is an unwrapping error
-                # (u, v) are lengths on a plane or a free-form patch, angles elsewhere
-                r_eff = 1.0 if sp.prim.kind in (PLANE, FREE) else max(prim_radius(sp.prim), 1e-3)
-                if gap * r_eff > 4.0 * self.max_edge_tol:
+                # ⚠️ MEASURED WITH THE SURFACE'S OWN METRIC. (u, v) are
+                # lengths on a plane or a free-form patch, angles elsewhere -
+                # and on a torus v is the TUBE's angle: scaling it by the
+                # major radius made a 2.4-micron gap on test8's rim fillet
+                # (R14.75 r0.5) count as 0.07 mm, thirty times too much, and
+                # the whole 131-facet torus was rejected.
+                du, dv = u_prev - u_start, v_prev - v_start
+                pk = sp.prim
+                if pk.kind in (PLANE, FREE):
+                    glen = math.hypot(du, dv)
+                elif pk.kind == TORUS:
+                    glen = math.hypot(du * (pk.r0 + pk.r1 * math.cos(v_start)), dv * pk.r1)
+                elif pk.kind == SPHERE:
+                    glen = pk.r0 * math.hypot(du * math.cos(v_start), dv)
+                else:
+                    rv = pk.r0 + (v_start * math.sin(sp.alpha) if abs(pk.slope) >= 1e-12 else 0.0)
+                    glen = math.hypot(du * max(abs(rv), 1e-3), dv)
+                if glen > 4.0 * self.max_edge_tol:
                     return f"wire not closed in parameter space (deviation {gap:.1e}, du {u_prev - u_start:+.3f} dv {v_prev - v_start:+.3f})"
             out.append((w, worst, worst_own))
         return out
