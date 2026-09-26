@@ -37,6 +37,12 @@ PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
                text - become one surface swept along the extrusion
                direction: a cylinder on a circular profile, otherwise a
                B-spline profile (Segmenter._extrusion_bands).
+               A constant-radius fillet between two curved walls - a hole
+               meeting another hole, a round meeting a bore - is neither a
+               torus nor a cylinder: its width changes all along. It's
+               rebuilt from the two walls and the ball rolling between them
+               (RollingBall, Segmenter._rolling_fillets) as one B-spline
+               face, the ball's radius measured on the mesh.
 
 THE PHASES RUN IN THE ORDER THEY'RE WRITTEN, and none pulls another one in.
 Without flags the sequence is A B C A (the last one re-merges the planar
@@ -3184,6 +3190,448 @@ def fit_extrusion(P: np.ndarray, Nrep: np.ndarray, d: np.ndarray, tol: float, ch
     return None
 
 
+# --- 5.3c  rolling-ball fillets -----------------------------------------------
+#
+# ⚠️ A FILLET BETWEEN TWO CURVED WALLS IS NOT A QUADRIC. A constant-radius
+# fillet is the surface swept by a ball rolling in contact with two walls:
+# between a plane and a coaxial cylinder the ball's centre runs on a circle
+# (a torus), between two planes on a line (a cylinder), but between two
+# cylinders with crossing axes - a hole meeting another hole - it runs on a
+# saddle-shaped 3D curve, and the CAD writes the fillet as a B-spline. Its
+# visible width changes all along (test13: 0.3 to 1.57 mm for r = 1, as the
+# walls meet at 17 to 90 degrees), and so does the curvature along it. The
+# quadric fit cuts it into dozens of osculating tori and cylinders (plus
+# tori of the wrong family with R - r = 1), the height-field B-spline can't
+# take it either (it turns 180 degrees around the bore), and it stayed a
+# mosaic of 20 tori and 200 planar chips per fillet.
+# The surface is rebuilt from what defines it: the two walls (already
+# recognized), the radius and the side the ball sits on. Its centre solves
+#     A.dist(c) = sA * rho,   B.dist(c) = sB * rho
+# (a 3D curve, the spine), and the fillet is the arc of radius rho around the
+# spine between the two contact points. It's written as a tensor B-spline
+# with the arc across (u, 0 on A and 1 on B) and the spine's length along
+# (v): the same kind of surface the CAD exports, not a height field.
+
+
+def _bs_basis_d1(t: np.ndarray, kv: np.ndarray, n: int, deg: int = _BS_DEG):
+    """(N, dN/dt): values and first derivatives of the n basis functions."""
+    t = np.clip(np.asarray(t, float), kv[0], kv[-1])
+    N = np.zeros((len(t), n + deg))
+    idx = np.clip(np.searchsorted(kv, t, side="right") - 1, deg, n - 1)
+    N[np.arange(len(t)), idx] = 1.0
+    low = None
+    for d in range(1, deg + 1):
+        if d == deg:
+            low = N.copy()  # degree deg-1: the derivative is made of these
+        Nn = np.zeros_like(N)
+        for i in range(n + deg - d):
+            d1 = kv[i + d] - kv[i]
+            d2 = kv[i + d + 1] - kv[i + 1]
+            a = (t - kv[i]) / d1 * N[:, i] if d1 > 0 else 0.0
+            b = (kv[i + d + 1] - t) / d2 * N[:, i + 1] if d2 > 0 else 0.0
+            Nn[:, i] = a + b
+        N = Nn
+    dN = np.zeros((len(t), n))
+    for i in range(n):
+        d1 = kv[i + deg] - kv[i]
+        d2 = kv[i + deg + 1] - kv[i + 1]
+        a = low[:, i] / d1 if d1 > 0 else 0.0
+        b = low[:, i + 1] / d2 if d2 > 0 else 0.0
+        dN[:, i] = deg * (a - b)
+    return N[:, :n], dN
+
+
+def _occ_knots(kk: np.ndarray):
+    """Full knot vector -> (distinct knots, multiplicities) for OpenCascade."""
+    vals = np.unique(np.round(kk, 12))
+    ka = TColStd_Array1OfReal(1, len(vals))
+    ma = TColStd_Array1OfInteger(1, len(vals))
+    for i, t in enumerate(vals):
+        ka.SetValue(i + 1, float(t))
+        ma.SetValue(i + 1, int((np.abs(kk - t) < 1e-12).sum()))
+    return ka, ma
+
+
+class SplineSurf:
+    """
+    Cubic tensor B-spline with 3D poles (nu, nv, 3) and clamped knots: a
+    free-form surface that ISN'T a height field. Same interface as FreeForm
+    (uv / point / dist / normal_at / geom), with (u, v) found by projection:
+    the nearest node of a sampled grid, then Newton on the surface itself,
+    so the parameters are exactly Geom_BSplineSurface's.
+    """
+
+    def __init__(self, poles: np.ndarray, ku: np.ndarray, kv: np.ndarray):
+        self.poles = np.asarray(poles, float)
+        self.ku, self.kv = np.asarray(ku, float), np.asarray(kv, float)
+        nu, nv = self.poles.shape[:2]
+        # SurfParam reads a frame for FREE; only FreeForm's uv() uses it
+        self.C = self.poles.reshape(-1, 3).mean(axis=0)
+        self.X, self.Y, self.Z = np.eye(3)
+        gu = np.linspace(self.ku[0], self.ku[-1], max(4 * nu, 24))
+        gv = np.linspace(self.kv[0], self.kv[-1], max(6 * nv, 60))
+        GU, GV = np.meshgrid(gu, gv, indexing="ij")
+        self._gu, self._gv = GU.ravel(), GV.ravel()
+        self._gp = self.point(self._gu, self._gv)
+        self._tree = None
+
+    def _eval(self, u, v, der: bool = True):
+        u = np.atleast_1d(np.asarray(u, float))
+        v = np.atleast_1d(np.asarray(v, float))
+        nu, nv = self.poles.shape[:2]
+        Bu, dBu = _bs_basis_d1(u, self.ku, nu)
+        Bv, dBv = _bs_basis_d1(v, self.kv, nv)
+        S = np.einsum("ni,ijk,nj->nk", Bu, self.poles, Bv)
+        if not der:
+            return S
+        return S, np.einsum("ni,ijk,nj->nk", dBu, self.poles, Bv), np.einsum("ni,ijk,nj->nk", Bu, self.poles, dBv)
+
+    def point(self, u, v) -> np.ndarray:
+        return self._eval(u, v, der=False)
+
+    def uv(self, P: np.ndarray, iters: int = 12):
+        P = np.atleast_2d(np.asarray(P, float))
+        if self._tree is None:
+            from scipy.spatial import cKDTree
+
+            self._tree = cKDTree(self._gp)
+        _, k = self._tree.query(P)
+        u, v = self._gu[k].copy(), self._gv[k].copy()
+        for _ in range(iters):
+            S, Su, Sv = self._eval(u, v)
+            r = P - S
+            a11 = np.einsum("ij,ij->i", Su, Su)
+            a12 = np.einsum("ij,ij->i", Su, Sv)
+            a22 = np.einsum("ij,ij->i", Sv, Sv)
+            b1 = np.einsum("ij,ij->i", Su, r)
+            b2 = np.einsum("ij,ij->i", Sv, r)
+            det = a11 * a22 - a12 * a12
+            det = np.where(np.abs(det) < 1e-300, 1e-300, det)
+            du = (a22 * b1 - a12 * b2) / det
+            dv = (a11 * b2 - a12 * b1) / det
+            u = np.clip(u + du, self.ku[0], self.ku[-1])
+            v = np.clip(v + dv, self.kv[0], self.kv[-1])
+            if max(float(np.abs(du).max()), float(np.abs(dv).max())) < 1e-13:
+                break
+        return u, v
+
+    def _frame(self, u, v):
+        S, Su, Sv = self._eval(u, v)
+        n = np.cross(Su, Sv)
+        return S, n / np.maximum(np.linalg.norm(n, axis=1), 1e-300)[:, None]
+
+    def dist(self, P: np.ndarray) -> np.ndarray:
+        """Signed perpendicular distance (positive along Su x Sv)."""
+        P = np.atleast_2d(np.asarray(P, float))
+        S, n = self._frame(*self.uv(P))
+        return np.einsum("ij,ij->i", P - S, n)
+
+    def normal_at(self, P: np.ndarray) -> np.ndarray:
+        return self._frame(*self.uv(np.atleast_2d(P)))[1]
+
+    def geom(self):
+        nu, nv = self.poles.shape[:2]
+        arr = TColgp_Array2OfPnt(1, nu, 1, nv)
+        for i in range(nu):
+            for j in range(nv):
+                arr.SetValue(i + 1, j + 1, _mk_pnt(self.poles[i, j]))
+        kau, mau = _occ_knots(self.ku)
+        kav, mav = _occ_knots(self.kv)
+        return Geom_BSplineSurface(arr, kau, kav, mau, mav, _BS_DEG, _BS_DEG, False, False)
+
+
+class RollingBall:
+    """
+    The ball of radius rho touching walls A and B: centre c with
+    A.dist(c) = sA*rho and B.dist(c) = sB*rho (sA, sB: the side it sits on).
+    The contact points are c - sA*rho*nA(c) and c - sB*rho*nB(c).
+    """
+
+    def __init__(self, A: Prim, B: Prim, sA: float, sB: float, rho: float):
+        self.A, self.B = A, B
+        self.sA, self.sB, self.rho = float(sA), float(sB), float(rho)
+        self.spine = None  # (points, arc length) once marched
+
+    def _tangent(self, c):
+        t = np.cross(self.A.normal_at(c), self.B.normal_at(c))
+        tl = np.linalg.norm(t, axis=1)
+        return t / np.maximum(tl, 1e-300)[:, None], tl
+
+    def centre(self, c0, P=None, plane_pt=None, plane_n=None, iters: int = 40):
+        """
+        Newton onto the spine. Third equation: the centre is in the plane
+        through P normal to the spine (the foot of P), or in a given plane.
+        Returns (c, ok).
+        """
+        c = np.array(c0, float)
+        ok = np.ones(len(c), bool)
+        for _ in range(iters):
+            nA, nB = self.A.normal_at(c), self.B.normal_at(c)
+            t, tl = self._tangent(c)
+            if P is not None:
+                f3, g3 = np.einsum("ij,ij->i", c - P, t), t
+            else:
+                f3, g3 = np.einsum("ij,ij->i", c - plane_pt, plane_n), plane_n
+            F = np.c_[self.A.dist(c) - self.sA * self.rho, self.B.dist(c) - self.sB * self.rho, f3]
+            J = np.stack([nA, nB, g3], axis=1)
+            bad = (np.abs(np.linalg.det(J)) < 1e-10) | (tl < 1e-6)
+            J[bad] = np.eye(3)
+            dc = np.linalg.solve(J, -F[:, :, None])[:, :, 0]
+            dc[bad] = 0.0
+            ok &= ~bad
+            st = np.linalg.norm(dc, axis=1)
+            dc *= np.minimum(1.0, 0.5 * self.rho / np.maximum(st, 1e-300))[:, None]
+            c = c + dc
+            if float(st.max()) < 1e-12:
+                break
+        # a centre that doesn't sit on both offsets isn't a centre
+        ok &= (np.abs(self.A.dist(c) - self.sA * self.rho) <= 1e-6 * self.rho) & (np.abs(self.B.dist(c) - self.sB * self.rho) <= 1e-6 * self.rho)
+        return c, ok
+
+    def contacts(self, c):
+        """Unit vectors from the centre to the contact points on A and on B."""
+        return -self.sA * self.A.normal_at(c), -self.sB * self.B.normal_at(c)
+
+    def _arc_frame(self, c):
+        a, b = self.contacts(c)
+        cab = np.clip(np.einsum("ij,ij->i", a, b), -1.0, 1.0)
+        e2 = b - cab[:, None] * a
+        e2 /= np.maximum(np.linalg.norm(e2, axis=1), 1e-300)[:, None]
+        return a, e2, np.arccos(cab)
+
+    def foot(self, P, c0, iters: int = 40):
+        """(centre, |P - c| - rho, theta across the arc: 0 on A, 1 on B, ok)."""
+        c, ok = self.centre(c0, P=P, iters=iters)
+        w = P - c
+        res = np.linalg.norm(w, axis=1) - self.rho
+        a, e2, ph = self._arc_frame(c)
+        th = np.arctan2(np.einsum("ij,ij->i", w, e2), np.einsum("ij,ij->i", w, a)) / np.maximum(ph, 1e-12)
+        return c, res, th, ok & (ph > 1e-3)
+
+    def surface_point(self, c, th, dr=None):
+        a, e2, ph = self._arc_frame(c)
+        ang = np.asarray(th, float) * ph
+        rr = self.rho if dr is None else (self.rho + np.asarray(dr, float))[:, None]
+        return c + rr * (np.cos(ang)[:, None] * a + np.sin(ang)[:, None] * e2)
+
+    def march(self, c_start: np.ndarray, length: float, h: float, near=None, reach: float = 0.0):
+        """Spine polyline through c_start, up to `length` each way (stops
+        where the walls turn parallel and the ball has nowhere to sit, and,
+        given the data's centres `near`, once it is `reach` past them)."""
+        tree = None
+        if near is not None and len(near):
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(np.asarray(near, float))
+        runs = {}
+        for sgn in (1.0, -1.0):
+            pts = []
+            c = np.asarray(c_start, float)[None, :]
+            d = sgn * self._tangent(c)[0][0]
+            s, hk = 0.0, h
+            while s < length:
+                cp = c + hk * d
+                cn, ok = self.centre(cp, plane_pt=cp, plane_n=d[None, :])
+                step = float(np.linalg.norm(cn - c))
+                if not ok[0] or step < 0.2 * hk or step > 3.0 * hk:
+                    break
+                tn, tl = self._tangent(cn)
+                if tl[0] < 1e-3:
+                    break
+                dn = tn[0] if float(tn[0] @ d) >= 0.0 else -tn[0]
+                # the step follows the bend: about 3 degrees of turn at most
+                kap = math.acos(min(1.0, float(dn @ d))) / step
+                hk = min(h, max(0.02 * h, 0.05 / max(kap, 1e-12)))
+                d = dn
+                s += step
+                pts.append(cn[0])
+                c = cn
+                if len(pts) > 8 and float(np.linalg.norm(cn[0] - c_start)) < 0.5 * h:
+                    break  # the spine closed on itself
+                if tree is not None and tree.query(cn[0])[0] > reach:
+                    break
+            runs[sgn] = pts
+        S = np.array(runs[-1.0][::-1] + [np.asarray(c_start, float)] + runs[1.0])
+        L = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(S, axis=0), axis=1))])
+        self.spine = (S, L)
+        return S, L
+
+    def spine_param(self, c: np.ndarray) -> np.ndarray:
+        """Arc length along the marched spine of centres lying on it."""
+        S, L = self.spine
+        if getattr(self, "_stree", None) is None or self._stree[0] is not S:
+            from scipy.spatial import cKDTree
+
+            self._stree = (S, cKDTree(S))
+        c = np.atleast_2d(np.asarray(c, float))
+        _, j = self._stree[1].query(c)
+        best_s = L[j].astype(float)
+        best_d = np.linalg.norm(S[j] - c, axis=1)
+        for off in (-1, 0):  # the segments before and after the nearest node
+            a = np.clip(j + off, 0, len(S) - 2)
+            seg = S[a + 1] - S[a]
+            sl = np.maximum(np.einsum("ij,ij->i", seg, seg), 1e-300)
+            t = np.clip(np.einsum("ij,ij->i", c - S[a], seg) / sl, 0.0, 1.0)
+            d = np.linalg.norm(S[a] + t[:, None] * seg - c, axis=1)
+            m = d < best_d
+            best_d = np.where(m, d, best_d)
+            best_s = np.where(m, L[a] + t * np.sqrt(sl), best_s)
+        return best_s
+
+    def spine_point(self, s: np.ndarray) -> np.ndarray:
+        """Exact spine points at arc lengths s (interpolated, then projected)."""
+        S, L = self.spine
+        s = np.clip(np.asarray(s, float), L[0], L[-1])
+        c0 = np.c_[np.interp(s, L, S[:, 0]), np.interp(s, L, S[:, 1]), np.interp(s, L, S[:, 2])]
+        t, _ = self._tangent(c0)
+        c, _ = self.centre(c0, plane_pt=c0, plane_n=t)
+        return c
+
+    def spine_analytic(self, tol: float) -> bool:
+        """The spine is a line or a circle: the fillet is a cylinder or a
+        torus, and the quadric fit already does it exactly."""
+        S = self.spine[0]
+        if len(S) < 5:
+            return True
+        ctr = S.mean(axis=0)
+        _, sv, Vt = np.linalg.svd(S - ctr)
+        if float(np.abs((S - ctr) @ Vt[1:].T).max()) <= tol:
+            return True
+        if float(np.abs((S - ctr) @ Vt[2]).max()) > tol:
+            return False
+        x, y = (S - ctr) @ Vt[0], (S - ctr) @ Vt[1]
+        try:
+            cx, cy, r = taubin_circle(x, y)
+        except Exception:
+            return False
+        return bool(np.isfinite(r) and float(np.abs(np.hypot(x - cx, y - cy) - r).max()) <= tol)
+
+
+def _bs_knots_graded(t0: float, t1: float, n: int, ts: np.ndarray, w: np.ndarray, deg: int = _BS_DEG) -> np.ndarray:
+    """Clamped knots for n poles, spaced so that every span holds the same
+    integral of the density w (sampled at ts)."""
+    cw = np.concatenate([[0.0], np.cumsum(0.5 * (w[1:] + w[:-1]) * np.diff(ts))])
+    inner = np.interp(np.linspace(0.0, cw[-1], n - deg + 1), cw, ts)
+    inner[0], inner[-1] = t0, t1
+    return np.concatenate([np.full(deg, t0), inner, np.full(deg, t1)])
+
+
+def _fillet_domain(ball: RollingBall, th: np.ndarray, s: np.ndarray):
+    """
+    (theta0, theta1, s0, s1): the data's footprint plus a margin.
+    ⚠️ SMALL MARGINS. Past the data the spine may run on a wall's phantom
+    extension: on test13 the ball between the bore and the slot's R2 round,
+    once the round turns tangent into a plane, keeps rolling around the
+    round's axis with a radius under rho (0.44 mm) - a folded tube nobody
+    needs. The margin only has to catch the rim's projection.
+    """
+    d0, d1 = float(th.min()), float(th.max())
+    mt = 0.05 * max(d1 - d0, 0.2)
+    L = ball.spine[1]
+    e0, e1 = float(s.min()), float(s.max())
+    ms = max(0.02 * (e1 - e0), 0.02 * ball.rho)
+    return max(d0 - mt, -0.5), min(d1 + mt, 1.5), max(e0 - ms, float(L[0])), min(e1 + ms, float(L[-1]))
+
+
+class FilletCorrection:
+    """Radial correction h(theta, s) over a rolling-ball surface: a cubic
+    tensor B-spline, constant past its domain."""
+
+    def __init__(self, coef: np.ndarray, ku: np.ndarray, kv: np.ndarray):
+        self.coef, self.ku, self.kv = coef, ku, kv
+
+    def __call__(self, th, s) -> np.ndarray:
+        Bu = _bs_basis(np.clip(th, self.ku[0], self.ku[-1]), self.ku, self.coef.shape[0])
+        Bv = _bs_basis(np.clip(s, self.kv[0], self.kv[-1]), self.kv, self.coef.shape[1])
+        return np.einsum("ni,ij,nj->n", Bu, self.coef, Bv)
+
+
+def fit_fillet_correction(dom, th, s, r, th_c, s_c, r_c, tol: float, check_tol: float, soft_w: float = 0.05) -> Optional[FilletCorrection]:
+    """
+    ⚠️ THE MESH ISN'T ON THE EXACT FILLET EITHER. The CAD writes a
+    rolling-ball fillet as a B-spline that approximates it (test13: 5 poles
+    across a 90-degree arc, 1e-3 off the true circle), and the mesh is cut
+    from that B-spline: 5e-4 to 1.6e-3 from the exact surface in places,
+    three times tol_fit; where the ball changes wall (the bore turning
+    tangent into the top edge's round) the exact surface of the first pair
+    is off the same way. The rolling ball stays the model and a smooth
+    radial correction h(theta, s) takes the difference, fitted like
+    fit_free: the sparsest grid with the strongest smoothing that brings
+    the vertices within tol and keeps the facets' interior (weak data)
+    within check_tol. None if nothing does.
+    """
+    t0, t1, s0, s1 = dom
+    n = len(th)
+    for nv in (4, 6, 8, 12, 16, 24, 32):
+        for nu in (4, 5, 6):
+            if nu * nv > max(16, n // 2):
+                continue
+            ku, kv = _bs_knots(t0, t1, nu), _bs_knots(s0, s1, nv)
+            A = (_bs_basis(np.clip(th, t0, t1), ku, nu)[:, :, None] * _bs_basis(np.clip(s, s0, s1), kv, nv)[:, None, :]).reshape(n, nu * nv)
+            Ac = (_bs_basis(np.clip(th_c, t0, t1), ku, nu)[:, :, None] * _bs_basis(np.clip(s_c, s0, s1), kv, nv)[:, None, :]).reshape(len(th_c), nu * nv)
+            Du, Dv = _d2_matrix(nu), _d2_matrix(nv)
+            Rg = np.vstack([np.kron(Du, np.eye(nv)), np.kron(np.eye(nu), Dv)])
+            sc = float(np.linalg.norm(A)) / max(float(np.linalg.norm(Rg)), 1e-12)
+            AtA = A.T @ A + soft_w**2 * (Ac.T @ Ac)
+            Atb = A.T @ r + soft_w**2 * (Ac.T @ r_c)
+            RtR = Rg.T @ Rg
+            for lam in (1e-3, 1e-4, 1e-5, 1e-6):
+                try:
+                    c = np.linalg.solve(AtA + (lam * sc**2) * RtR + (1e-6 * sc**2) * np.eye(nu * nv), Atb)
+                except np.linalg.LinAlgError:
+                    continue
+                if float(np.abs(A @ c - r).max()) > tol or float(np.abs(Ac @ c - r_c).max()) > check_tol:
+                    continue
+                return FilletCorrection(c.reshape(nu, nv), ku, kv)
+    return None
+
+
+def fillet_spline(ball: RollingBall, dom, tol: float, corr: Optional[FilletCorrection] = None) -> Optional[SplineSurf]:
+    """
+    The fillet (plus its correction) as a tensor B-spline over the domain:
+    least squares through a grid of exact points, poles added until the
+    grid's midpoints are within tol.
+    ⚠️ THE KNOTS FOLLOW THE CURVATURE. Where the walls turn almost parallel
+    the spine bends hard (test13: radius 3 mm at the sides of the bore, 2 mm
+    on the far side of the arc) and elsewhere it's nearly straight: uniform
+    knots needed 128 poles along the spine for 1e-5, most of them wasted.
+    Spaced by the square root of the curvature, 48-64 are enough; the grid
+    is spaced the same way, so no span goes without samples.
+    """
+    t0, t1, s0, s1 = dom
+    if s1 - s0 < 1e-6 or t1 - t0 < 1e-6:
+        return None
+    dr = (lambda u, v: corr(np.full(len(v), u), v)) if corr is not None else (lambda u, v: None)
+    tf = np.linspace(s0, s1, max(64, int(math.ceil((s1 - s0) / (0.02 * ball.rho))) + 1))
+    Cf = ball.spine_point(tf)
+    Rf = np.stack([ball.surface_point(Cf, np.full(len(tf), u), dr(u, tf)) for u in (t0, 0.5 * (t0 + t1), t1)])
+    hf = tf[1] - tf[0]
+    k = np.zeros(len(tf))
+    k[1:-1] = np.linalg.norm(Rf[:, 2:] - 2.0 * Rf[:, 1:-1] + Rf[:, :-2], axis=2).max(axis=0) / hf**2
+    k[0], k[-1] = k[1], k[-2]
+    w = np.sqrt(k + 1.0 / (s1 - s0))
+    cw = np.concatenate([[0.0], np.cumsum(0.5 * (w[1:] + w[:-1]) * np.diff(tf))])
+    mu, mv = 17, 6 * 128
+    us = np.linspace(t0, t1, mu)
+    vs = np.interp(np.linspace(0.0, cw[-1], mv), cw, tf)
+    C = ball.spine_point(vs)
+    Q = np.stack([ball.surface_point(C, np.full(mv, u), dr(u, vs)) for u in us])  # (mu, mv, 3)
+    um = 0.5 * (us[1:] + us[:-1])
+    vm = 0.5 * (vs[1:] + vs[:-1])
+    Cm = ball.spine_point(vm)
+    Qm = np.stack([ball.surface_point(Cm, np.full(len(vm), u), dr(u, vm)) for u in um])
+    for nv in (8, 12, 16, 24, 32, 48, 64, 96, 128):
+        kv = _bs_knots_graded(s0, s1, nv, tf, w)
+        Pv, Mv = np.linalg.pinv(_bs_basis(vs, kv, nv)), _bs_basis(vm, kv, nv)
+        for nu in (7, 9):
+            ku = _bs_knots(t0, t1, nu)
+            poles = np.einsum("ia,abk,jb->ijk", np.linalg.pinv(_bs_basis(us, ku, nu)), Q, Pv)
+            err = float(np.linalg.norm(np.einsum("ia,abk,jb->ijk", _bs_basis(um, ku, nu), poles, Mv) - Qm, axis=2).max())
+            if err <= tol:
+                return SplineSurf(poles, ku, kv)
+    return None
+
+
 def normal_deviation(prim: Prim, P: np.ndarray, Nrep: np.ndarray) -> float:
     """
     Mean angular deviation (degrees) between the faces' normals and the
@@ -6237,6 +6685,7 @@ class Segmenter:
         # them unclaimed.
         found = self._absorb_free([(R.prim, list(R.faces)) for R in regions])
         found = self._wedged(found)
+        found = self._reseed(found, lambda R: coarse(R) or _fragment(R))
         found = self._coaxial_bands(found)
         found = [(self._snap_cylinder(pp, rf), rf) for pp, rf in found]
         # ⚠️ AND IT MERGES AGAIN. The first pass looks at the regions AS
@@ -6256,6 +6705,7 @@ class Segmenter:
         found = [(q, rf) for q, (_, rf) in zip(cons, found)]
         found = self._absorb_exact(found, changed)
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
+        regions = self._rolling_fillets(regions)
         regions = self._blend_patches(regions, frags)
         regions = self._extrusion_bands(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
@@ -6832,7 +7282,8 @@ class Segmenter:
                     cnt[q] = cnt.get(q, 0) + 1
             for q in cnt:
                 tot[q] = len(regions[q].faces)
-            dentro = [q for q in cnt if cnt[q] >= 0.8 * tot[q]]
+            # (a rolling-ball fillet is a finished surface: never dissolved)
+            dentro = [q for q in cnt if cnt[q] >= 0.8 * tot[q] and getattr(regions[q].prim, "ball", None) is None]
             # ⚠️ A STRONG REGION THAT OWNS THE SECTION IS NOT A FRAGMENT. A
             # region sitting on the mesh the way a CAD surface does (a few
             # thousandths of the tolerance) is the real thing: on test6 a
@@ -6912,6 +7363,368 @@ class Segmenter:
             return regions
         Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
         return [R for k, R in enumerate(regions) if k not in drop] + extra
+
+    def _rolling_fillets(self, regions):
+        """
+        Constant-radius fillets between two curved walls (see RollingBall),
+        rebuilt as ONE B-spline face each.
+
+        The hypotheses are the pieces the quadric fit left on them: a torus
+        or a cylinder whose tube radius is the ball's (each strip of such a
+        fillet is osculated by one). For every pair of good walls around the
+        piece, the ball of that radius is placed from the facets' normals
+        (it must sit about rho from both walls), the piece's vertices are
+        projected onto the rolling-ball surface, and the pair that explains
+        them is kept; the radius is refined on the data, then the surface
+        grows over the neighbouring facets that lie on it (vertices within
+        the facet's own threshold, across the arc, normals agreeing). A
+        region mostly on the fillet is dissolved into it, one only grazed by
+        it keeps all its facets.
+        ⚠️ WHEN THE SPINE IS A LINE OR A CIRCLE THE FILLET IS A QUADRIC (a
+        cylinder, a torus): those are left to the exact quadric fit.
+        """
+        if not self.allow_free or self.only_cyl:
+            return regions
+        topo = self.topo
+        tol_fit, tol_grow = self.tol_fit, self.tol_grow
+        areas = topo.areas
+        med_area = float(np.median([areas[i] for i in range(topo.nF)]))
+        area = lambda fs: float(sum(areas[i] for i in fs))
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        cos_n = math.cos(math.radians(20.0))
+
+        def pts(fs):
+            P = np.vstack([topo.verts[i] for i in fs])
+            N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in fs])
+            return P, N
+
+        def supports(fs, a_min):
+            """good walls touching the piece, or touching the loose facets around it"""
+            fset = set(fs)
+            ring = {j for i in fs for j in topo.adj[i] if j not in fset}
+            ring2 = set(ring)
+            for j in ring:
+                if j not in owner:
+                    ring2 |= {q for q in topo.adj[j] if q not in fset}
+            out = {}
+            for j in ring2:
+                k = owner.get(j)
+                if k is not None:
+                    R = regions[k]
+                    if k not in dissolved and R.prim.kind != FREE and R.rms <= 2.0 * tol_fit and area(R.faces) >= a_min:
+                        out[("r", k)] = R.prim
+                elif areas[j] >= max(a_min, 20.0 * med_area):
+                    pp = plane_prim_of_face(topo, j)
+                    if pp is not None:
+                        out[("p", j)] = pp
+            return out
+
+        def fit_rho(ball, P, c, lo, hi):
+            """least squares on the vertices' residuals: Gauss-Newton on rho
+            (derivative by a finite step), kept inside [lo, hi]"""
+            r0 = ball.rho
+            for _ in range(6):
+                c, rr, _, oo = ball.foot(P, c)
+                dh = 1e-4 * ball.rho
+                ball.rho = r0 + dh
+                c2, r2, _, o2 = ball.foot(P, c)
+                ball.rho = r0
+                m = oo & o2
+                if not m.any():
+                    return
+                J = (r2[m] - rr[m]) / dh
+                jj = float(J @ J)
+                if jj < 1e-300:
+                    return
+                step = -float(J @ rr[m]) / jj
+                r0 = min(max(r0 + step, lo), hi)
+                ball.rho = r0
+                if abs(step) < 1e-7 * r0:
+                    return
+
+        def facets_on(ball, kap, ids, cap=math.inf, corr=None):
+            """which facets lie on the fillet: vertices within the facet's own
+            threshold (half its sag, as in face_tol), across the arc, normal
+            agreeing - all the facets in ONE projection"""
+            ids = [i for i in ids if len(topo.verts[i]) >= 3]
+            if not ids:
+                return []
+            Qs, own, span = [], [], []
+            for i in ids:
+                V = topo.verts[i]
+                Q = np.vstack([V, (V + np.roll(V, -1, axis=0)) * 0.5, topo.cents[i][None, :]])
+                Qs.append(Q)
+                own.append(np.tile(topo.norms[i], (len(Q), 1)))
+                span.append(len(V))
+            Q, Nq = np.vstack(Qs), np.vstack(own)
+            c, res, th, ok = ball.foot(Q, Q - kap * ball.rho * Nq)
+            if corr is not None:
+                res = res - corr(th, ball.spine_param(c))
+            w = Q - c
+            wn = np.linalg.norm(w, axis=1)
+            cosn = kap * np.einsum("ij,ij->i", w, Nq) / np.maximum(wn, 1e-300)
+            out, o = [], 0
+            for i, nv, Qi in zip(ids, span, Qs):
+                m = len(Qi)
+                r, t = np.abs(res[o : o + m]), th[o : o + nv]
+                good = bool(ok[o : o + m].all()) and float(t.min()) >= -0.05 and float(t.max()) <= 1.05 and cosn[o + m - 1] >= cos_n
+                if good and float(r[:nv].max()) <= max(tol_fit, min(0.5 * float(r[nv:].max()), tol_grow, cap)):
+                    out.append(i)
+                o += m
+            return out
+
+        def grow(ball, kap, seed, blocked, cap=math.inf, corr=None):
+            F = set(facets_on(ball, kap, seed, cap, corr))
+            if len(F) < 0.8 * len(seed):
+                return None
+            seen = F | blocked
+            front = list(F)
+            while front:
+                cand = []
+                for i in front:
+                    for j in topo.adj[i]:
+                        if j in seen:
+                            continue
+                        seen.add(j)
+                        if areas[j] <= 20.0 * med_area:  # a big one is a real plane of the part
+                            cand.append(j)
+                front = facets_on(ball, kap, cand, cap, corr)
+                F |= set(front)
+            return F
+
+        def vfeet(ball, kap, F):
+            """distinct vertices of F with their ball: (V, centres, residuals,
+            theta); the few without a centre are left out, None if many are"""
+            V = np.unique(np.round(np.vstack([topo.verts[i] for i in F]), 9), axis=0)
+            Nv = np.zeros_like(V)
+            vi = {tuple(p): j for j, p in enumerate(V)}
+            for i in F:
+                for p in np.round(topo.verts[i], 9):
+                    Nv[vi[tuple(p)]] += areas[i] * topo.norms[i]
+            Nv /= np.maximum(np.linalg.norm(Nv, axis=1), 1e-300)[:, None]
+            c, res, th, ok = ball.foot(V, V - kap * ball.rho * Nv)
+            if ok.sum() < max(0.9 * len(V), 8):
+                return None, None, None, None
+            return V[ok], c[ok], res[ok], th[ok]
+
+        def correction(ball, kap, F, res, th, sv):
+            """the radial correction on F's vertices (the facets' interior as
+            weak data, never worse than twice the exact fillet there)"""
+            Qc, Nc = interior(F)
+            cc, rc, tc, okc = ball.foot(Qc, Qc - kap * ball.rho * Nc)
+            if not okc.any():
+                return None
+            return fit_fillet_correction(_fillet_domain(ball, th, sv), th, sv, res, tc[okc], ball.spine_param(cc[okc]), rc[okc], tol_fit, 2.0 * float(np.abs(rc[okc]).max()) + 2.0 * tol_fit)
+
+        def march(ball, V, c):
+            j0 = int(np.argmin(np.linalg.norm(V - V.mean(axis=0), axis=1)))
+            ball.march(c[j0], 1.5 * float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) + 2.0 * ball.rho, 0.1 * ball.rho, c, reach(c, ball.rho))
+
+        def interior(F):
+            """the facets' side midpoints and centroids, with their normals"""
+            Q, Nq = [], []
+            for i in F:
+                Vf = topo.verts[i]
+                q = np.vstack([(Vf + np.roll(Vf, -1, axis=0)) * 0.5, topo.cents[i][None, :]])
+                Q.append(q)
+                Nq.append(np.tile(topo.norms[i], (len(q), 1)))
+            return np.vstack(Q), np.vstack(Nq)
+
+        def reach(c, rho):
+            """how far past the data's centres the spine is still needed: half a
+            ball, or more where the sections are sparse (long facets)"""
+            from scipy.spatial import cKDTree
+
+            cu = np.unique(np.round(c, 7), axis=0)
+            if len(cu) < 2:
+                return 0.5 * rho
+            d = cKDTree(cu).query(cu, k=2)[0][:, 1]
+            return max(0.5 * rho, 1.5 * float(d.max()))
+
+        def seed_core(F, fs):
+            core = [i for i in fs if i in F]
+            return core if core else sorted(F)
+
+        def settle_regions(F, supp):
+            """regions mostly on the fillet are dissolved, the others keep their facets"""
+            cnt = Counter(owner[i] for i in F if i in owner)
+            gone, keep = set(), set()
+            for q, n in cnt.items():
+                if q not in supp and n >= 0.5 * len(regions[q].faces):
+                    gone.add(q)
+                else:
+                    keep |= set(regions[q].faces)
+            return gone, keep
+
+        hyp = []
+        for k, R in enumerate(regions):
+            p = R.prim
+            if p.kind == TORUS:
+                rho0 = p.r1
+            elif p.kind == AXIAL and abs(p.slope) < 1e-9:
+                rho0 = p.r0
+            else:
+                continue
+            if R.closed_u or not (0.0 < rho0 <= 0.05 * self.diag) or len(R.faces) < self.min_faces:
+                continue
+            hyp.append((area(R.faces), k, rho0))
+        hyp.sort(reverse=True)
+        consumed, dissolved, out, analytic, general = set(), set(), [], set(), set()
+        for a_w, k, rho0 in hyp:
+            fs = regions[k].faces
+            if k in dissolved or sum(1 for i in fs if i in consumed) > 0.5 * len(fs):
+                continue
+            P, N = pts(fs)
+            sup = supports(fs, a_w)
+            keys = list(sup)
+            cands = []
+            for a in range(len(keys)):
+                for b in range(a + 1, len(keys)):
+                    A, B = sup[keys[a]], sup[keys[b]]
+                    for kap in (1.0, -1.0):
+                        c0 = P - kap * rho0 * N
+                        mA, mB = float(np.median(A.dist(c0))), float(np.median(B.dist(c0)))
+                        if not (0.5 * rho0 < abs(mA) < 1.5 * rho0 and 0.5 * rho0 < abs(mB) < 1.5 * rho0):
+                            continue
+                        ball = RollingBall(A, B, math.copysign(1.0, mA), math.copysign(1.0, mB), rho0)
+                        c, res, th, ok = ball.foot(P, c0, iters=12)
+                        if not ok.all() or th.min() < -0.2 or th.max() > 1.2:
+                            continue
+                        rm = float(np.sqrt(np.mean(res**2)))
+                        if rm <= 0.05 * rho0 + tol_fit:
+                            cands.append((rm, a, b, kap, ball, c))
+            if not cands:
+                continue
+            _, a, b, kap, ball, c = min(cands, key=lambda t: t[0])
+            pair = (keys[a], keys[b], kap)
+            if pair in analytic:
+                continue
+            fit_rho(ball, P, c, 0.9 * rho0, 1.1 * rho0)
+            c, _, _, okp = ball.foot(P, c)
+            if pair not in general and okp.any():
+                # ⚠️ A CIRCULAR SPINE IS A TORUS: find it out on the piece
+                # itself, before growing anything (on test13 the bore-to-face
+                # tori paid growth, correction and a long march to be thrown
+                # away). Remembered per pair of walls, either way.
+                cp = c[okp]
+                # (strict: a short piece of a saddle curve can pass for a circle)
+                ball.march(cp[int(np.argmin(np.linalg.norm(cp - cp.mean(axis=0), axis=1)))], 0.6 * float(np.linalg.norm(P.max(axis=0) - P.min(axis=0))) + ball.rho, 0.2 * ball.rho)
+                if ball.spine_analytic(max(1e-6 * self.diag, 1e-8)):
+                    analytic.add(pair)
+                    Log.debug(f"  rolling-ball fillet at {np.round(P.mean(axis=0), 2)}: the spine is a line or a circle, left to the quadrics")
+                    continue
+                general.add(pair)
+            supp = {kk[1] for kk in (keys[a], keys[b]) if kk[0] == "r"}
+            blocked = set(consumed)
+            for kk in (keys[a], keys[b]):
+                blocked |= set(regions[kk[1]].faces) if kk[0] == "r" else {kk[1]}
+            F = grow(ball, kap, fs, blocked)
+            if F is None:
+                Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: the piece itself doesn't lie on it")
+                continue
+            # ⚠️ THE FACET'S THRESHOLD IS NOT ENOUGH TO STOP IT. Half the sag
+            # of a coarse facet reaches tol_grow, and where the fillet runs
+            # into the next one (test13: the bore-to-slot fillet meeting the
+            # bore-to-face torus) the ball's surface goes on tangent and stays
+            # within that for a few rows: it ate a third of the torus. Once
+            # the fillet is known, its own scatter sets the limit: no vertex
+            # past six times its rms.
+            cap = math.inf
+            for _ in range(2):
+                gone, keep = settle_regions(F, supp)
+                F = set(largest_component(sorted(F - keep), topo.adj))
+                if len(F) < 4 * self.min_faces:
+                    break
+                Pf, Nf = pts(sorted(F))
+                c, rr, _, oo = ball.foot(Pf, Pf - kap * ball.rho * Nf)
+                fit_rho(ball, Pf, c, 0.97 * ball.rho, 1.03 * ball.rho)
+                _, rr, _, oo = ball.foot(Pf, c)
+                cap = max(tol_fit, 6.0 * float(np.sqrt(np.mean(rr[oo] ** 2))))
+                F2 = grow(ball, kap, list(seed_core(F, fs)), blocked | keep, cap)
+                if F2 is None or F2 == F:
+                    break
+                F = F2
+            gone, keep = settle_regions(F, supp)
+            F = set(largest_component(sorted(F - keep), topo.adj))
+            if len(F) < 4 * self.min_faces:
+                continue
+            V, c, res, th = vfeet(ball, kap, F)
+            if V is None:
+                Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: vertices without a ball centre")
+                continue
+            march(ball, V, c)
+            # the correction, and the facets that hold on the corrected surface
+            corr = None
+            for _ in range(3):
+                sv = ball.spine_param(c)
+                if float(np.abs(res).max()) <= 0.5 * tol_fit:
+                    break
+                corr = correction(ball, kap, F, res, th, sv)
+                if corr is None:
+                    break
+                F2 = grow(ball, kap, sorted(F), blocked | keep, cap, corr)
+                gone2, keep2 = settle_regions(F2, supp)
+                F2 = set(largest_component(sorted(F2 - keep2), topo.adj))
+                if F2 == F or len(F2) < len(F):
+                    break
+                V2 = vfeet(ball, kap, F2)
+                if V2[0] is None:
+                    break
+                F, gone, keep = F2, gone2, keep2
+                V, c, res, th = V2
+                march(ball, V, c)
+                corr = None  # fitted on the previous map
+            sv = ball.spine_param(c)
+            if corr is None and float(np.abs(res).max()) > 0.5 * tol_fit:
+                corr = correction(ball, kap, F, res, th, sv)
+            spl = fillet_spline(ball, _fillet_domain(ball, th, sv), 0.1 * tol_fit, corr)
+            if spl is None:
+                Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: no B-spline within {0.1 * tol_fit:.1e} of it")
+                continue
+            pr = Prim(FREE, V.mean(axis=0), np.array([0.0, 0.0, 1.0]), 0.0, 0.0, 0.0, 0.0)
+            pr.free = spl
+            pr.ball = ball
+            pr.corr = corr
+            # the facets that hold on the B-spline (face_tol, all in one projection)
+            FL = sorted(F)
+            Qv = [np.vstack([topo.verts[i], (topo.verts[i] + np.roll(topo.verts[i], -1, axis=0)) * 0.5, topo.cents[i][None, :]]) for i in FL]
+            dq = np.abs(spl.dist(np.vstack(Qv)))
+            fl, o = [], 0
+            for i, q in zip(FL, Qv):
+                nv_ = len(topo.verts[i])
+                if float(dq[o : o + nv_].max()) <= max(tol_fit, min(0.5 * float(dq[o + nv_ : o + len(q)].max()), tol_grow)):
+                    fl.append(i)
+                o += len(q)
+            fl = largest_component(fl, topo.adj)
+            if len(fl) < 4 * self.min_faces:
+                Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: {len(fl)} of {len(F)} facets hold on the B-spline")
+                continue
+            Pf = np.vstack([topo.verts[i] for i in fl])
+            dv = np.abs(pr.dist(Pf))
+            pr.rms = float(np.sqrt(np.mean(dv**2)))
+            Log.debug(
+                f"  rolling-ball fillet r {ball.rho:.4f} between {keys[a][0]}{keys[a][1]} {ball.A.label()} and {keys[b][0]}{keys[b][1]} {ball.B.label()}: "
+                f"{len(fl)} facets ({len(gone)} regions dissolved) at {np.round(Pf.mean(axis=0), 2)}, vertices max {float(dv.max()):.1e} rms {pr.rms:.1e}, "
+                f"{spl.poles.shape[0]}x{spl.poles.shape[1]} poles{'' if corr is None else f', corrected {corr.coef.shape[0]}x{corr.coef.shape[1]} max {float(np.abs(corr.coef).max()):.1e}'}"
+            )
+            consumed |= set(fl)
+            dissolved |= gone
+            out.append(describe_region(pr, topo, fl))
+        if not out:
+            return regions
+        Log.debug(f"Rolling-ball fillets: {len(out)} B-spline faces in place of {len(dissolved)} regions")
+        taken = {i for R in out for i in R.faces}
+        kept = []
+        for k, R in enumerate(regions):
+            if k in dissolved:
+                continue
+            if any(i in taken for i in R.faces):
+                fs = [i for i in R.faces if i not in taken]
+                if len(fs) < self.min_faces:
+                    continue
+                R = describe_region(R.prim, topo, fs)
+            kept.append(R)
+        return kept + out
 
     def _extrusion_bands(self, regions):
         """
@@ -7273,6 +8086,53 @@ class Segmenter:
         if n_add:
             Log.debug(f"Wedged slivers recovered: +{n_add}")
         return found
+
+    def _reseed(self, found, drop):
+        """
+        Seeds again on the facets still unclaimed, on the final map.
+
+        ⚠️ A SEED THAT FAILED ON A CROWDED MAP MAY HOLD ON THE FINAL ONE.
+        On test13 a short R2 fillet (a fan of 18 triangles with vertices on
+        its two rims only) was taken, seed after seed, by small random
+        spheres fitted on five or seven of its triangles plus a few of the
+        corner sphere's: the filters then threw the spheres away and the
+        fillet stayed a fan, while a seed on the same triangles, once the
+        neighbours are claimed, finds the cylinder at once (r 2.0000, 25
+        facets). Only clusters of loose facets are tried (the big planar
+        faces are real planes), and what they give must be a strong region
+        and pass the same filters as the first round (drop).
+        """
+        topo = self.topo
+        nF = topo.nF
+        taken = [False] * nF
+        for _, rf in found:
+            for i in rf:
+                taken[i] = True
+        big = 20.0 * float(np.median([topo.areas[i] for i in range(nF)]))
+        loose = [i for i in range(nF) if not taken[i] and topo.planar[i] and topo.verts[i].size and topo.areas[i] <= big]
+        lset = set(loose)
+        loose = [i for i in loose if sum(1 for j in topo.adj[i] if j in lset) >= 1]
+        if len(loose) < self.min_faces:
+            return found
+        saved = self.taken
+        self.taken = taken
+        try:
+            new, tried = self._seed_loop(sorted(loose, key=lambda i: -topo.areas[i]), [0] * nF)
+        finally:
+            self.taken = saved
+        # ⚠️ ONLY WHAT SITS ON THE MESH LIKE A CAD SURFACE. On test9 the same
+        # round found twenty 5-to-12-facet cylinders and cones (rms 3e-4 to
+        # 1e-3) on the strips of the extruded letters, and took them away from
+        # the extrusion bands: +13 faces. The fan on test13 fits at 6e-7.
+        strong = lambda R: R.rms <= 0.05 * self.tol_fit and len(R.faces) >= 8
+        new = [(p, rf) for p, rf in new if (lambda R: strong(R) and not drop(R))(describe_region(p, topo, rf))]
+        if new:
+            Log.debug(f"Second round of seeds on {len(loose)} loose facets ({tried} tried): {len(new)} regions, {sum(len(rf) for _, rf in new)} facets")
+            if Log.level <= 10:
+                for p_, rf_ in new:
+                    R_ = describe_region(p_, topo, rf_)
+                    Log.debug(f"    {R_.label()} r {p_.r0:.4f} rms {R_.rms:.1e} at {np.round(np.mean([topo.cents[i] for i in rf_], axis=0), 2)}")
+        return found + new
 
     def _absorb_free(self, found):
         """
@@ -7637,7 +8497,9 @@ class SurfParam:
         P = np.atleast_2d(P)
         d = P - self.C
         k = self.prim.kind
-        if k == FREE or k == PLANE:
+        if k == FREE:
+            return self.prim.free.uv(P)
+        if k == PLANE:
             return d @ self.X, d @ self.Y
         t = d @ self.Z
         x, y = d @ self.X, d @ self.Y

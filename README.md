@@ -44,8 +44,8 @@ Then check the result against the input mesh:
 python tools/qa.py test0.stl test0.step
 ```
 
-and, for the test files that ship with their original CAD (`test0`, `test4`, `test10`, `test12`),
-compare face-by-face against the ground truth:
+and, for the test files that ship with their original CAD (`test0`, `test4`, `test10`, `test12`,
+`test13`), compare face-by-face against the ground truth:
 
 ```bash
 python tools/cadcmp.py test0_original.step test0.step -v
@@ -86,7 +86,9 @@ are reported but left in.
   than their own cylinders did. The walls of an extruded outline — a sketch with splines, embossed
   or engraved text — become one surface swept along the extrusion direction: a cylinder when the
   profile is a circular arc, otherwise a B-spline profile. Stretches tessellated so coarsely that
-  the mesh doesn't say where the curve runs stay planar.
+  the mesh doesn't say where the curve runs stay planar. A constant-radius fillet between two
+  curved walls (a hole meeting another hole, whose width changes all along) is rebuilt from the
+  two walls and the ball rolling between them, as one B-spline face.
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A B C A` (the last one re-merges the planar faces split by the replacements).
@@ -116,10 +118,10 @@ python refit.py part.stl -a -b -c -a 0.005
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
     used during development.
-- `test0.stl` … `test13.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10` and
-  `test12` come with the CAD file they were exported from (`testN_original.step`): the reference
-  for `tools/cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six internal
-  cavities.
+- `test0.stl` … `test13.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10`,
+  `test12` and `test13` come with the CAD file they were exported from (`testN_original.step`): the
+  reference for `tools/cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six
+  internal cavities. `test13` has rolling-ball fillets between two crossing holes.
 
 ## Branches
 
