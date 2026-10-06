@@ -88,7 +88,10 @@ are reported but left in.
   profile is a circular arc, otherwise a B-spline profile. Stretches tessellated so coarsely that
   the mesh doesn't say where the curve runs stay planar. A constant-radius fillet between two
   curved walls (a hole meeting another hole, whose width changes all along) is rebuilt from the
-  two walls and the ball rolling between them, as one B-spline face.
+  two walls and the ball rolling between them, as one B-spline face whose edges follow the ball's
+  contact lines; the straight and circular pieces of the same chain become the exact cylinders and
+  tori the ball sweeps there, and each fillet ends where its ball leaves the walls' facets (`test13`
+  reproduces all 57 faces of its CAD one to one).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A B C A` (the last one re-merges the planar faces split by the replacements).
@@ -96,6 +99,18 @@ The phases run in the order they're written on the command line. With no flags t
 ```bash
 python refit.py part.stl -a -b -c -a 0.005
 ```
+
+## Output file
+
+After the phases, the edges that are still polylines of the mesh get the curve they really sit
+on: the exact intersection of the two faces, a circle, or a spline through its vertices (checked on
+both faces). A chain that doesn't take one curve as a whole is cut at its corners and tried again in
+pieces, and the step repeats while it finds something.
+
+The STEP file is written without pcurves (the edges' 2D curves on the faces), as CAD systems do:
+the reader rebuilds them, and the file is 3-7 times smaller. The output is read back right away
+and checked (validity, free edges, every face triangulated against its own area); the faces that
+come back worse get their pcurves written after all. `--pcurves` always writes them all.
 
 ## Repository layout
 

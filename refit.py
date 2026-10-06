@@ -42,7 +42,15 @@ PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
                torus nor a cylinder: its width changes all along. It's
                rebuilt from the two walls and the ball rolling between them
                (RollingBall, Segmenter._rolling_fillets) as one B-spline
-               face, the ball's radius measured on the mesh.
+               face, the ball's radius measured on the mesh. Its rails are
+               trimmed to the ball's contact lines (the walls' facets inside
+               them change hands), and the straight or circular pieces of the
+               chain - a torus where the ball runs along a face, a few loose
+               facets between two fillets - become the exact cylinder or
+               torus the ball sweeps there. A fillet ends where its ball
+               leaves a wall's actual facets: what lies past that is the next
+               face of the chain, however tangent (test13: all 57 faces of
+               its CAD, one to one).
 
 THE PHASES RUN IN THE ORDER THEY'RE WRITTEN, and none pulls another one in.
 Without flags the sequence is A B C A (the last one re-merges the planar
@@ -383,6 +391,36 @@ facets) become a single closed edge. Each edge's tolerance is the measured
 deviation, no longer the blanket --arc-tol; each face may gain or lose at
 most the crescent between the polyline and the curve; and a part that was
 already invalid before this step no longer makes every arc get thrown away.
+Since October 2026 a chain that takes no single curve gets a second try in
+pieces (_chain_pieces): cut at its corners, then around its longest run of
+vertices on an exact intersection. test13's R11.75 round met the plane along
+57 segments on the exact tangent circle but for the last two at each end
+(where the round meets the fillets): the whole circle was refused, and the
+57 stayed. With the pieces test13 goes from 695 to about 340 edges. A piece
+may not halve a face either: a lens-shaped planar sliver squashed by a
+fitted circle passes BRepCheck in memory and fails it once read back.
+
+THE STEP FILE: NO PCURVES (--pcurves to write them)
+----------------------------------------------------
+A segment of the mesh left on a curved face has no straight image in (u,v),
+so OCC writes its 2D curve as a 20-30 pole B-spline: on test13 1,160 of
+them, 90% of a 3.5 MB file whose CAD original weighs 179 KB and carries no
+pcurve at all. They're now left out, as CAD systems do, and the reader
+rebuilds them by projection: read back by OCC and imported into Autodesk
+Fusion, the parts come out with the same faces, edges, vertices and volume,
+in files 3-7 times smaller. But not always: test10 read back a seam as two
+free edges, and test2's four countersink cones came back valid, with the
+right area, and triangulating into holes and spikes (the projected pcurves
+wrapped the wrong way). So the output is read back, checked (validity,
+free edges, and every face triangulated at 2e-5 x diagonal against its own
+area, at two mesher settings: the answer depends on them) and, if anything
+came back worse than in memory, written again with the pcurves kept on just
+the faces that went wrong - all of them only if that isn't enough. Where
+pcurves don't help either (test5's 4 free edges come back whatever is
+written) the smaller file is kept.
+The arcs step runs again while it finds something: a chain is judged with
+its neighbors as they are, and passes once theirs have become curves
+(test9: 42 more exact intersections on the second pass).
 
 TANGENT JUNCTIONS AND TRUE TOLERANCES
 ---------------------------------------
@@ -506,9 +544,10 @@ import math
 import os
 import sys
 import time
+import types
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -1102,6 +1141,22 @@ def is_valid(shape) -> bool:
         return False
 
 
+def _face_groups(ids, adj) -> List[set]:
+    """Connected groups (by shared edge, adj) of the facets in ids."""
+    ids, out = set(ids), []
+    while ids:
+        st = [ids.pop()]
+        g = set(st)
+        while st:
+            for j in adj[st.pop()]:
+                if j in ids:
+                    ids.discard(j)
+                    g.add(j)
+                    st.append(j)
+        out.append(g)
+    return out
+
+
 def _face_components(faces) -> List[List[int]]:
     """Groups of faces connected through shared edges."""
     c = TopoDS_Compound()
@@ -1557,17 +1612,218 @@ def _name_step_model(w, path: str, src: Optional[str]) -> None:
         Log.debug(f"STEP header: {ex}")
 
 
-def write_step(shape, path: str, schema: str = "AP214IS", src: Optional[str] = None) -> None:
+def write_step(shape, path: str, schema: str = "AP214IS", src: Optional[str] = None, pcurves: bool = False) -> None:
+    """
+    ⚠️ NO PCURVES BY DEFAULT, LIKE THE CAD. A segment of the mesh left on a
+    curved face has no straight image in (u,v): OCC writes its pcurve as a
+    20-30 pole 2D B-spline, and on test13 those were 1,160 curves and 90% of
+    the file (3.5 MB against the CAD's 179 KB, which carries no pcurve at
+    all). The reader rebuilds them by projection: OCC and Fusion re-read
+    the same faces, edges, vertices and volume. main() re-reads the file
+    and writes it again WITH pcurves if anything came back worse.
+    """
+    # ⚠️ the writer FIRST: on an STL input it's the first STEP object of the
+    # run, and creating it loads the STEP defaults over anything set before
+    # (the pcurves came back, the file stayed 3.5 MB)
+    w = STEPControl_Writer()
     _iface_set("write.step.schema", schema)
     _iface_set("write.step.unit", "MM")
     _iface_set("write.precision.mode", "0")
-    w = STEPControl_Writer()
+    _iface_set("write.surfacecurve.mode", "1" if pcurves else "0")
     w.Transfer(shape, STEPControl_AsIs)
     _name_step_model(w, path, src)
     if w.Write(path) != IFSelect_RetDone:
         Log.error(f"STEP write failed: {path}")
         return
     Log.ok(f"Saved: {path}  ({os.path.getsize(path) / 1024:,.0f} KB)")
+
+
+def unmeshable_faces(shape, defl: float) -> List[int]:
+    """
+    Faces whose triangulation (BRepMesh at deflection defl) is missing or
+    doesn't cover them: triangulated area off the face's own by over 10%
+    (small faces with wide edge tolerances already differ by a few percent,
+    a broken one by a factor).
+
+    ⚠️ A VALID FACE CAN STILL BE BROKEN. Read back without pcurves, test2's
+    four countersink cones passed BRepCheck with the right area, but the
+    pcurves the reader had projected for them wrapped the wrong way: at a
+    0.002 mm deflection one came out untriangulated and three covered 0.25
+    or 28 mm2 instead of 8.4 - holes and spikes in any viewer, 2.9 mm of
+    deviation in tools/qa.py. Meshing the read-back part finds them.
+    ⚠️ AND THE MESHER'S ANSWER DEPENDS ON ITS SETTINGS: the same file came
+    out clean at an angular deflection of 0.5 rad and with two other cones
+    at 11.9 mm2 instead of 4.3 at 0.1 (the setting tools/qa.py uses). Both
+    are tried, the triangulation cleared in between.
+    """
+    bad = set()
+    faces = [td_Face(f) for f in explore(shape, TopAbs_FACE)]
+    areas = [face_area(f) for f in faces]
+    clean = _st(_m("BRepTools").BRepTools, "Clean")
+    for ang in (0.5, 0.1):
+        try:
+            clean(shape)
+            _BRepMesh.BRepMesh_IncrementalMesh(shape, float(defl), False, ang, True)
+        except Exception:
+            return [-1]
+        for i, f in enumerate(faces):
+            loc = TopLoc_Location()
+            tri = bt_Triangulation(f, loc)
+            if tri is None or tri.NbTriangles() == 0:
+                bad.add(i)
+                continue
+            N = np.array([(q.X(), q.Y(), q.Z()) for q in (tri.Node(k) for k in range(1, tri.NbNodes() + 1))])
+            T = np.array([tri.Triangle(k).Get() for k in range(1, tri.NbTriangles() + 1)], dtype=int) - 1
+            a_mesh = 0.5 * float(np.linalg.norm(np.cross(N[T[:, 1]] - N[T[:, 0]], N[T[:, 2]] - N[T[:, 0]]), axis=1).sum())
+            if abs(a_mesh - areas[i]) > 0.1 * areas[i] + 1e-6:
+                bad.add(i)
+    try:
+        clean(shape)
+    except Exception:
+        pass
+    return sorted(bad)
+
+
+def _strip_pcurves(shape, keep: Set[int]):
+    """Copy of shape without the stored pcurves, except on the faces in keep
+    (indices in explore order). Only for writing: the copy isn't valid."""
+    cp = copy_shape(shape)
+    bb = BRep_Builder()
+    for i, f in enumerate(explore(cp, TopAbs_FACE)):
+        if i in keep:
+            continue
+        f = td_Face(f)
+        for e in explore(f, TopAbs_EDGE):
+            e = td_Edge(e)
+            # ⚠️ a degenerated edge (a cone's apex, a sphere's pole) has no 3D
+            # curve: its pcurve is all it is, and without it the writer
+            # drops the face (test8 read back with a face missing)
+            if _st(BRep_Tool, "Degenerated")(e):
+                continue
+            tol = float(bt_Tolerance(e))
+            if _st(BRep_Tool, "IsClosed")(e, f):
+                bb.UpdateEdge(e, None, None, f, tol)
+            else:
+                bb.UpdateEdge(e, None, f, tol)
+    return cp
+
+
+def _read_back_check(shape, ri, base_bad: Set[int], defl: float):
+    """
+    (score, what's wrong, faces to blame) of a written file read back as ri,
+    against the part in memory. score = (invalid, extra free edges, faces
+    that triangulate worse than in memory): (0, 0, 0) is a faithful file,
+    and lower is better.
+    """
+    if ri is None or count_sub(ri, TopAbs_FACE) != count_sub(shape, TopAbs_FACE):
+        return (1, 1 << 20, 1 << 20), "a different face count", set()
+    faces = explore(ri, TopAbs_FACE)
+    if is_valid(shape) and not is_valid(ri):
+        return (1, 0, 0), "an invalid part", {i for i, f in enumerate(faces) if not is_valid(f)}
+    nfree0, nfree = count_free_edges(shape), count_free_edges(ri)
+    if nfree > nfree0:
+        # the faces along the free edges (test10: a seam read back as two)
+        _, _, ef = face_edges_map(ri)
+        return (0, nfree - nfree0, 0), f"free edges {nfree0} -> {nfree}", {f for fs in ef if len(fs) == 1 for f in fs}
+    bad = set(unmeshable_faces(ri, defl)) - base_bad
+    return (0, 0, len(bad)), (f"{len(bad)} faces that don't triangulate" if bad else ""), bad
+
+
+def _lost_faces(shape, ri, tol: float) -> Set[int]:
+    """Faces of shape (explore order) with no face of the same surface type
+    within tol (centroid of the vertices) in the read-back ri."""
+    def sig(sh):
+        return [(int(face_surface_type(f)), face_vertices(f).mean(axis=0)) for f in explore(sh, TopAbs_FACE)]
+    got: Dict[int, List[np.ndarray]] = defaultdict(list)
+    for t, c in sig(ri):
+        got[t].append(c)
+    lost = set()
+    for i, (t, c) in enumerate(sig(shape)):
+        cs = got.get(t)
+        if not cs or float(np.linalg.norm(np.array(cs) - c, axis=1).min()) > tol:
+            lost.add(i)
+    return lost
+
+
+def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: bool = False):
+    """
+    write_step, then read back. Without pcurves the file is checked and, if
+    it came back worse than the part in memory, written again with the
+    pcurves kept only on the faces to blame, then (if that isn't enough)
+    everywhere; the best of the three is kept, the smallest among equals.
+    Returns the part as read back.
+    ⚠️ ONE CONE IS NO REASON FOR 5 MB. On test8 a single 0.008 mm2 cone came
+    back from the pcurve-less file triangulating badly; rewriting the whole
+    part with pcurves made 6.7 MB of it, keeping them on that cone alone
+    2.0 MB (1.3 without any) - and test2's countersinks, 380 KB against 932.
+    ⚠️ AND PCURVES DON'T CURE EVERYTHING: test5 reads back with 4 free edges
+    whatever is written (circles ending 5e-4 off a B-spline face's vertex):
+    there the file without them is just as good, and three times smaller.
+    """
+    write_step(shape, path, src=src, pcurves=pcurves)
+    ri, _ = read_step(path)
+    if pcurves:
+        return ri
+    V = Topo(shape).vpos
+    defl = 2e-5 * (float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if len(V) else 1.0)
+    # (only the faces that triangulate worse than in memory: a few did
+    # already, and the pcurves aren't what's wrong with them)
+    base_bad = set(unmeshable_faces(copy_shape(shape), defl))
+    sc, why, bad = _read_back_check(shape, ri, base_bad, defl)
+    if sc == (0, 0, 0):
+        return ri
+    tried = [(sc, 0, "without pcurves", None)]
+    if bad:
+        # the faces to blame, then those plus their neighbors (an edge is
+        # discretized once for both its faces: test8's cone only came back
+        # whole with its neighbors' pcurves too)
+        _, _, ef = face_edges_map(shape)
+        ring = set(bad)
+        for fs in ef:
+            if ring.intersection(fs):
+                ring.update(fs)
+        for keep in (set(bad), ring):
+            try:
+                # ⚠️ a face left without pcurves can be DROPPED by the writer
+                # (test8: four tori bounded by four circles, fine in a file
+                # without any pcurve, gone from one with some): those get
+                # theirs back and it's written again
+                for _ in range(3):
+                    write_step(_strip_pcurves(shape, keep), path, src=src, pcurves=True)
+                    ri1, _ = read_step(path)
+                    lost = _lost_faces(shape, ri1, 50.0 * defl)
+                    if not lost or lost <= keep:
+                        break
+                    keep = keep | lost
+                sc1, _, _ = _read_back_check(shape, ri1, base_bad, defl)
+                if sc1 == (0, 0, 0):
+                    Log.info(f"the file without pcurves read back with {why}: written again with pcurves on {len(keep)} faces only")
+                    return ri1
+                tried.append((sc1, 1, f"pcurves on {len(keep)} faces", keep))
+            except Exception as ex:
+                Log.debug(f"pcurves on some faces only: {type(ex).__name__}: {ex}")
+            if keep == ring:
+                break
+    write_step(shape, path, src=src, pcurves=True)
+    ri2, _ = read_step(path)
+    sc2, why2, _ = _read_back_check(shape, ri2, base_bad, defl)
+    tried.append((sc2, 2, "pcurves everywhere", None))
+    best = min(tried, key=lambda t: (t[0], t[1]))
+    if best[1] == 2:
+        Log.warn(f"the file without pcurves reads back with {why}: written again with them" + (f" (still {why2})" if why2 else ""))
+        return ri2
+    # the pcurves didn't help: back to the smaller file
+    Log.warn(f"the file reads back with {why} with or without pcurves: kept {best[2]}")
+    if best[1] == 1:
+        write_step(_strip_pcurves(shape, best[3]), path, src=src, pcurves=True)
+    else:
+        write_step(shape, path, src=src, pcurves=False)
+    ri, _ = read_step(path)
+    if count_sub(ri, TopAbs_FACE) == 0 and count_sub(shape, TopAbs_FACE) > 0:
+        # (an invalid solid can come out of the writer with nothing in it:
+        # say so loudly, never a quiet "Saved")
+        Log.error(f"the STEP file is EMPTY: the writer dropped the whole solid ({'valid' if is_valid(shape) else 'NOT valid'} in memory)")
+    return ri
 
 
 # =============================================================================
@@ -3340,6 +3596,34 @@ class SplineSurf:
         return Geom_BSplineSurface(arr, kau, kav, mau, mav, _BS_DEG, _BS_DEG, False, False)
 
 
+def _pt_tri_dist(Q: np.ndarray, T: np.ndarray, J: np.ndarray) -> np.ndarray:
+    """Distance of each point Q[i] from the nearest of the triangles T[J[i]]
+    (exact point-to-triangle distance)."""
+    A, B, C = T[J, 0], T[J, 1], T[J, 2]
+    P = Q[:, None, :]
+    ab, ac = B - A, C - A
+    nrm = np.cross(ab, ac)
+    nn = np.maximum(np.einsum("...i,...i->...", nrm, nrm), 1e-300)
+    # inside the triangle: the distance to its plane
+    w = np.einsum("...i,...i->...", P - A, nrm) / nn
+    X = P - w[..., None] * nrm
+    v2 = X - A
+    d00, d01, d11 = np.einsum("...i,...i->...", ab, ab), np.einsum("...i,...i->...", ab, ac), np.einsum("...i,...i->...", ac, ac)
+    d20, d21 = np.einsum("...i,...i->...", v2, ab), np.einsum("...i,...i->...", v2, ac)
+    den = np.maximum(d00 * d11 - d01 * d01, 1e-300)
+    bv, bw = (d11 * d20 - d01 * d21) / den, (d00 * d21 - d01 * d20) / den
+    inside = (bv >= 0) & (bw >= 0) & (bv + bw <= 1)
+    d_in = np.where(inside, np.linalg.norm(P - X, axis=-1), np.inf)
+
+    def seg(U, V):
+        uv = V - U
+        t = np.clip(np.einsum("...i,...i->...", P - U, uv) / np.maximum(np.einsum("...i,...i->...", uv, uv), 1e-300), 0.0, 1.0)
+        return np.linalg.norm(P - (U + t[..., None] * uv), axis=-1)
+
+    d = np.minimum(np.minimum(d_in, seg(A, B)), np.minimum(seg(B, C), seg(C, A)))
+    return d.min(axis=1)
+
+
 class RollingBall:
     """
     The ball of radius rho touching walls A and B: centre c with
@@ -3357,7 +3641,7 @@ class RollingBall:
         tl = np.linalg.norm(t, axis=1)
         return t / np.maximum(tl, 1e-300)[:, None], tl
 
-    def centre(self, c0, P=None, plane_pt=None, plane_n=None, iters: int = 40):
+    def centre(self, c0, P=None, plane_pt=None, plane_n=None, iters: int = 40, exact: bool = False):
         """
         Newton onto the spine. Third equation: the centre is in the plane
         through P normal to the spine (the foot of P), or in a given plane.
@@ -3365,11 +3649,32 @@ class RollingBall:
         """
         c = np.array(c0, float)
         ok = np.ones(len(c), bool)
+        h = 1e-6 * self.rho
         for _ in range(iters):
             nA, nB = self.A.normal_at(c), self.B.normal_at(c)
             t, tl = self._tangent(c)
-            if P is not None:
+            if P is not None and not exact:
                 f3, g3 = np.einsum("ij,ij->i", c - P, t), t
+            elif P is not None:
+                # ⚠️ THE TANGENT TURNS WITH THE CENTRE: its derivative belongs
+                # in the Jacobian (exact=True). Without it (g3 = t) Newton
+                # crawls at 0.85 a step where the spine bends, and 40 steps
+                # left test13's corner vertices 1e-5..3e-3 off their centre.
+                # ⚠️ BUT THE GROWTH KEEPS THE CHEAP ITERATION: its "no centre"
+                # where the spine bends sharply is what stops a fillet at the
+                # end caps of test8's r0.3 rods (with exact centres it ran down
+                # the rod and left islands that no face could hold). Exact
+                # centres serve the steps that place facets one by one after
+                # the fillet is known: pieces taken in, the last facets at the
+                # corners.
+                f3 = np.einsum("ij,ij->i", c - P, t)
+                g3 = np.empty_like(c)
+                for k in range(3):
+                    e = np.zeros(3)
+                    e[k] = h
+                    tp, _ = self._tangent(c + e)
+                    tm, _ = self._tangent(c - e)
+                    g3[:, k] = (np.einsum("ij,ij->i", c + e - P, tp) - np.einsum("ij,ij->i", c - e - P, tm)) / (2.0 * h)
             else:
                 f3, g3 = np.einsum("ij,ij->i", c - plane_pt, plane_n), plane_n
             F = np.c_[self.A.dist(c) - self.sA * self.rho, self.B.dist(c) - self.sB * self.rho, f3]
@@ -3399,9 +3704,9 @@ class RollingBall:
         e2 /= np.maximum(np.linalg.norm(e2, axis=1), 1e-300)[:, None]
         return a, e2, np.arccos(cab)
 
-    def foot(self, P, c0, iters: int = 40):
+    def foot(self, P, c0, iters: int = 40, exact: bool = False):
         """(centre, |P - c| - rho, theta across the arc: 0 on A, 1 on B, ok)."""
-        c, ok = self.centre(c0, P=P, iters=iters)
+        c, ok = self.centre(c0, P=P, iters=iters, exact=exact)
         w = P - c
         res = np.linalg.norm(w, axis=1) - self.rho
         a, e2, ph = self._arc_frame(c)
@@ -3507,6 +3812,28 @@ class RollingBall:
         return bool(np.isfinite(r) and float(np.abs(np.hypot(x - cx, y - cy) - r).max()) <= tol)
 
 
+    def spine_quadric(self, tol: float) -> Optional["Prim"]:
+        """The cylinder (straight spine) or torus (circular spine) the ball
+        sweeps, when the spine is one - None otherwise."""
+        S = self.spine[0] if self.spine is not None else None
+        if S is None or len(S) < 3:
+            return None
+        ctr = S.mean(axis=0)
+        _, _, Vt = np.linalg.svd(S - ctr)
+        if float(np.abs((S - ctr) @ Vt[1:].T).max()) <= tol:
+            return Prim(AXIAL, ctr, Vt[0] / np.linalg.norm(Vt[0]), float(self.rho), 0.0)
+        if len(S) < 5 or float(np.abs((S - ctr) @ Vt[2]).max()) > tol:
+            return None
+        x, y = (S - ctr) @ Vt[0], (S - ctr) @ Vt[1]
+        try:
+            cx, cy, r = taubin_circle(x, y)
+        except Exception:
+            return None
+        if not (np.isfinite(r) and float(np.abs(np.hypot(x - cx, y - cy) - r).max()) <= tol):
+            return None
+        return Prim(TORUS, ctr + cx * Vt[0] + cy * Vt[1], Vt[2] / np.linalg.norm(Vt[2]), float(r), 0.0, float(self.rho))
+
+
 def _bs_knots_graded(t0: float, t1: float, n: int, ts: np.ndarray, w: np.ndarray, deg: int = _BS_DEG) -> np.ndarray:
     """Clamped knots for n poles, spaced so that every span holds the same
     integral of the density w (sampled at ts)."""
@@ -3562,6 +3889,14 @@ def fit_fillet_correction(dom, th, s, r, th_c, s_c, r_c, tol: float, check_tol: 
     """
     t0, t1, s0, s1 = dom
     n = len(th)
+    # ⚠️ AND NOTHING WILD WHERE THERE IS NO DATA. The domain is a rectangle
+    # in (theta, s), the fillet's end often isn't: on test13 a 6x6 grid
+    # passed the vertices and swung to 0.08 mm in an empty corner, and no
+    # B-spline could follow it. The correction stays within twice the
+    # largest one the data asks for, all over the domain.
+    gu, gv = np.meshgrid(np.linspace(t0, t1, 25), np.linspace(s0, s1, 61), indexing="ij")
+    gu, gv = gu.ravel(), gv.ravel()
+    h_max = 2.0 * max(float(np.abs(r).max()) if n else 0.0, float(np.abs(r_c).max()) if len(r_c) else 0.0) + tol
     for nv in (4, 6, 8, 12, 16, 24, 32):
         for nu in (4, 5, 6):
             if nu * nv > max(16, n // 2):
@@ -3582,7 +3917,10 @@ def fit_fillet_correction(dom, th, s, r, th_c, s_c, r_c, tol: float, check_tol: 
                     continue
                 if float(np.abs(A @ c - r).max()) > tol or float(np.abs(Ac @ c - r_c).max()) > check_tol:
                     continue
-                return FilletCorrection(c.reshape(nu, nv), ku, kv)
+                fc = FilletCorrection(c.reshape(nu, nv), ku, kv)
+                if float(np.abs(fc(gu, gv)).max()) > h_max:
+                    continue
+                return fc
     return None
 
 
@@ -5015,7 +5353,13 @@ def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 
         s2 = arc_deviation(cv, P)
         if s2 > arc_tol:
             continue
-        sc = max(s, s2)
+        # ⚠️ THE VERTICES FIRST. The arc's deviation from the polyline is
+        # mostly the chords' own sag, and it's smaller for a curve slightly
+        # INSIDE them: scored on max(s, s2), test13's R11.75 round took the
+        # r11.748 plane cut over the tangent circle the vertices sit on
+        # exactly. The arc is the gate; among the curves passing it, the one
+        # through the vertices wins.
+        sc = s + 0.05 * s2
         if sc < bs:
             best, bs = cv, sc
     return best
@@ -6708,6 +7052,48 @@ class Segmenter:
         regions = self._rolling_fillets(regions)
         regions = self._blend_patches(regions, frags)
         regions = self._extrusion_bands(regions)
+        # ⚠️ AND ONE LAST CO-SURFACE MERGE: the extruded bands come last, and
+        # a band on the same round as a region found by the seeds stayed a
+        # face of its own (test4: a 5-strip o6 sliver next to the 54-facet
+        # rest of the same round, one CAD face).
+        analytic = [R for R in regions if R.prim.kind != FREE]
+        merged = self._merge_cosurface([(R.prim, list(R.faces)) for R in analytic], "final")
+        if len(merged) < len(analytic):
+            same = {tuple(sorted(R.faces)): R for R in analytic}
+            regions = [same.get(tuple(sorted(rf))) or describe_region(p, topo, rf) for p, rf in merged] + [R for R in regions if R.prim.kind == FREE]
+        # ⚠️ THE WIDE STRIP ON A ROUND. Where the tessellator crossed a round
+        # with one wide strip, the growth took it for a real plane of the
+        # part (big facets are walls) and it stayed a planar face beside its
+        # cylinder (test10: 0.58 mm2, its four vertices 1e-5 from the CAD's
+        # r2.9337, only the chord's sag inside). A loose facet joins the
+        # curved region next to it when every vertex is on the surface, its
+        # middle no further than tol_grow, its normal the surface's, and the
+        # region's boundary can still be walked.
+        owner_f = {i: k for k, R in enumerate(regions) for i in R.faces}
+        eng_like = types.SimpleNamespace(topo=topo)
+        cos10 = math.cos(math.radians(10.0))
+        n_strip = 0
+        for i in range(nF):
+            if i in owner_f or len(topo.verts[i]) < 3:
+                continue
+            c_i = topo.cents[i][None, :]
+            for k in sorted({owner_f[j] for j in topo.adj[i] if j in owner_f}):
+                p = regions[k].prim
+                if p.kind in (PLANE, FREE):
+                    continue
+                if float(np.abs(p.dist(topo.verts[i])).max()) > self.tol_fit or abs(float(p.dist(c_i)[0])) > self.tol_grow:
+                    continue
+                if abs(float(p.normal_at(c_i)[0] @ topo.norms[i])) < cos10:
+                    continue
+                new = sorted(set(regions[k].faces) | {i})
+                if Engine.region_loops(eng_like, new)[0] is None:
+                    continue
+                regions[k] = describe_region(p, topo, new)
+                owner_f[i] = k
+                n_strip += 1
+                break
+        if n_strip:
+            Log.debug(f"Wide strips on curved regions: {n_strip} loose facets taken in")
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
@@ -7381,7 +7767,12 @@ class Segmenter:
         region mostly on the fillet is dissolved into it, one only grazed by
         it keeps all its facets.
         ⚠️ WHEN THE SPINE IS A LINE OR A CIRCLE THE FILLET IS A QUADRIC (a
-        cylinder, a torus): those are left to the exact quadric fit.
+        cylinder, a torus): no B-spline, but the piece is rebuilt on the
+        exact quadric the ball sweeps (exact_piece), not left to its own
+        free fit.
+        Where the CAD's B-spline strays from the ball, the pieces between
+        the fillet's ends are taken in afterwards (absorb_pieces), and the
+        walls' last row along such a rail goes back to its wall.
         """
         if not self.allow_free or self.only_cyl:
             return regions
@@ -7550,11 +7941,237 @@ class Segmenter:
             cnt = Counter(owner[i] for i in F if i in owner)
             gone, keep = set(), set()
             for q, n in cnt.items():
+                if q in dissolved:
+                    continue
                 if q not in supp and n >= 0.5 * len(regions[q].faces):
                     gone.add(q)
                 else:
                     keep |= set(regions[q].faces)
             return gone, keep
+
+        fverts = lambda i: {j for e in topo.f_edges[i] for j in topo.e_verts[e]}
+        # can the engine walk the boundary of these facets?
+        eng_like = types.SimpleNamespace(topo=topo)
+        walks = lambda fs_: bool(fs_) and Engine.region_loops(eng_like, sorted(fs_))[0] is not None
+        vfaces = defaultdict(list)  # vertex -> facets
+        for i_ in range(topo.nF):
+            for v_ in fverts(i_):
+                vfaces[v_].append(i_)
+
+        def holds(FL, spl):
+            """the facets of FL that hold on the B-spline (face_tol, in one projection)"""
+            Qv = [np.vstack([topo.verts[i], (topo.verts[i] + np.roll(topo.verts[i], -1, axis=0)) * 0.5, topo.cents[i][None, :]]) for i in FL]
+            if not Qv:
+                return []
+            dq = np.abs(spl.dist(np.vstack(Qv)))
+            ok_, o = [], 0
+            for i, q in zip(FL, Qv):
+                nv_ = len(topo.verts[i])
+                if float(dq[o : o + nv_].max()) <= max(tol_fit, min(0.5 * float(dq[o + nv_ : o + len(q)].max()), tol_grow)):
+                    ok_.append(i)
+                o += len(q)
+            return ok_
+
+        def exact_piece(k, q, wall_keys):
+            """
+            ⚠️ THE QUADRIC OF AN ANALYTIC SPINE IS KNOWN EXACTLY: USE IT. Left
+            to their own fit, test13's bore-to-floor tori came out R 11.236
+            instead of 11.25 and a second piece with its axis 14 degrees off:
+            seven free parameters bend to take in the first rows of the
+            B-spline fillets next door (tangent there, and on test13 a CAD
+            approximation a few microns off the true ball). The exact torus
+            the ball sweeps between the two walls holds every facet of the
+            CAD torus and none of the neighbours'. Region k takes the facets
+            with every vertex within tol_fit of it (its own, loose ones, and
+            those of the other pieces of the same fillet - same tube radius -
+            around it); the pieces keep what is left, or dissolve.
+            """
+            # (a fit that already is that surface stays: it may carry a radius
+            # snapped to its round value, the ball's is measured)
+            if prims_same(regions[k].prim, q, tol_fit, math.cos(math.radians(0.05))):
+                return False
+            wallf = set(consumed)
+            for kk in wall_keys:
+                wallf |= set(regions[kk[1]].faces) if kk[0] == "r" else {kk[1]}
+            tube = q.r1 if q.kind == TORUS else q.r0
+
+            def piece(j):
+                o_ = owner.get(j)
+                return o_ is None or o_ == k or o_ in dissolved or (o_ in hyp_rho and abs(hyp_rho[o_] - tube) <= 0.1 * tube)
+
+            # (vertices within tol_fit: the surface is exact, and half a coarse
+            # facet's sag reaches into the B-spline fillet's first rows)
+            on_q = lambda j: float(np.abs(q.dist(topo.verts[j])).max()) <= tol_fit
+            core = [i for i in regions[k].faces if on_q(i)]
+            if area(core) < 0.5 * area(regions[k].faces):
+                return False
+            # (and only when it holds more of the piece than the piece's own
+            # fit: on test9 a ball measured 0.01 off would have traded an
+            # exact o13 for an o12.98)
+            p0 = regions[k].prim
+            if len(core) <= sum(1 for i in regions[k].faces if float(np.abs(p0.dist(topo.verts[i])).max()) <= tol_fit):
+                return False
+            F, seen = set(core), set(core) | wallf
+            front = list(core)
+            while front:
+                nxt = []
+                for i in front:
+                    for j in topo.adj[i]:
+                        if j in seen:
+                            continue
+                        seen.add(j)
+                        if areas[j] <= 20.0 * med_area and len(topo.verts[j]) >= 3 and piece(j) and on_q(j):
+                            nxt.append(j)
+                F |= set(nxt)
+                front = nxt
+            F = set(largest_component(sorted(F), topo.adj))
+            if area(F) < 0.5 * area(regions[k].faces):
+                return False
+            for q2 in {owner[i] for i in F if i in owner} - {k}:
+                if q2 in dissolved:
+                    continue
+                rest = [i for i in regions[q2].faces if i not in F]
+                if len(rest) < self.min_faces:
+                    dissolved.add(q2)
+                    for i in rest:
+                        owner.pop(i, None)
+                else:
+                    regions[q2] = describe_region(regions[q2].prim, topo, rest)
+            for i in regions[k].faces:
+                if i not in F:
+                    owner.pop(i, None)
+            regions[k] = describe_region(q, topo, sorted(F))
+            for i in F:
+                owner[i] = k
+            exact_regs.add(k)
+            Log.debug(f"  rolling-ball fillet at {np.round(q.center, 2)}: the exact {q.label()} of its ball takes {len(F)} facets")
+            return True
+
+        touch_cache = {}
+
+        def wall_touch(ball, wall_keys, c_):
+            """
+            Does the ball centred at c_ touch both walls ON THEIR FACETS - not
+            on a wall's phantom extension past its edge? Per centre: both
+            contact points within max(tol_grow, 1% rho) of the wall's facets
+            (exact point-to-triangle distance over the nearest ones).
+            """
+            from scipy.spatial import cKDTree
+
+            lim = max(tol_grow, 0.01 * ball.rho)
+            ok_ = np.ones(len(c_), bool)
+            for side, kk in enumerate(wall_keys):
+                if kk not in touch_cache:
+                    # (the wall's own facets and, connected to them, every
+                    # facet on its surface: test13's r2 round came with a
+                    # five-facet sliver of its own along the stray rail)
+                    Wp = ball.A if side == 0 else ball.B
+                    fs_w = set(regions[kk[1]].faces if kk[0] == "r" else [kk[1]])
+                    front = list(fs_w)
+                    while front:
+                        nxt = [j for i in front for j in topo.adj[i] if j not in fs_w and len(topo.verts[j]) >= 3 and float(np.abs(Wp.dist(topo.verts[j])).max()) <= tol_grow]
+                        nxt = set(nxt)
+                        fs_w |= nxt
+                        front = list(nxt)
+                    T = [np.stack([topo.verts[i][0], topo.verts[i][m], topo.verts[i][m + 1]]) for i in fs_w for m in range(1, len(topo.verts[i]) - 1)]
+                    T = np.array(T) if T else np.zeros((0, 3, 3))
+                    ctr = T.mean(axis=1)
+                    rad = np.linalg.norm(T - ctr[:, None, :], axis=2).max(axis=1) if len(T) else np.zeros(0)
+                    touch_cache[kk] = (T, ctr, rad, cKDTree(ctr) if len(T) else None)
+                T, ctr, rad, tc = touch_cache[kk]
+                if tc is None:
+                    continue
+                n_ = -(ball.sA if side == 0 else ball.sB) * (ball.A if side == 0 else ball.B).normal_at(c_)
+                Q = c_ + ball.rho * n_
+                # (candidates by bounding sphere: a wall's facets can be strips
+                # far longer than the ball, their centroids far from the point)
+                for m, cand in enumerate(tc.query_ball_point(Q, float(rad.max()) + lim)):
+                    if not ok_[m]:
+                        continue
+                    cand = np.asarray(cand, int)
+                    cand = cand[np.linalg.norm(ctr[cand] - Q[m], axis=1) <= rad[cand] + lim]
+                    ok_[m] = len(cand) > 0 and float(_pt_tri_dist(Q[m : m + 1], T, cand[None, :])[0]) <= lim
+            return ok_
+
+        def absorb_pieces(ball, kap, F, gone, keep, supp, blocked, wall_keys):
+            """
+            ⚠️ THE PIECES THE GROWTH COULDN'T REACH. Where the CAD's B-spline
+            strays from the true ball (test13: two of the four bore-to-slot
+            fillets, 2-5e-3 off it) the growth stops at six times the
+            fillet's scatter, and the pieces the quadric fit cut there - a
+            23-facet cylinder r 0.995, a few loose facets - stayed as
+            separate faces inside the fillet. A piece next to the fillet
+            joins it when all its vertices sit on the ball (across the arc,
+            within 1% of its radius: the correction then takes the
+            difference) AND its ball touches both walls on their actual
+            facets. Past a wall's edge the ball rolls on the wall's phantom
+            extension, as close to the mesh as inside (test13: the r1
+            cylinder where the chain runs on along a flat wall, the torus
+            where it runs on along the floor), and what is there is another
+            face.
+            Returns (F, gone, keep, number of facets taken in).
+            """
+            # (the CAD's stray is a fraction of the ball: never past 1% of it)
+            bound = min(max(20.0 * tol_fit, 2e-4 * self.diag), 0.01 * ball.rho)
+            added, took = set(), set()
+            wallf = set(blocked)
+            free_ = lambda q_: q_ is None or q_ in dissolved or q_ in gone
+
+            def on_ball(fs_):
+                fs_ = [i for i in fs_ if len(topo.verts[i]) >= 3]
+                if not fs_:
+                    return False
+                P_, N_ = pts(fs_)
+                c_, r_, t_, o_ = ball.foot(P_, P_ - kap * ball.rho * N_, exact=True)
+                if not o_.all() or float(t_.min()) < -0.05 or float(t_.max()) > 1.05 or float(np.abs(r_).max()) > bound:
+                    return False
+                if not wall_touch(ball, wall_keys, c_).all():
+                    return False
+                w_ = P_ - c_
+                cosn_ = kap * np.einsum("ij,ij->i", w_, N_) / np.maximum(np.linalg.norm(w_, axis=1), 1e-300)
+                return float(cosn_.min()) >= cos_n
+
+            for _ in range(30):
+                ring_ = {j for i in (F | added) for j in topo.adj[i]} - F - added - wallf
+                units = []
+                for q_ in sorted({owner.get(j) for j in ring_} - {None} - took):
+                    if q_ in supp or q_ in dissolved or q_ in gone or q_ in exact_regs or regions[q_].prim.kind == FREE or area(regions[q_].faces) > area(F):
+                        continue
+                    units.append((q_, set(regions[q_].faces) - wallf))
+                for j in sorted(ring_):
+                    # (one by one also the facets an exact quadric of the
+                    # chain took where the two run tangent: those between
+                    # this fillet's walls are this fillet's)
+                    if (free_(owner.get(j)) or owner.get(j) in exact_regs) and areas[j] <= 20.0 * med_area and len(topo.verts[j]) >= 3:
+                        units.append((None, {j}))
+                grew = False
+                for q_, fs_ in units:
+                    if fs_ and on_ball(sorted(fs_)):
+                        added |= fs_
+                        grew = True
+                        if q_ is not None:
+                            took.add(q_)
+                if not grew:
+                    break
+            if not added:
+                return F, gone, keep, 0
+            for q_ in took:
+                keep -= set(regions[q_].faces)
+            for q_ in {owner.get(i) for i in added} & exact_regs:
+                mine = {i for i in added if owner.get(i) == q_}
+                rest = [i for i in regions[q_].faces if i not in mine]
+                # (the quadric must still close its boundary without them)
+                if len(rest) < self.min_faces or not walks(rest):
+                    added -= mine
+                    continue
+                regions[q_] = describe_region(regions[q_].prim, topo, rest)
+                for i in mine:
+                    owner.pop(i)
+            keep -= added
+            if not added:
+                return F, gone, keep, 0
+            Log.debug(f"  rolling-ball fillet r {ball.rho:.4f}: {len(added)} facets ({len(took)} pieces, the rest loose) on its walls taken in")
+            return F | added, gone | took, keep, len(added)
 
         hyp = []
         for k, R in enumerate(regions):
@@ -7569,7 +8186,10 @@ class Segmenter:
                 continue
             hyp.append((area(R.faces), k, rho0))
         hyp.sort(reverse=True)
+        hyp_rho = {k: rho0 for _, k, rho0 in hyp}
+        exact_regs = set()
         consumed, dissolved, out, analytic, general = set(), set(), [], set(), set()
+        stolen_all, out_fl, rails = set(), [], []
         for a_w, k, rho0 in hyp:
             fs = regions[k].faces
             if k in dissolved or sum(1 for i in fs if i in consumed) > 0.5 * len(fs):
@@ -7612,6 +8232,9 @@ class Segmenter:
                 if ball.spine_analytic(max(1e-6 * self.diag, 1e-8)):
                     analytic.add(pair)
                     Log.debug(f"  rolling-ball fillet at {np.round(P.mean(axis=0), 2)}: the spine is a line or a circle, left to the quadrics")
+                    q = ball.spine_quadric(max(1e-6 * self.diag, 1e-8))
+                    if q is not None:
+                        exact_piece(k, q, (keys[a], keys[b]))
                     continue
                 general.add(pair)
             supp = {kk[1] for kk in (keys[a], keys[b]) if kk[0] == "r"}
@@ -7653,6 +8276,12 @@ class Segmenter:
                 Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: vertices without a ball centre")
                 continue
             march(ball, V, c)
+            F, gone, keep, n_in = absorb_pieces(ball, kap, F, gone, keep, supp, blocked, (keys[a], keys[b]))
+            if n_in:
+                V, c, res, th = vfeet(ball, kap, F)
+                if V is None:
+                    continue
+                march(ball, V, c)
             # the correction, and the facets that hold on the corrected surface
             corr = None
             for _ in range(3):
@@ -7663,6 +8292,8 @@ class Segmenter:
                 if corr is None:
                     break
                 F2 = grow(ball, kap, sorted(F), blocked | keep, cap, corr)
+                if F2 is None:
+                    break
                 gone2, keep2 = settle_regions(F2, supp)
                 F2 = set(largest_component(sorted(F2 - keep2), topo.adj))
                 if F2 == F or len(F2) < len(F):
@@ -7686,16 +8317,28 @@ class Segmenter:
             pr.ball = ball
             pr.corr = corr
             # the facets that hold on the B-spline (face_tol, all in one projection)
-            FL = sorted(F)
-            Qv = [np.vstack([topo.verts[i], (topo.verts[i] + np.roll(topo.verts[i], -1, axis=0)) * 0.5, topo.cents[i][None, :]]) for i in FL]
-            dq = np.abs(spl.dist(np.vstack(Qv)))
-            fl, o = [], 0
-            for i, q in zip(FL, Qv):
-                nv_ = len(topo.verts[i])
-                if float(dq[o : o + nv_].max()) <= max(tol_fit, min(0.5 * float(dq[o + nv_ : o + len(q)].max()), tol_grow)):
-                    fl.append(i)
-                o += len(q)
-            fl = largest_component(fl, topo.adj)
+            fl = largest_component(holds(sorted(F), spl), topo.adj)
+            # (and the loose facets around it that hold on it too: at the
+            # corners, where the round turns into the flat wall, the ball's
+            # centre is ill-conditioned and the growth never got there)
+            # (only where its ball touches both walls' facets: past a wall's
+            # edge the B-spline runs on tangent to the next face as closely,
+            # the r1 cylinder at the flat wall)
+            fls = set(fl)
+            for _ in range(5):
+                ring_ = {j for i in fls for j in topo.adj[i]} - fls - blocked
+                add = []
+                for j in sorted(ring_):
+                    if (owner.get(j) is None or owner[j] in dissolved or owner[j] in gone) and areas[j] <= 20.0 * med_area and len(topo.verts[j]) >= 3:
+                        P_, N_ = pts([j])
+                        c_, _, t_, o_ = ball.foot(P_, P_ - kap * ball.rho * N_, exact=True)
+                        if o_.all() and float(t_.min()) >= -0.05 and float(t_.max()) <= 1.05 and wall_touch(ball, (keys[a], keys[b]), c_).all():
+                            add.append(j)
+                add = holds(add, spl)
+                if not add:
+                    break
+                fls |= set(add)
+            fl = sorted(fls)
             if len(fl) < 4 * self.min_faces:
                 Log.debug(f"  rolling-ball fillet r {ball.rho:.4f} from region {k}: {len(fl)} of {len(F)} facets hold on the B-spline")
                 continue
@@ -7709,7 +8352,242 @@ class Segmenter:
             )
             consumed |= set(fl)
             dissolved |= gone
-            out.append(describe_region(pr, topo, fl))
+            out_fl.append((pr, set(fl)))
+            rails.append((len(out_fl) - 1, ball, kap, spl, keys[a], keys[b]))
+        # ⚠️ THE RAILS ARE THE CONTACT LINES. Near the contact the fillet
+        # and its wall are tangent, so a fillet facet there is within
+        # tolerance of the wall too - and the walls' facets are blocked while
+        # the fillet grows. Here and there a row of fillet facets stayed with
+        # the bore: the rail came out a staircase up to 0.08 mm off the
+        # contact line, and the spline through it waved (test13, seen in the
+        # CAD). The CAD tessellation puts its vertices ON the contact line
+        # (95% of the rail's within 1e-3 mm of the ball's), so the wall's
+        # facets with a vertex inside the fillet past delta, and none
+        # outside, are the fillet's.
+        # ⚠️ AND THE WALL IS EVERY REGION ON ITS SURFACE: test13's o19.5 bore
+        # came in four pieces, only one of them the support, and the rail ran
+        # inside the fillet wherever another piece held the strip.
+        # ⚠️ ONLY ONCE ALL THE FILLETS ARE BUILT: done fillet by fillet, the
+        # facets one took changed what the next one grew over (a small
+        # fillet on test13 came out with a 7e-3 correction and broke).
+        taken_all = set().union(*[f for _, f in out_fl]) if out_fl else set()
+        cos_w = math.cos(math.radians(0.5))
+        for idx, ball, kap, spl, key_a, key_b in rails:
+            flset = out_fl[idx][1]
+            delta = max(5.0 * tol_fit, 2e-3 * ball.rho)
+            n_stolen = 0
+            for side, kk in ((0, key_a), (1, key_b)):
+                if kk[0] != "r":
+                    continue
+                Wp = ball.A if side == 0 else ball.B
+                wall = set()
+                for q, Rq in enumerate(regions):
+                    if q == kk[1] or (q not in dissolved and Rq.prim.kind != FREE and prims_same(Rq.prim, Wp, tol_grow, cos_w)):
+                        wall |= set(Rq.faces)
+                wall -= taken_all
+                for _ in range(8):
+                    ring = sorted({j for i in flset for j in topo.adj[i] if j in wall and len(topo.verts[j]) >= 3})
+                    if not ring:
+                        break
+                    Q = np.vstack([topo.verts[j] for j in ring])
+                    Nq = np.vstack([np.tile(topo.norms[j], (len(topo.verts[j]), 1)) for j in ring])
+                    cq, _, tq, oq = ball.foot(Q, Q - kap * ball.rho * Nq)
+                    ph = ball._arc_frame(cq)[2]
+                    off = (tq if side == 0 else 1.0 - tq) * ph * ball.rho
+                    inside, o = [], 0
+                    for j in ring:
+                        m = len(topo.verts[j])
+                        oo = off[o : o + m]
+                        # along the rail only: a facet touching (even by a
+                        # vertex) anything but this wall and this fillet is at
+                        # one of its ends, where the walls meet other features
+                        near = {g for v in fverts(j) for g in vfaces[v]} - {j}
+                        at_end = any(g not in flset and g not in wall for g in near)
+                        if not at_end and oq[o : o + m].all() and float(oo.max()) > delta and float(oo.min()) >= -delta:
+                            inside.append(j)
+                        o += m
+                    add = holds(inside, spl)
+                    if not add:
+                        break
+                    flset |= set(add)
+                    wall -= set(add)
+                    taken_all |= set(add)
+                    stolen_all |= set(add)
+                    n_stolen += len(add)
+            if n_stolen:
+                Log.debug(f"  rolling-ball fillet r {ball.rho:.4f}: {n_stolen} facets of its walls inside the contact lines taken back")
+        # ⚠️ AND CHECKED AGAIN ONCE ALL THE FILLETS ARE IN: the facets one
+        # fillet takes off a wall and those the next one takes can leave it
+        # with a boundary the engine can't walk (a merged non-convex facet
+        # between two of them on test13's o19.5 bore: "boundary can't be
+        # closed"). Taken facets around any new such vertex go back.
+        # (the engine's own walk decides: the direction test above is stricter
+        # than its turn-around-the-vertex rule, and a merged planar facet that
+        # isn't convex already fails it before anything is taken)
+        if stolen_all:
+            taken_now = set().union(*[f for _, f in out_fl])
+            back = set()
+            for q in {owner[i] for i in stolen_all if i in owner}:
+                mine = set(regions[q].faces) & stolen_all
+                rest = set(regions[q].faces) - taken_now
+                if walks(rest) or not walks(rest | mine):
+                    continue
+                # piece by piece: each connected group of taken facets stays
+                # taken only if the wall can still be walked without it
+                cur = rest | mine
+                for grp in sorted(_face_groups(mine, topo.adj), key=len, reverse=True):
+                    if walks(cur - grp):
+                        cur -= grp
+                    else:
+                        back |= grp
+            for _, f in out_fl:
+                mine = f & stolen_all
+                if mine and not walks(f) and walks(f - mine):
+                    back |= mine
+            if back:
+                for _, f in out_fl:
+                    f -= back
+                stolen_all -= back
+                Log.debug(f"  rolling-ball fillets: {len(back)} facets taken off the walls given back (they left a boundary the engine can't walk)")
+        # ⚠️ THE SHORT STRAIGHT PIECE BETWEEN TWO FILLETS. Where test13's
+        # bore-to-slot fillet chain runs along the slot's flat wall, the CAD
+        # has a 0.18 mm2 r1 cylinder - the ball rolling between the bore and
+        # the plane, on a straight spine. Its 7 facets are too few for any
+        # seed (fragment filters), and they stayed as planar scraps between
+        # two B-spline fillets. A loose group touching a rolling-ball fillet
+        # is tried with the ball of that fillet between the walls around it:
+        # if every vertex is on it and its spine is a line or a circle, the
+        # group becomes that exact cylinder or torus.
+        fil_faces = set().union(*[f for _, f in out_fl]) if out_fl else set()
+        held = set(fil_faces)
+        for q, Rq in enumerate(regions):
+            if q not in dissolved:
+                held |= set(Rq.faces)
+        fil_of = {i: n for n, (_, f) in enumerate(out_fl) for i in f}
+        # (a big planar face is a real plane of the part: a wall, not a scrap)
+        loose = {i for i in range(topo.nF) if i not in held and len(topo.verts[i]) >= 3 and areas[i] <= 20.0 * med_area}
+        extra = []
+        for grp in _face_groups(loose, topo.adj):
+            nbf = {fil_of[j] for i in grp for j in topo.adj[i] if j in fil_of}
+            if not nbf or len(grp) > 60:
+                continue
+            G = sorted(grp)
+            P, N = pts(G)
+            sup = supports(G, area(G))
+            keys_g = list(sup)
+            best = None
+            for rho in sorted({out_fl[n][0].ball.rho for n in nbf}):
+                for ia in range(len(keys_g)):
+                    for ib in range(ia + 1, len(keys_g)):
+                        A, B = sup[keys_g[ia]], sup[keys_g[ib]]
+                        for kap in (1.0, -1.0):
+                            c0 = P - kap * rho * N
+                            mA, mB = float(np.median(A.dist(c0))), float(np.median(B.dist(c0)))
+                            if not (0.5 * rho < abs(mA) < 1.5 * rho and 0.5 * rho < abs(mB) < 1.5 * rho):
+                                continue
+                            ball = RollingBall(A, B, math.copysign(1.0, mA), math.copysign(1.0, mB), rho)
+                            c, res, th, ok = ball.foot(P, c0, iters=20)
+                            # facet by facet: a merged planar facet can run past
+                            # the piece's end onto the next fillet (test13: a
+                            # quad across the r1 cylinder's end) - it stays loose
+                            good_v = ok & (th >= -0.1) & (th <= 1.1) & (np.abs(res) <= tol_fit)
+                            on, o = [], 0
+                            for i in G:
+                                m = len(topo.verts[i])
+                                if good_v[o : o + m].all():
+                                    on.append(i)
+                                o += m
+                            on = largest_component(on, topo.adj) if on else []
+                            a_on = area(on)
+                            if len(on) >= 3 and a_on >= 0.5 * area(G) and (best is None or a_on > best[0]):
+                                best = (a_on, ball, on, kap)
+            if best is None:
+                Log.debug(f"  rolling-ball junction at {np.round(P.mean(axis=0), 2)}: {len(G)} loose facets, walls {[f'{k_[0]}{k_[1]} {sup[k_].label()}' for k_ in keys_g]}: no ball sits on them")
+                continue
+            _, ball, G, kap = best
+            P, N = pts(G)
+            c, _, _, _ = ball.foot(P, P - kap * ball.rho * N, iters=20)
+            ext = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+            ball.march(c[int(np.argmin(np.linalg.norm(c - c.mean(axis=0), axis=1)))], 2.0 * ext + ball.rho, 0.1 * ball.rho)
+            q = ball.spine_quadric(max(1e-6 * self.diag, 1e-8))
+            if q is None:
+                Log.debug(f"  rolling-ball junction at {np.round(P.mean(axis=0), 2)}: {len(G)} loose facets on a ball r {ball.rho:.4f}, but its spine isn't a line or a circle")
+                continue
+            dq = np.abs(q.dist(P))
+            if float(dq.max()) > tol_fit or not all(self.within(q, i) for i in G):
+                Log.debug(f"  rolling-ball junction at {np.round(P.mean(axis=0), 2)}: {q.label()} off by {float(dq.max()):.1e}")
+                continue
+            q.rms = float(np.sqrt(np.mean(dq**2)))
+            extra.append(describe_region(q, topo, G))
+            Log.debug(f"  rolling-ball junction at {np.round(P.mean(axis=0), 2)}: {len(G)} loose facets are a {q.label()} (vertices max {float(dq.max()):.1e})")
+        # ⚠️ AND THE WALL'S LAST ROW, WHERE THE CAD'S EDGE STRAYS. The rail
+        # of an approximated fillet is the CAD's own edge curve, and on
+        # test13 two of them run up to 4.3e-3 off the r2 round they lie on
+        # (the other two within 7e-5): the round's facets along that
+        # stretch have one vertex off its surface, the quadric fit left them
+        # out, and they stayed planar scraps or a cylinder r 1.815 of their
+        # own between the round and the fillet. A loose group (or a small
+        # region) on the wall's side of a rail joins the wall when every
+        # vertex is on it, or is a vertex of the fillet's facets lying on the
+        # fillet and within tol_grow of the wall: the edge between the two
+        # faces runs through those vertices anyway.
+        if rails:
+            held2 = set(held) | {i for R in extra for i in R.faces}
+            fil_v = {}
+            for idx, ball, kap, spl, key_a, key_b in rails:
+                for i in out_fl[idx][1]:
+                    for v_ in fverts(i):
+                        fil_v.setdefault(v_, set()).add(idx)
+            n_back = 0
+            for idx, ball, kap, spl, key_a, key_b in rails:
+                flset = out_fl[idx][1]
+                for kk in (key_a, key_b):
+                    if kk[0] != "r" or kk[1] in dissolved:
+                        continue
+                    w = kk[1]
+                    W = regions[w]
+                    wset = set(W.faces)
+                    small = {q for q, Rq in enumerate(regions) if q != w and q not in dissolved and q not in exact_regs and Rq.prim.kind != FREE
+                             and area(Rq.faces) <= 0.1 * area(W.faces) and any(j in wset for i in Rq.faces for j in topo.adj[i])}
+                    pool = {i for i in range(topo.nF) if i not in held2 and len(topo.verts[i]) >= 3 and areas[i] <= 20.0 * med_area}
+                    pool |= {i for q in small for i in regions[q].faces}
+                    pool -= flset
+
+                    def fits_wall(i):
+                        for v_ in fverts(i):
+                            d_ = abs(float(W.prim.dist(topo.vpos[v_][None, :])[0]))
+                            if d_ <= tol_fit:
+                                continue
+                            if d_ <= tol_grow and idx in fil_v.get(v_, ()) and abs(float(spl.dist(topo.vpos[v_][None, :])[0])) <= tol_fit:
+                                continue
+                            return False
+                        return True
+
+                    for grp in _face_groups(pool, topo.adj):
+                        if not any(j in wset for i in grp for j in topo.adj[i]) or not any(j in flset for i in grp for j in topo.adj[i]):
+                            continue
+                        owners_ = {owner.get(i) for i in grp} - {None}
+                        if any(q not in small for q in owners_ if q not in dissolved):
+                            continue
+                        if any(set(regions[q].faces) - grp for q in owners_ if q in small):
+                            continue
+                        if not all(fits_wall(i) for i in grp):
+                            continue
+                        new = sorted(wset | grp)
+                        if not walks(new):
+                            continue
+                        regions[w] = describe_region(W.prim, topo, new)
+                        W, wset = regions[w], set(new)
+                        for q in owners_:
+                            if q in small:
+                                dissolved.add(q)
+                        for i in grp:
+                            owner[i] = w
+                        held2 |= grp
+                        n_back += len(grp)
+            if n_back:
+                Log.debug(f"  rolling-ball fillets: {n_back} facets along the rails back to their wall")
+        out = [describe_region(pr, topo, sorted(f)) for pr, f in out_fl] + extra
         if not out:
             return regions
         Log.debug(f"Rolling-ball fillets: {len(out)} B-spline faces in place of {len(dissolved)} regions")
@@ -8656,6 +9534,14 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
     samples the pcurve is exact, what's left there is the true distance
     curve-surface - the sag of a chord, which more samples can't remove).
     """
+    # ⚠️ AND A SPLINE THROUGH 60 VERTICES IS NOT A CIRCLE: its shape
+    # changes at every knot, and 97 samples on a 64-pole rail of test13's
+    # rolling-ball fillet left 1.4e-2 of interpolation error, refused as
+    # "pcurve off". The samples start from three per pole.
+    try:
+        n = max(n, min(3 * int(curve.NbPoles()) + 1, 400))
+    except Exception:
+        pass
     out = None
     for nn in (n, 2 * n - 1, 4 * n - 3):
         out = _make_pcurve_n(sp, curve, t0, t1, traverse_fwd, u_prev, v_prev, nn)
@@ -10891,6 +11777,71 @@ def _chain_spline(P: np.ndarray, max_turn_deg: float = 25.0) -> Optional["CGeom"
         return None
 
 
+def _chain_pieces(V: np.ndarray, cat, seq, exact, tol: float, max_turn_deg: float = 25.0):
+    """
+    Pieces of a chain that took no single curve: cut at its corners (a turn
+    over max_turn_deg between two segments), then each piece cut again
+    around its longest run of vertices within tol of one of the EXACT
+    curves (two segments at least). Returns [(edges, vertices), ...], or []
+    when there's nothing to cut.
+    """
+    seq = list(seq)
+    cat = list(cat)
+    closed = seq[0] == seq[-1]
+    P = V[np.array(seq)]
+    D = np.diff(P, axis=0)
+    n_ = np.linalg.norm(D, axis=1)
+    if len(D) < 2 or n_.min() <= 1e-12:
+        return []
+    D = D / n_[:, None]
+    cmax = math.cos(math.radians(max_turn_deg))
+    corner = [j for j in range(1, len(seq) - 1) if float(D[j - 1] @ D[j]) < cmax]
+    if closed:
+        if float(D[-1] @ D[0]) < cmax:
+            corner = [0] + corner
+        if not corner:
+            return []
+        # start at the first corner: the ring becomes an open chain
+        k = corner[0]
+        seq = seq[k:-1] + seq[:k + 1]
+        cat = cat[k:] + cat[:k]
+        corner = [j - k for j in corner[1:]]
+    cuts = [0] + corner + [len(seq) - 1]
+    pieces = [(cat[a:b], seq[a:b + 1]) for a, b in zip(cuts[:-1], cuts[1:]) if b > a]
+    out = []
+    for pc, ps in pieces:
+        best = None
+        if exact and len(pc) >= 3:
+            Q = V[np.array(ps)]
+            for cv in exact:
+                try:
+                    ok = np.abs(cv.dist(Q)) <= tol
+                except Exception:
+                    continue
+                j = 0
+                while j < len(ok):
+                    if not ok[j]:
+                        j += 1
+                        continue
+                    e = j
+                    while e + 1 < len(ok) and ok[e + 1]:
+                        e += 1
+                    if e - j >= 2 and (best is None or e - j > best[1] - best[0]):
+                        best = (j, e)
+                    j = e + 1
+        if best is not None and best[1] - best[0] < len(pc):
+            a, b = best
+            for x, y in ((0, a), (a, b), (b, len(pc))):
+                if y > x:
+                    out.append((pc[x:y], ps[x:y + 1]))
+        else:
+            out.append((pc, ps))
+    out = [(c, s) for c, s in out if len(c) >= 2]
+    if len(out) == 1 and len(out[0][0]) == len(cat):
+        return []
+    return out
+
+
 def snap_arcs(shape, tol: float, title: str = "Arcs"):
     """
     Replaces every chain of segments running between the SAME two faces
@@ -10927,18 +11878,20 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
     fatti = n_exact = n_closed = n_spline = 0
     vt_backup: Dict[int, float] = {}
     sliver = 0.0  # summed area between the replaced polylines and their curves
-    for cat, seq, facce in cands:
+    def attempt(cat, seq, facce) -> bool:
+        """One chain (or piece of one) -> one curve; True if it was replaced."""
+        nonlocal fatti, sliver, n_exact, n_closed, n_spline
         P = topo.vpos[np.array(seq)]
         closed = seq[0] == seq[-1]
         Pq = P[:-1] if closed else P
         if len(Pq) < 3:
-            continue
+            return False
         seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
         if not closed:
             dr = P[-1] - P[0]
             L = float(np.linalg.norm(dr))
             if L < 1e-12:
-                continue
+                return False
             d0 = P - P[0]
             dr = dr / L
             dev_retta = float(np.linalg.norm(d0 - np.outer(d0 @ dr, dr), axis=1).max())
@@ -10946,7 +11899,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
             dev_retta = math.inf
         pa, pb = prim_of(facce[0]), prim_of(facce[1])
         if pa is not None and pb is not None and pa.kind == PLANE and pb.kind == PLANE:
-            continue  # two planes meet along a line: nothing to snap
+            return False  # two planes meet along a line: nothing to snap
         # the polyline is a chord of the true curve: between two vertices the
         # curve may stand off by the chord's sag, never by more than a slice
         # of the segment (a 45-degree step sags by a tenth of its chord)
@@ -10974,28 +11927,35 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
         # 3. along a FREE-FORM face: the spline through the vertices. The
         # pcurve may stand off as far as the edges it replaces already do
         # (their tolerance is the fit's deviation on those vertices), no more.
+        # ⚠️ AND BETWEEN TWO ANALYTIC FACES WITH NO CLOSED-FORM MEET: test13's
+        # R11.75 round runs into the slot's o4 rounds (torus x cylinder,
+        # axes crossed) along four 16-segment polylines that no circle
+        # explains. The spline goes there too, held to the bare tolerance on
+        # both faces (the edges' own tolerance doesn't widen it: those are
+        # exact surfaces, not a fit).
         spline = False
         lim_p = tol
-        if cv is None and not closed and len(cat) >= 3 and (pa is None or pb is None) and dev_retta > tol:
+        if cv is None and not closed and len(cat) >= 3 and dev_retta > tol:
             sp_c = _chain_spline(P)
             if sp_c is not None and arc_deviation(sp_c, P) <= arc_tol:
                 cv, spline = sp_c, True
-                lim_p = max(tol, 1.2 * max(float(bt_Tolerance(topo.edges[k])) for k in cat))
+                if pa is None or pb is None:
+                    lim_p = max(tol, 1.2 * max(float(bt_Tolerance(topo.edges[k])) for k in cat))
         where = f"chain of {len(cat)} at {np.round(P[len(P) // 2], 2)}"
         if cv is None:
             Log.debug(f"  arc: {where}: no curve (exact candidates {len(ex_c) if pa is not None and pb is not None else 0})")
-            continue
+            return False
         # it must turn one way only (no back-and-forth along the curve)
         if cv.period:
             tt = np.unwrap(np.asarray(cv.param(P), float))
             dt = np.diff(tt)
             if not (np.all(dt > 0) or np.all(dt < 0)):
                 Log.debug(f"  arc: {where}: goes back and forth along the curve")
-                continue
+                return False
             span = abs(float(tt[-1] - tt[0]))
             if (closed and abs(span - 2 * math.pi) > 0.25 * math.pi) or (not closed and span >= 2 * math.pi - 1e-9):
                 Log.debug(f"  arc: {where}: spans {math.degrees(span):.0f} degrees")
-                continue
+                return False
         i1, i2 = seq[0], seq[-1]
         V1 = td_Vertex(topo.vmap.FindKey(i1 + 1))
         V2 = td_Vertex(topo.vmap.FindKey(i2 + 1))
@@ -11023,7 +11983,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
             Log.debug(f"  arc: {where}: MakeEdge refused")
             for j, t in bumped.items():
                 set_tolerance(td_Vertex(topo.vmap.FindKey(j + 1)), t)
-            continue
+            return False
         E = td_Edge(E)
         # tangent junctions at the two ends (see tangent_gap)
         own = set(cat)
@@ -11089,22 +12049,55 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
         if buono:
             for fi in facce:
                 F_new = td_Face(rl.Apply(topo.faces[fi]))
-                if not is_valid(F_new) or abs(face_area(F_new) - topo.areas[fi]) > crescent:
+                # ⚠️ nor may it squash a face: a lens between a straight edge
+                # and a 6-segment polyline (test8, 0.047 mm2) closed down to
+                # 0.0006 under a circle fitted through the polyline - valid
+                # in memory, "SelfIntersectingWire" once read back from STEP
+                a_new = face_area(F_new) if is_valid(F_new) else 0.0
+                if not is_valid(F_new) or abs(a_new - topo.areas[fi]) > crescent or a_new < 0.5 * topo.areas[fi]:
                     Log.debug(f"  arc: {where}: face {fi} " + (f"area {topo.areas[fi]:.4f} -> {face_area(F_new):.4f} (crescent {crescent:.1e})" if is_valid(F_new) else "invalid: " + ", ".join(check_detail(F_new, 3))))
                     buono = False
                     break
         if not buono:
             for j, t in bumped.items():
                 set_tolerance(td_Vertex(topo.vmap.FindKey(j + 1)), t)
-            continue
+            return False
         rs.Replace(td_Edge(topo.edges[cat[0]].Oriented(TopAbs_FORWARD)), E_rep)
         for k in cat[1:]:
             rs.Remove(td_Edge(topo.edges[k].Oriented(TopAbs_FORWARD)))
+        Log.debug(f"  arc: {where}: -> {cv.label()} (faces {facce[0]}, {facce[1]}, areas {topo.areas[facce[0]]:.4f}, {topo.areas[facce[1]]:.4f})")
         fatti += 1
         sliver += crescent
         n_exact += int(exact)
         n_closed += int(closed)
         n_spline += int(spline)
+        return True
+
+    n_split = 0
+    for cat, seq, facce in cands:
+        if attempt(cat, seq, facce):
+            continue
+        # ⚠️ ONE CURVE FOR THE WHOLE CHAIN OR NOTHING was too strict. The rim
+        # of test13's R11.75 round is 57 segments on the exact tangent circle
+        # but for the last two at each end, where the round meets the
+        # fillets (the vertex there stands 0.05 off the circle): the circle
+        # was refused and all 57 stayed. A rolling-ball fillet's rail with
+        # one corner in it was refused by the spline for the same reason.
+        # Second try: the chain is cut at its corners, and the longest run
+        # sitting on an exact intersection is taken apart from its tails.
+        pa_, pb_ = prim_of(facce[0]), prim_of(facce[1])
+        ex_ = surf_surf_curves(pa_, pb_, tol) if (pa_ is not None and pb_ is not None) else []
+        # (a long piece that fails is halved, up to three times: the rail of
+        # test13's big fillet, 87 segments once its corners were gone, moved
+        # the bore's area by 2.7 mm2 as one spline and passed in halves)
+        work = [(c_, s_, 0) for c_, s_ in _chain_pieces(topo.vpos, cat, seq, ex_, tol)]
+        while work:
+            c_, s_, depth = work.pop()
+            if attempt(c_, s_, facce):
+                n_split += 1
+            elif depth < 3 and len(c_) >= 8:
+                h = len(c_) // 2
+                work += [(c_[:h], s_[: h + 1], depth + 1), (c_[h:], s_[h:], depth + 1)]
     if not fatti:
         Log.info(f"{title}: no polyline to promote "
                  f"({len(cands)} chains examined)   [{time.perf_counter() - t0:.2f}s]")
@@ -11143,7 +12136,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
         return shape, 0
     n0, n1 = len(topo.edges), len(Topo(nuovo).edges)
     Log.ok(f"{title}: {fatti:,} polylines promoted to exact curves "
-           f"({n_exact} exact intersections, {n_spline} splines along free-form faces, {n_closed} closed rings) · "
+           f"({n_exact} exact intersections, {n_spline} splines along free-form faces, {n_closed} closed rings, {n_split} pieces of split chains) · "
            f"edges {n0:,} -> {n1:,} · volume {100 * (v1 - v0) / max(abs(v0), 1e-12):+.4f}%"
            f"   [{time.perf_counter() - t0:.2f}s]")
     return nuovo, fatti
@@ -11232,6 +12225,52 @@ def run_phase(
         Log.info(f"Second pass on {len(pending)} regions rejected for polygonal boundaries")
 
     res.shape = eng.shape
+    # ⚠️ EVERY REPLACEMENT IS CHECKED, THE SUM ISN'T ALWAYS. On test12 four
+    # faces came out of Phase C with an invalid edge (two small clusters: a
+    # cone and a sliver plane, a torus and a sphere), each fine when its
+    # region went in and broken by a neighbour's later; the final Phase A,
+    # which rolls back only from a VALID start, spread them to 52 faces and
+    # the STEP writer wrote an EMPTY file. Repaired on a copy, kept only if
+    # it leaves fewer invalid faces, the same faces, no new free edge and the
+    # same volume.
+    if not is_valid(res.shape):
+        nbad = lambda sh: sum(1 for f in explore(sh, TopAbs_FACE) if check_detail(td_Face(f)))
+        b0, f0, v0 = nbad(res.shape), count_free_edges(res.shape), shape_volume(res.shape)
+
+        def keeps(fx):
+            return (fx is not None and not fx.IsNull() and nbad(fx) < b0 and count_sub(fx, TopAbs_FACE) == count_sub(res.shape, TopAbs_FACE)
+                    and count_free_edges(fx) <= f0 and abs(shape_volume(fx) - v0) <= 1e-5 * max(abs(v0), 1e-9))
+
+        # first the edges of the invalid faces alone (SameParameter and the
+        # vertices' tolerance: on test12 that was all of it); ShapeFix on the
+        # whole solid mended them too, but opened two free edges
+        fx = None
+        try:
+            fx = copy_shape(res.shape)
+            for f in explore(fx, TopAbs_FACE):
+                f = td_Face(f)
+                if check_detail(f):
+                    for e in explore(f, TopAbs_EDGE):
+                        _ShapeFix.ShapeFix_Edge().FixSameParameter(td_Edge(e), f)
+                        _ShapeFix.ShapeFix_Edge().FixVertexTolerance(td_Edge(e), f)
+        except Exception as e:
+            Log.debug(f"edge repair failed: {e}")
+            fx = None
+        if not keeps(fx):
+            try:
+                sf = ShapeFix_Shape(copy_shape(res.shape))
+                sf.SetPrecision(1e-7)
+                sf.SetMaxTolerance(max_edge_tol)
+                sf.Perform()
+                fx = sf.Shape()
+            except Exception as e:
+                Log.debug(f"ShapeFix failed: {e}")
+                fx = None
+        if keeps(fx):
+            Log.info(f"Invalid faces after the replacements: {b0} -> {nbad(fx)} (edges repaired)")
+            res.shape = fx
+        else:
+            Log.warn(f"{b0} invalid faces after the replacements, not mended")
     res.regions = regions
     res.n_ok = sum(1 for R in regions if R.status == "OK")
     res.n_fail = len(regions) - res.n_ok
@@ -11445,6 +12484,13 @@ def parse_args(argv=None):
         "edges without moving a single face)",
     )
     g.add_argument(
+        "--pcurves",
+        action="store_true",
+        help="write the edges' 2D curves on the faces too (pcurves). Off by "
+        "default, as in the CAD's own files: the reader rebuilds them, and "
+        "the file is 5-7 times smaller",
+    )
+    g.add_argument(
         "--arc-tol",
         type=float,
         default=None,
@@ -11616,14 +12662,20 @@ def main(argv=None) -> int:
         _diag = float(np.linalg.norm(_V.max(axis=0) - _V.min(axis=0))) if len(_V) else 1.0
         _tolA = args.arc_tol if args.arc_tol and args.arc_tol > 0 else (
             args.tol if args.tol and args.tol > 0 else max(2e-4, 1e-5 * _diag))
-        shape, _ = snap_arcs(shape, _tolA)
+        # ⚠️ AGAIN, while it finds something: a chain is judged with its
+        # neighbors as they are, and once theirs have become curves it can
+        # pass (a second pass: test9 -118 edges, 42 of them exact
+        # intersections; test13 351 -> 283; a third finds nothing)
+        for _pass in range(3):
+            shape, _n = snap_arcs(shape, _tolA, title="Arcs" if _pass == 0 else f"Arcs (pass {_pass + 1})")
+            if not _n:
+                break
     Log.banner("Saving")
     # ⚠️ THE LAST WORD BEFORE WRITING. Every conversion validates itself,
     # but the checks are local: if something slipped through, this is where it shows.
     if not is_valid(shape):
         Log.warn("the finished part doesn't pass BRepCheck: " + ", ".join(check_detail(shape, 4)))
-    write_step(shape, out_path, src=args.input)
-    _ri, _ = read_step(out_path)
+    _ri = write_step_checked(shape, out_path, src=args.input, pcurves=args.pcurves)
     if is_valid(shape) and not is_valid(_ri):
         Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))
     if args.report:
