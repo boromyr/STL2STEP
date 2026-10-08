@@ -7073,25 +7073,58 @@ class Segmenter:
         eng_like = types.SimpleNamespace(topo=topo)
         cos10 = math.cos(math.radians(10.0))
         n_strip = 0
-        for i in range(nF):
-            if i in owner_f or len(topo.verts[i]) < 3:
-                continue
-            c_i = topo.cents[i][None, :]
-            for k in sorted({owner_f[j] for j in topo.adj[i] if j in owner_f}):
-                p = regions[k].prim
-                if p.kind in (PLANE, FREE):
+        med_a = float(np.median([topo.areas[i] for i in range(nF)])) if nF else 0.0
+        # (a big facet is a real plane of the part, not a strip)
+        loose_f = {i for i in range(nF) if i not in owner_f and len(topo.verts[i]) >= 3 and topo.areas[i] <= 20.0 * med_a}
+
+        def on_chords(p, G):
+            """every vertex of G on the surface, or off it no more than the
+            strip's own chord (a T-vertex of the next tessellation along its
+            long side: on test10 1.8e-3 inside the round, the strip's middle
+            1.3-1.9e-3): on the chord's side, at most twice its sag"""
+            V = np.unique(np.round(np.vstack([topo.verts[i] for i in G]), 9), axis=0)
+            d = p.dist(V)
+            dc = p.dist(np.array([topo.cents[i] for i in G]))
+            off = np.abs(d) > self.tol_fit
+            if int((~off).sum()) < 2 or float(np.abs(d).max()) > self.tol_grow:
+                return False
+            if not off.any():
+                return True
+            sg = float(np.sign(np.mean(dc)))
+            return bool(np.all(np.sign(d[off]) == sg) and float(np.abs(d[off]).max()) <= 2.0 * float(np.abs(dc).max()) + self.tol_fit)
+
+        curved = sorted({owner_f[j] for i in loose_f for j in topo.adj[i] if j in owner_f and regions[owner_f[j]].prim.kind not in (PLANE, FREE)})
+        for k in curved:
+            p = regions[k].prim
+            # the loose facets near the surface, a few rings out (a strip's
+            # far end holds the chord's other end), then the connected groups
+            # of them touching the region
+            near, front = set(), {j for i in regions[k].faces for j in topo.adj[i] if j in loose_f}
+            for _ in range(6):
+                ok_ = set()
+                for i in front - near:
+                    c_i = topo.cents[i][None, :]
+                    if abs(float(p.dist(c_i)[0])) > self.tol_grow or float(np.abs(p.dist(topo.verts[i])).max()) > self.tol_grow:
+                        continue
+                    if abs(float(p.normal_at(c_i)[0] @ topo.norms[i])) < cos10:
+                        continue
+                    ok_.add(i)
+                near |= ok_
+                front = {j for i in ok_ for j in topo.adj[i] if j in loose_f and j not in near}
+            kset = set(regions[k].faces)
+            for G in _face_groups(near - set(owner_f), topo.adj):
+                if len(G) > 20 or not any(j in kset for i in G for j in topo.adj[i]):
                     continue
-                if float(np.abs(p.dist(topo.verts[i])).max()) > self.tol_fit or abs(float(p.dist(c_i)[0])) > self.tol_grow:
+                if not on_chords(p, G):
                     continue
-                if abs(float(p.normal_at(c_i)[0] @ topo.norms[i])) < cos10:
-                    continue
-                new = sorted(set(regions[k].faces) | {i})
+                new = sorted(kset | set(G))
                 if Engine.region_loops(eng_like, new)[0] is None:
                     continue
                 regions[k] = describe_region(p, topo, new)
-                owner_f[i] = k
-                n_strip += 1
-                break
+                kset = set(new)
+                for i in G:
+                    owner_f[i] = k
+                n_strip += len(G)
         if n_strip:
             Log.debug(f"Wide strips on curved regions: {n_strip} loose facets taken in")
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
