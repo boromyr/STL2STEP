@@ -13,3 +13,6 @@ __pycache__/
 
 # local backups
 .bak/
+
+# viewer uploads
+viewer_uploads/

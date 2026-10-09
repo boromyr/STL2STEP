@@ -1,0 +1,951 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Refit Viewer</title>
+<style>
+:root {
+  --bg: #121418;
+  --bg-view: radial-gradient(ellipse at 50% 40%, #1d2026 0%, #121418 75%);
+  --panel: #17191e;
+  --card: #1d2026;
+  --line: #2a2e36;
+  --line-soft: #23262d;
+  --text: #e3e6eb;
+  --muted: #8a909b;
+  --faint: #5c626d;
+  --accent: #6fd6bf;
+  --accent-ink: #0d2a24;
+  --warn: #f0b85b;
+  --err: #f07070;
+  --ok: #7fd68f;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, "SFMono-Regular", Menlo, monospace;
+  --sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.4 var(--sans); overflow: hidden; }
+button, input, select { font: inherit; color: inherit; }
+#app { display: grid; grid-template-columns: 1fr 380px; grid-template-rows: 1fr 28px; height: 100vh; }
+#view { position: relative; grid-row: 1; grid-column: 1; background: var(--bg-view); overflow: hidden; }
+#c { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+#panel { grid-row: 1 / span 2; grid-column: 2; background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 20px 20px 24px; }
+#status { grid-row: 2; grid-column: 1; display: flex; align-items: center; justify-content: center; gap: 14px; color: var(--muted); font-size: 12.5px; border-top: 1px solid var(--line-soft); background: var(--panel); white-space: nowrap; overflow: hidden; }
+#status b { color: var(--text); font-weight: 500; }
+
+/* segmented controls */
+.seg { display: inline-flex; gap: 4px; padding: 5px; background: rgba(23,25,30,.92); border: 1px solid var(--line); border-radius: 10px; backdrop-filter: blur(6px); }
+.seg button { border: 0; background: transparent; color: var(--muted); padding: 7px 16px; border-radius: 7px; cursor: pointer; white-space: nowrap; }
+.seg button:hover:not(:disabled) { color: var(--text); }
+.seg button.on { background: #2a2e37; color: var(--text); }
+.seg button:disabled { color: #3f444d; cursor: default; }
+.seg .sep { width: 1px; background: var(--line); margin: 4px 4px; }
+#tabs { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); }
+#display { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); }
+#views { position: absolute; top: 18px; right: 18px; }
+#views button { padding: 6px 10px; font-size: 12.5px; }
+#gizmo { position: absolute; left: 14px; bottom: 14px; width: 96px; height: 96px; pointer-events: none; }
+
+#tip { position: absolute; pointer-events: none; background: rgba(15,17,21,.94); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 12.5px; display: none; white-space: nowrap; z-index: 5; }
+#tip .k { color: var(--muted); }
+#tip .t { font-weight: 600; }
+#overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--muted); background: rgba(18,20,24,.55); z-index: 4; }
+#overlay.show { display: flex; }
+.spin { width: 26px; height: 26px; border: 2.5px solid #2f343d; border-top-color: var(--accent); border-radius: 50%; animation: sp .8s linear infinite; }
+@keyframes sp { to { transform: rotate(360deg); } }
+#empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--faint); text-align: center; pointer-events: none; }
+#drop { position: absolute; inset: 10px; border: 2px dashed var(--accent); border-radius: 14px; display: none; align-items: center; justify-content: center; color: var(--accent); background: rgba(111,214,191,.06); z-index: 6; font-size: 16px; }
+#drop.show { display: flex; }
+
+/* log drawer */
+#log { position: absolute; left: 0; right: 0; bottom: 0; height: 36%; min-height: 140px; background: rgba(13,14,17,.97); border-top: 1px solid var(--line); display: none; flex-direction: column; z-index: 3; }
+#log.show { display: flex; }
+#logbar { display: flex; align-items: center; gap: 10px; padding: 6px 10px 6px 14px; border-bottom: 1px solid var(--line-soft); font-size: 12.5px; color: var(--muted); }
+#logbar .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#logbar button { background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; cursor: pointer; color: var(--muted); }
+#logbar button:hover { color: var(--text); }
+#logtext { flex: 1; overflow: auto; margin: 0; padding: 8px 14px 14px; font: 12px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; color: #c9cdd4; }
+#logtext .ok { color: var(--ok); } #logtext .warn { color: var(--warn); } #logtext .error { color: var(--err); }
+#logtext .debug { color: var(--faint); } #logtext .banner { color: var(--accent); font-weight: 600; }
+#logtoggle { position: absolute; right: 18px; bottom: 18px; }
+#display, #logtoggle, #gizmo { transition: bottom .15s; }
+#view.logopen #display, #view.logopen #logtoggle { bottom: calc(36% + 14px); }
+#view.logopen #gizmo { bottom: calc(36% + 10px); }
+
+/* panel */
+h2 { font-size: 17px; font-weight: 600; margin: 0 0 16px; }
+h3 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 26px 0 10px; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; }
+.row label, .lbl { color: #b7bcc5; }
+.row .hint { color: var(--faint); font-size: 11.5px; }
+.field { background: var(--card); border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; outline: none; min-width: 0; }
+.field:focus { border-color: #3d6f64; }
+select.field { cursor: pointer; }
+.num { width: 92px; text-align: right; }
+.wide { width: 100%; }
+.filerow { display: flex; gap: 6px; }
+.filerow select { flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--card); border-radius: 7px; padding: 6px 11px; cursor: pointer; color: #c4c9d1; white-space: nowrap; }
+.btn:hover { color: var(--text); border-color: #3a3f48; }
+.big { width: 100%; padding: 11px; border-radius: 8px; border: 0; font-weight: 600; cursor: pointer; margin-top: 14px; }
+#go { background: var(--accent); color: var(--accent-ink); }
+#go:hover { filter: brightness(1.06); }
+#go:disabled { background: #2a2e36; color: #5c626d; cursor: default; filter: none; }
+#cancel { background: transparent; border: 1px solid #5a3434; color: var(--err); display: none; }
+.presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 9px; margin-bottom: 8px; }
+.presets button { border: 0; background: transparent; color: var(--muted); padding: 6px 2px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
+.presets button.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.checks { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; margin-top: 6px; }
+.checks label { display: flex; align-items: center; gap: 7px; font-size: 13px; color: #b7bcc5; cursor: pointer; min-height: 26px; }
+.checks input { accent-color: var(--accent); }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; margin: 10px 0 4px; list-style: none; }
+details summary::before { content: "▸ "; } details[open] summary::before { content: "▾ "; }
+#cmd { margin-top: 12px; font: 11.5px/1.45 var(--mono); color: var(--muted); background: #121418; border: 1px solid var(--line-soft); border-radius: 7px; padding: 8px 10px; word-break: break-all; cursor: copy; position: relative; }
+#cmd:hover { color: #b7bcc5; }
+#cmdnote { margin-top: 6px; font-size: 12px; color: var(--faint); }
+#cmdnote.warn { color: var(--warn); }
+#runstate { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); font-size: 13px; }
+#runstate .top { display: flex; align-items: center; gap: 10px; }
+#runstate .spin { width: 15px; height: 15px; border-width: 2px; flex: none; }
+#runstate .ph { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#runstate .tm { color: var(--muted); font-variant-numeric: tabular-nums; }
+#runstate .sum { margin-top: 6px; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+#runstate a { color: var(--accent); cursor: pointer; text-decoration: none; }
+
+table.stats { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+table.stats td, table.stats th { padding: 4px 0; text-align: right; }
+table.stats th { color: var(--faint); font-weight: 500; font-size: 11.5px; }
+table.stats td:first-child, table.stats th:first-child { text-align: left; color: #b7bcc5; }
+table.stats td.dim { color: var(--faint); }
+table.stats tr.sw { cursor: pointer; }
+table.stats tr.sw:hover td { color: var(--text); }
+table.stats tr.sw.iso td:first-child { color: var(--accent); }
+table.stats tr.gap td { padding-top: 10px; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+#engine { margin-top: 28px; padding: 14px; border-radius: 10px; background: var(--card); border: 1px solid var(--line-soft); font-size: 12.5px; color: var(--muted); line-height: 1.6; word-break: break-all; }
+#engine b { color: var(--text); font-weight: 500; }
+
+@media (max-width: 860px) {
+  #app { grid-template-columns: 1fr; grid-template-rows: 58vh 28px auto; height: auto; min-height: 100vh; }
+  html, body { overflow: auto; }
+  #panel { grid-row: 3; grid-column: 1; border-left: 0; border-top: 1px solid var(--line); padding: 16px; }
+  #view { grid-row: 1; } #status { grid-row: 2; }
+  #views { display: none; }
+  .seg button { padding: 6px 10px; }
+}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app">
+  <main id="view">
+    <canvas id="c" tabindex="0"></canvas>
+    <div id="empty">Pick a mesh on the right, or drop an .stl / .step here</div>
+    <div class="seg" id="tabs">
+      <button data-tab="input" disabled>Input</button>
+      <button data-tab="output" disabled>STEP</button>
+      <button data-tab="cad" disabled title="&lt;name&gt;_original.step">Original CAD</button>
+    </div>
+    <div class="seg" id="views">
+      <button data-view="fit" title="Fit (F)">Fit</button>
+      <button data-view="iso" title="Isometric (I)">Iso</button>
+      <button data-view="top">Top</button>
+      <button data-view="front">Front</button>
+      <button data-view="right">Right</button>
+    </div>
+    <div class="seg" id="display">
+      <button data-disp="shaded" class="on">Shaded</button>
+      <button data-disp="edges" class="on">Edges</button>
+      <button data-disp="mesh">Triangles</button>
+      <span class="sep"></span>
+      <button data-color="type" class="on" title="Faces coloured by surface type">Type</button>
+      <button data-color="faces" title="One colour per face">Faces</button>
+      <button data-color="curves" title="Edges coloured by curve type">Curves</button>
+      <button data-color="plain">Plain</button>
+    </div>
+    <div class="seg" id="logtoggle"><button id="logbtn" title="Log (L)">Log</button></div>
+    <canvas id="gizmo" width="192" height="192"></canvas>
+    <div id="tip"></div>
+    <div id="overlay"><div class="spin"></div><div id="overlaytext">Loading…</div></div>
+    <div id="drop">Drop an .stl or .step file</div>
+    <section id="log">
+      <div id="logbar"><span class="grow" id="logtitle">Log</span><button id="logcopy">Copy</button><button id="logclose">Close</button></div>
+      <pre id="logtext"></pre>
+    </section>
+  </main>
+
+  <aside id="panel">
+    <h2>Convert</h2>
+    <div class="filerow">
+      <select id="file" class="field"></select>
+      <button class="btn" id="openbtn" title="Open a file from disk">Open…</button>
+      <input type="file" id="fileinput" accept=".stl,.step,.stp" hidden>
+    </div>
+
+    <h3>Phases</h3>
+    <div class="presets" id="presets">
+      <button data-seq="" class="on" title="A C A(0.005) C A(0.005)">Default</button>
+      <button data-seq="-a -c -a 0.005" title="one Phase C only">Fast</button>
+      <button data-seq="-a -b -c -a 0.005" title="holes first">Holes</button>
+      <button data-seq="-a" title="only merging coplanar faces">Only A</button>
+    </div>
+    <input id="seq" class="field wide" placeholder="A C A(0.005) C A(0.005)" spellcheck="false">
+
+    <h3>Tolerances</h3>
+    <div class="row"><label for="tol" title="--tol: the only tolerance of phases B and C">Tolerance <span class="hint">--tol</span></label><input id="tol" class="field num" placeholder="auto" inputmode="decimal"></div>
+    <div class="row"><label for="lintol" title="--lin-tol: the first Phase A's tolerance">Phase A <span class="hint">--lin-tol</span></label><input id="lintol" class="field num" placeholder="auto" inputmode="decimal"></div>
+    <div class="row"><label for="threads" title="-j: worker processes for the primitive search">Processes <span class="hint">-j</span></label><input id="threads" class="field num" placeholder="auto" inputmode="numeric"></div>
+
+    <div class="checks">
+      <label><input type="checkbox" id="o_report" checked> Report</label>
+      <label><input type="checkbox" id="o_verbose"> Verbose</label>
+      <label><input type="checkbox" id="o_nofree"> No B-spline</label>
+      <label><input type="checkbox" id="o_noarcs"> No arcs</label>
+    </div>
+    <details>
+      <summary>More options</summary>
+      <div class="checks">
+        <label><input type="checkbox" id="o_pcurves"> pcurves</label>
+        <label><input type="checkbox" id="o_validate"> Validate</label>
+        <label><input type="checkbox" id="o_norepair"> No mesh repair</label>
+        <label><input type="checkbox" id="o_nocad"> No CAD edges</label>
+        <label><input type="checkbox" id="o_nosphere"> No spheres</label>
+        <label><input type="checkbox" id="o_nocone"> No cones</label>
+        <label><input type="checkbox" id="o_notorus"> No tori</label>
+        <label><input type="checkbox" id="o_j1"> Reproducible (-j 1)</label>
+      </div>
+      <div class="row" style="margin-top:8px"><label for="extra">Extra args</label></div>
+      <input id="extra" class="field wide" placeholder="e.g. --max-edge-tol 0.01 --close-holes 20" spellcheck="false">
+      <div class="row" style="margin-top:8px"><label for="output">Output</label></div>
+      <input id="output" class="field wide" placeholder="auto" spellcheck="false">
+    </details>
+
+    <div id="cmd" title="Click to copy"></div>
+    <div id="cmdnote"></div>
+    <button class="big" id="go" disabled>Convert to STEP</button>
+    <button class="big" id="cancel">Cancel</button>
+    <div id="runstate">
+      <div class="top"><div class="spin" id="runspin"></div><div class="ph" id="runphase"></div><div class="tm" id="runtime"></div></div>
+      <div class="sum" id="runsum"></div>
+    </div>
+
+    <h3 id="stattitle">Model</h3>
+    <div id="stats"><div class="muted small">Nothing loaded.</div></div>
+
+    <div id="engine">Engine <b>refit.py</b><br><span id="enginepath"></span></div>
+  </aside>
+  <footer id="status"><span id="statusmain">Ready</span></footer>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => [...document.querySelectorAll(s)];
+const fmt = (n, d = 0) => Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const fnum = (x) => (Math.abs(x) >= 100 ? x.toFixed(2) : Math.abs(x) >= 1 ? x.toFixed(3) : x.toPrecision(3));
+const base = (p) => (p || "").split(/[\\/]/).pop();
+
+// ---------------------------------------------------------------- colours
+const FACE_COLORS = {
+  plane: "#c3c8d0", cylinder: "#5e9ff2", cone: "#f2a65e", sphere: "#6fd69c", torus: "#b483f2",
+  bspline: "#f2708f", revolution: "#4fcfd6", extrusion: "#d6cf4f", offset: "#9aa3ad", other: "#9aa3ad",
+  facet: "#f2d34f",
+};
+const FACE_LABELS = {
+  plane: "Plane", cylinder: "Cylinder", cone: "Cone", sphere: "Sphere", torus: "Torus", bspline: "B-spline",
+  revolution: "Revolution", extrusion: "Extrusion", offset: "Offset", other: "Other", facet: "Mesh triangle",
+};
+const CURVE_COLORS = { line: "#4a515c", circle: "#2f86ff", ellipse: "#19b37a", hyperbola: "#ff8a1f", parabola: "#ff8a1f", bspline: "#e0306a", offset: "#888", other: "#888" };
+const CURVE_LABELS = { line: "Line", circle: "Circle", ellipse: "Ellipse", hyperbola: "Hyperbola", parabola: "Parabola", bspline: "B-spline", offset: "Offset", other: "Other" };
+const PLAIN = new THREE.Color("#c8ccd3");
+const EDGE_DARK = new THREE.Color("#1c1f25");
+const FREE_EDGE = new THREE.Color("#ff3b3b");
+const DIM = new THREE.Color("#5d636d");
+const ACCENT = new THREE.Color("#6fd6bf");
+const faceKey = (f) => (f.facet ? "facet" : f.type);
+
+// ---------------------------------------------------------------- three
+const canvas = $("#c");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 1e5);
+camera.up.set(0, 0, 1);
+scene.add(camera);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f48, 1.25));
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(0.6, 1.0, 1.4);
+camera.add(key);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.15;
+controls.screenSpacePanning = true;
+controls.zoomToCursor = true;
+controls.rotateSpeed = 0.9;
+
+const S = {
+  files: [], input: null, paths: { input: null, output: null, cad: null },
+  models: { input: null, output: null, cad: null }, tab: "input",
+  disp: { shaded: true, edges: true, mesh: false }, color: "type",
+  isolate: null, hover: -1, job: null, fitted: null,
+};
+
+function resize() {
+  const r = $("#view").getBoundingClientRect();
+  renderer.setSize(r.width, r.height, false);
+  camera.aspect = r.width / Math.max(1, r.height);
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe($("#view"));
+
+// ---------------------------------------------------------------- loading
+async function fetchModel(path) {
+  const res = await fetch("/api/mesh?path=" + encodeURIComponent(path));
+  if (!res.ok) {
+    let msg = res.statusText;
+    try { msg = (await res.json()).error; } catch {}
+    throw new Error(msg);
+  }
+  const buf = await res.arrayBuffer();
+  const hl = new DataView(buf).getUint32(0, true);
+  const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hl)));
+  const off0 = 4 + hl;
+  const arr = (name) => {
+    const b = header.buffers[name];
+    const C = { float32: Float32Array, uint32: Uint32Array }[b.dtype];
+    return new C(buf, off0 + b.offset, b.length);
+  };
+  return header.kind === "stl" ? buildSTL(header, arr("pos")) : buildSTEP(header, arr("pos"), arr("idx"), arr("seg"));
+}
+
+function material(flat) {
+  return new THREE.MeshStandardMaterial({
+    vertexColors: true, metalness: 0.05, roughness: 0.62, side: THREE.DoubleSide, flatShading: flat,
+    polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+  });
+}
+
+function buildSTL(h, pos) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geo.computeVertexNormals();
+  const col = new Float32Array(pos.length);
+  geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  const mesh = new THREE.Mesh(geo, material(true));
+  const group = new THREE.Group();
+  group.add(mesh);
+  const m = { h, kind: "stl", group, mesh, geo, edges: null, wire: null };
+  m.makeEdges = () => new THREE.LineSegments(new THREE.EdgesGeometry(geo, 25), new THREE.LineBasicMaterial({ color: EDGE_DARK }));
+  return m;
+}
+
+function buildSTEP(h, pos, idx, seg) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  geo.setIndex(new THREE.BufferAttribute(idx, 1));
+  geo.computeVertexNormals();
+  const col = new Float32Array(pos.length);
+  geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  const faceOfVert = new Uint32Array(pos.length / 3);
+  h.faces.forEach((f, i) => faceOfVert.fill(i, f.v0, f.v0 + f.nv));
+  const mesh = new THREE.Mesh(geo, material(false));
+  const egeo = new THREE.BufferGeometry();
+  egeo.setAttribute("position", new THREE.BufferAttribute(seg, 3));
+  egeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(seg.length), 3));
+  const edges = new THREE.LineSegments(egeo, new THREE.LineBasicMaterial({ vertexColors: true }));
+  const group = new THREE.Group();
+  group.add(mesh, edges);
+  return { h, kind: "step", group, mesh, geo, edges, egeo, wire: null, faceOfVert };
+}
+
+// ---------------------------------------------------------------- colouring
+const tmp = new THREE.Color();
+function faceColor(m, i, out) {
+  const f = m.h.faces[i];
+  if (S.color === "type") out.set(FACE_COLORS[faceKey(f)] || FACE_COLORS.other);
+  else if (S.color === "faces") out.setHSL((i * 0.6180339887) % 1, 0.55, 0.62);
+  else out.copy(PLAIN);
+  if (S.isolate) faceKey(f) === S.isolate ? out.set(FACE_COLORS[S.isolate]) : out.copy(DIM);
+  if (i === S.hover) out.lerp(new THREE.Color("#ffffff"), 0.45);
+  return out;
+}
+function paintFace(m, i) {
+  const f = m.h.faces[i], a = m.geo.attributes.color.array;
+  faceColor(m, i, tmp);
+  for (let v = f.v0, e = f.v0 + f.nv; v < e; v++) { a[3 * v] = tmp.r; a[3 * v + 1] = tmp.g; a[3 * v + 2] = tmp.b; }
+}
+function recolor(m) {
+  if (!m) return;
+  const a = m.geo.attributes.color.array;
+  if (m.kind === "stl") {
+    for (let k = 0; k < a.length; k += 3) { a[k] = PLAIN.r; a[k + 1] = PLAIN.g; a[k + 2] = PLAIN.b; }
+  } else {
+    for (let i = 0; i < m.h.faces.length; i++) paintFace(m, i);
+    const ea = m.egeo.attributes.color.array;
+    for (const [s0, n, kind, free] of m.h.edges) {
+      const c = free ? FREE_EDGE : S.color === "curves" ? tmp.set(CURVE_COLORS[kind] || CURVE_COLORS.other) : EDGE_DARK;
+      for (let k = 6 * s0, e = 6 * (s0 + n); k < e; k += 3) { ea[k] = c.r; ea[k + 1] = c.g; ea[k + 2] = c.b; }
+    }
+    m.egeo.attributes.color.needsUpdate = true;
+  }
+  m.geo.attributes.color.needsUpdate = true;
+}
+
+function applyDisplay(m) {
+  if (!m) return;
+  m.mesh.visible = S.disp.shaded;
+  if (S.disp.edges && !m.edges && m.makeEdges) { m.edges = m.makeEdges(); m.group.add(m.edges); }
+  if (m.edges) m.edges.visible = S.disp.edges;
+  // triangle edges in the accent colour: grey on the grey shading had no contrast
+  if (S.disp.mesh && !m.wire) {
+    m.wire = new THREE.LineSegments(new THREE.WireframeGeometry(m.geo),
+      new THREE.LineBasicMaterial({ color: ACCENT, transparent: true }));
+    m.group.add(m.wire);
+  }
+  if (m.wire) {
+    m.wire.visible = S.disp.mesh;
+    m.wire.material.opacity = S.disp.shaded ? 0.85 : 1;
+  }
+}
+
+// ---------------------------------------------------------------- tabs
+function setTab(tab) {
+  if (!S.models[tab]) return;
+  for (const t of ["input", "output", "cad"]) {
+    const m = S.models[t];
+    if (m) { if (m.group.parent) scene.remove(m.group); }
+  }
+  S.tab = tab;
+  S.hover = -1;
+  const m = S.models[tab];
+  scene.add(m.group);
+  recolor(m);
+  applyDisplay(m);
+  if (S.fitted !== S.paths.input) { fit(m, "iso"); S.fitted = S.paths.input; }
+  $$("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
+  renderStats();
+  updateStatus();
+}
+function refreshTabs() {
+  $$("#tabs button").forEach((b) => {
+    const t = b.dataset.tab;
+    b.disabled = !S.paths[t];
+    b.title = S.paths[t] || (t === "cad" ? "no <name>_original.step" : t === "output" ? "not converted yet" : "");
+  });
+  $("#tabs button[data-tab=output]").textContent = "STEP";
+}
+async function loadTab(tab, show = true, force = false) {
+  const p = S.paths[tab];
+  if (!p) return;
+  if (!S.models[tab] || force) {
+    if (show) overlay(`Loading ${base(p)}…`);
+    try {
+      const m = await fetchModel(p);
+      if (S.paths[tab] !== p) return;   // another file was picked meanwhile
+      if (S.models[tab]?.group.parent) scene.remove(S.models[tab].group);
+      disposeModel(S.models[tab]);
+      S.models[tab] = m;
+    } catch (e) {
+      if (show) { overlay(null); toast(`${base(p)}: ${e.message}`); }
+      if (tab !== "input") { S.paths[tab] = null; refreshTabs(); }
+      return;
+    } finally { if (show) overlay(null); }
+  }
+  if (show) setTab(tab); else renderStats();
+}
+function disposeModel(m) {
+  if (!m) return;
+  m.group.traverse((o) => { o.geometry?.dispose(); o.material?.dispose(); });
+}
+
+// ---------------------------------------------------------------- camera
+const VIEWS = {
+  iso: [new THREE.Vector3(1, -1.15, 0.9), new THREE.Vector3(0, 0, 1)],
+  top: [new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 1, 0)],
+  front: [new THREE.Vector3(0, -1, 0), new THREE.Vector3(0, 0, 1)],
+  right: [new THREE.Vector3(1, 0, 0), new THREE.Vector3(0, 0, 1)],
+};
+function fit(m, view) {
+  m = m || S.models[S.tab];
+  if (!m) return;
+  const [lo, hi] = m.h.bbox;
+  const c = new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2);
+  const r = Math.max(1e-6, 0.5 * Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]));
+  let dir, up;
+  if (view && VIEWS[view]) { [dir, up] = VIEWS[view]; dir = dir.clone().normalize(); }
+  else { dir = camera.position.clone().sub(controls.target).normalize(); up = camera.up.clone(); }
+  const dist = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05;
+  camera.up.copy(up);
+  controls.target.copy(c);
+  camera.position.copy(c).addScaledVector(dir, dist);
+  camera.near = dist / 200; camera.far = dist * 50;
+  camera.updateProjectionMatrix();
+  controls.update();
+  if (view === "top") camera.up.set(0, 0, 1);   // keep orbiting around Z afterwards
+}
+
+// ---------------------------------------------------------------- hover
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let lastMove = null;
+canvas.addEventListener("pointermove", (e) => { lastMove = e; });
+canvas.addEventListener("pointerleave", () => { lastMove = null; setHover(-1); $("#tip").style.display = "none"; });
+function pick(e) {
+  const m = S.models[S.tab];
+  if (!m || !m.mesh.visible) return null;
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  return ray.intersectObject(m.mesh, false)[0] || null;
+}
+function setHover(i) {
+  const m = S.models[S.tab];
+  if (!m || m.kind !== "step" || i === S.hover) return;
+  const old = S.hover;
+  S.hover = i;
+  if (old >= 0) paintFace(m, old);
+  if (i >= 0) paintFace(m, i);
+  m.geo.attributes.color.needsUpdate = true;
+}
+function faceDesc(f) {
+  const p = f.p, out = [];
+  if (p.radius != null) out.push(`r ${fnum(p.radius)}`);
+  if (p.halfAngle != null) out.push(`½∠ ${p.halfAngle.toFixed(3)}°`, `r₀ ${fnum(p.refRadius)}`);
+  if (p.majorRadius != null) out.push(`R ${fnum(p.majorRadius)}`, `r ${fnum(p.minorRadius)}`);
+  if (p.degree) out.push(`deg ${p.degree.join("×")}`, `poles ${p.poles.join("×")}`);
+  return out.join(" · ");
+}
+function hoverTick() {
+  if (!lastMove || S.dragging) return;
+  const e = lastMove; lastMove = null;
+  const hit = pick(e);
+  const tip = $("#tip");
+  const m = S.models[S.tab];
+  if (!hit || !m || m.kind !== "step") { setHover(-1); tip.style.display = "none"; return; }
+  const i = m.faceOfVert[hit.face.a];
+  setHover(i);
+  const f = m.h.faces[i];
+  const k = faceKey(f);
+  const d = faceDesc(f);
+  tip.innerHTML = `<span class="swatch" style="background:${FACE_COLORS[k]}"></span><span class="t">${FACE_LABELS[k]}</span>` +
+    (d ? ` <span class="k">·</span> ${d}` : "") +
+    `<br><span class="k">face ${i + 1} / ${m.h.faces.length} · ${fnum(f.area)} mm² · ${f.edges} edge${f.edges === 1 ? "" : "s"}${f.wires > 1 ? ` · ${f.wires} loops` : ""}</span>`;
+  const r = $("#view").getBoundingClientRect();
+  tip.style.display = "block";
+  const x = e.clientX - r.left + 16, y = e.clientY - r.top + 14;
+  tip.style.left = Math.min(x, r.width - tip.offsetWidth - 8) + "px";
+  tip.style.top = Math.min(y, r.height - tip.offsetHeight - 8) + "px";
+}
+controls.addEventListener("start", () => { S.dragging = true; $("#tip").style.display = "none"; });
+controls.addEventListener("end", () => { S.dragging = false; });
+canvas.addEventListener("dblclick", (e) => {
+  const hit = pick(e);
+  if (hit) { controls.target.copy(hit.point); controls.update(); }
+});
+
+// ---------------------------------------------------------------- gizmo
+const gz = $("#gizmo").getContext("2d");
+function drawGizmo() {
+  const W = 192, c = W / 2, L = 62;
+  gz.clearRect(0, 0, W, W);
+  const q = camera.quaternion.clone().invert();
+  const axes = [["X", new THREE.Vector3(1, 0, 0), "#f05a5a"], ["Y", new THREE.Vector3(0, 1, 0), "#6fd65c"], ["Z", new THREE.Vector3(0, 0, 1), "#5a8cf0"]]
+    .map(([n, v, col]) => [n, v.applyQuaternion(q), col]).sort((a, b) => a[1].z - b[1].z);
+  gz.lineCap = "round";
+  for (const [n, v, col] of axes) {
+    const x = c + v.x * L, y = c - v.y * L;
+    gz.strokeStyle = col; gz.globalAlpha = v.z < -0.2 ? 0.45 : 1; gz.lineWidth = 6;
+    gz.beginPath(); gz.moveTo(c, c); gz.lineTo(x, y); gz.stroke();
+    gz.fillStyle = col; gz.beginPath(); gz.arc(x, y, 7, 0, 7); gz.fill();
+    gz.font = "600 22px Segoe UI, sans-serif"; gz.textAlign = "center"; gz.textBaseline = "middle";
+    gz.fillText(n, c + v.x * (L + 20), c - v.y * (L + 20));
+  }
+  gz.globalAlpha = 1;
+}
+
+function loop() {
+  controls.update();
+  hoverTick();
+  renderer.render(scene, camera);
+  drawGizmo();
+  requestAnimationFrame(loop);
+}
+loop();
+
+// ---------------------------------------------------------------- UI helpers
+function overlay(text) {
+  $("#overlay").classList.toggle("show", !!text);
+  if (text) $("#overlaytext").textContent = text;
+}
+let toastTimer;
+function toast(msg) {
+  const el = $("#statusmain");
+  el.innerHTML = `<span style="color:var(--err)">${escapeHtml(msg)}</span>`;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(updateStatus, 7000);
+}
+function escapeHtml(s) { return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+function updateStatus() {
+  const m = S.models[S.tab];
+  $("#empty").style.display = m ? "none" : "flex";
+  if (!m) { $("#statusmain").textContent = S.input ? base(S.input) : "Ready"; return; }
+  const [lo, hi] = m.h.bbox;
+  const dims = hi.map((v, i) => fnum(v - lo[i])).join(" × ");
+  const what = m.kind === "stl" ? `${fmt(m.h.stats.triangles)} triangles` : `${fmt(m.h.stats.faces)} faces · ${fmt(m.h.stats.edges)} edges`;
+  $("#statusmain").innerHTML = `<b>${escapeHtml(m.h.name)}</b> — ${what} · ${dims} mm`;
+}
+
+// ---------------------------------------------------------------- stats panel
+function renderStats() {
+  const m = S.models[S.tab];
+  const box = $("#stats");
+  $("#stattitle").textContent = { input: "Input", output: "STEP", cad: "Original CAD" }[S.tab] + (m ? " · " + m.h.name : "");
+  if (!m) { box.innerHTML = '<div class="muted small">Nothing loaded.</div>'; return; }
+  const st = m.h.stats;
+  let html = '<table class="stats">';
+  const row = (a, b, cls = "") => `<tr class="${cls}"><td>${a}</td><td>${b}</td></tr>`;
+  if (m.kind === "stl") {
+    html += row("Triangles", fmt(st.triangles)) + row("Vertices", fmt(st.vertices)) + row("Edges", fmt(st.edges));
+    html += row("Open edges", st.boundaryEdges ? `<span style="color:var(--warn)">${fmt(st.boundaryEdges)}</span>` : "0");
+    html += row("Non-manifold edges", st.nonManifoldEdges ? `<span style="color:var(--warn)">${fmt(st.nonManifoldEdges)}</span>` : "0");
+    html += row("Area", fmt(st.area, 2) + " mm²");
+    html += "</table>";
+    box.innerHTML = html;
+    return;
+  }
+  // STEP: compare with the other STEP models (output vs original CAD)
+  const others = ["output", "cad"].filter((t) => t !== S.tab && S.models[t]?.kind === "step");
+  const cmp = others.length ? S.models[others[0]] : null;
+  const cmpName = cmp ? { output: "STEP", cad: "CAD" }[others[0]] : null;
+  const head = cmp ? `<tr><th></th><th>this</th><th>${cmpName}</th></tr>` : "";
+  const r3 = (a, b, c, cls = "", attrs = "") => cmp ? `<tr class="${cls}" ${attrs}><td>${a}</td><td>${b}</td><td class="dim">${c ?? "–"}</td></tr>` : `<tr class="${cls}" ${attrs}><td>${a}</td><td>${b}</td></tr>`;
+  const cs = cmp?.h.stats;
+  html += head;
+  html += r3("Faces", fmt(st.faces), cs && fmt(cs.faces));
+  html += r3("Edges", fmt(st.edges), cs && fmt(cs.edges));
+  html += r3("Vertices", fmt(st.vertices), cs && fmt(cs.vertices));
+  html += r3("Free edges", st.freeEdges ? `<span style="color:var(--err)">${st.freeEdges}</span>` : "0", cs && cs.freeEdges);
+  html += r3("Area", fmt(st.area, 2), cs && fmt(cs.area, 2));
+  const fkeys = Object.keys(FACE_LABELS).filter((k) => st.faceTypes[k] || cs?.faceTypes[k]);
+  fkeys.forEach((k, n) => {
+    html += r3(`<span class="swatch" style="background:${FACE_COLORS[k]}"></span>${FACE_LABELS[k]}`, fmt(st.faceTypes[k] || 0), cs && fmt(cs.faceTypes[k] || 0),
+      "sw" + (S.isolate === k ? " iso" : "") + (n === 0 ? " gap" : ""), `data-iso="${k}" title="Click to highlight"`);
+  });
+  const ekeys = Object.keys(CURVE_LABELS).filter((k) => st.edgeTypes[k] || cs?.edgeTypes[k]);
+  ekeys.forEach((k, n) => {
+    html += r3(`<span class="swatch" style="background:${CURVE_COLORS[k]}"></span>${CURVE_LABELS[k]} edges`, fmt(st.edgeTypes[k] || 0), cs && fmt(cs.edgeTypes[k] || 0), n === 0 ? "gap" : "");
+  });
+  html += "</table>";
+  html += `<div class="muted small" style="margin-top:8px">Hover a face for its type and size. Click a surface type to highlight it.</div>`;
+  box.innerHTML = html;
+  box.querySelectorAll("tr[data-iso]").forEach((tr) => tr.addEventListener("click", () => {
+    S.isolate = S.isolate === tr.dataset.iso ? null : tr.dataset.iso;
+    recolor(S.models[S.tab]);
+    renderStats();
+  }));
+}
+
+// ---------------------------------------------------------------- files
+async function loadFiles(select) {
+  S.files = await (await fetch("/api/files")).json();
+  const sel = $("#file");
+  const cur = select || sel.value;
+  sel.innerHTML = '<option value="">— pick a file —</option>' + S.files.map((f) =>
+    `<option value="${escapeHtml(f.path)}">${escapeHtml(f.name)}  ·  ${f.size >= 1048576 ? (f.size / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(f.size / 1024)) + " KB"}</option>`).join("");
+  if (cur && ![...sel.options].some((o) => o.value === cur)) sel.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(cur)}">${escapeHtml(base(cur))}</option>`);
+  sel.value = cur || "";
+}
+async function pickInput(path) {
+  S.input = path || null;
+  for (const t of ["input", "output", "cad"]) {
+    if (S.models[t]?.group.parent) scene.remove(S.models[t].group);
+    disposeModel(S.models[t]);
+    S.models[t] = null;
+  }
+  S.paths = { input: path || null, output: null, cad: null };
+  S.isolate = null;
+  S.fitted = null;
+  try { localStorage.setItem("refit.input", path || ""); } catch {}
+  refreshTabs(); renderStats(); updateCmd(); updateStatus(); setTitle();
+  $("#go").disabled = !path || !!S.job;
+  if (!path) return;
+  await loadTab("input");
+  const rel = await (await fetch(`/api/related?path=${encodeURIComponent(path)}&args=${encodeURIComponent(buildArgs())}&output=${encodeURIComponent($("#output").value.trim())}`)).json();
+  if (S.input !== path) return;
+  S.paths.output = rel.output || null;
+  S.paths.cad = rel.original && rel.original !== path ? rel.original : null;
+  refreshTabs();
+  // prefetch in the background so the panel can compare them
+  if (S.paths.output) loadTab("output", false);
+  if (S.paths.cad) loadTab("cad", false);
+}
+$("#file").addEventListener("change", (e) => pickInput(e.target.value));
+$("#openbtn").addEventListener("click", openFile);
+$("#fileinput").addEventListener("change", (e) => { const f = e.target.files[0]; if (f) upload(f); e.target.value = ""; });
+async function upload(file) {
+  if (!/\.(stl|step|stp)$/i.test(file.name)) { toast("Only .stl / .step / .stp"); return; }
+  overlay(`Uploading ${file.name}…`);
+  try {
+    const res = await fetch("/api/upload?name=" + encodeURIComponent(file.name), { method: "POST", body: file });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error);
+    await loadFiles(j.path);
+    overlay(null);
+    pickInput(j.path);
+  } catch (e) { overlay(null); toast(e.message); }
+}
+const view = $("#view");
+view.addEventListener("dragover", (e) => { e.preventDefault(); $("#drop").classList.add("show"); });
+view.addEventListener("dragleave", (e) => { if (e.target === $("#drop")) $("#drop").classList.remove("show"); });
+view.addEventListener("drop", (e) => { e.preventDefault(); $("#drop").classList.remove("show"); const f = e.dataTransfer.files[0]; if (f) upload(f); });
+
+// ---------------------------------------------------------------- options -> command line
+const FLAGS = [
+  ["o_report", "--report"], ["o_verbose", "-v"], ["o_nofree", "--no-free"], ["o_noarcs", "--no-arcs"],
+  ["o_pcurves", "--pcurves"], ["o_validate", "--validate"], ["o_norepair", "--no-mesh-repair"], ["o_nocad", "--no-cad-edges"],
+  ["o_nosphere", "--no-sphere"], ["o_nocone", "--no-cone"], ["o_notorus", "--no-torus"],
+];
+function buildArgs() {
+  const a = [];
+  const seq = $("#seq").value.trim();
+  if (seq) a.push(seq);
+  const tol = $("#tol").value.trim(), lt = $("#lintol").value.trim();
+  if (tol) a.push("--tol", tol);
+  if (lt) a.push("--lin-tol", lt);
+  const j = $("#o_j1").checked ? "1" : $("#threads").value.trim();
+  if (j) a.push("-j", j);
+  for (const [id, flag] of FLAGS) if ($("#" + id).checked) a.push(flag);
+  const ex = $("#extra").value.trim();
+  if (ex) a.push(ex);
+  return a.join(" ");
+}
+const q = (s) => (/[\s"]/.test(s) ? `"${s}"` : s);
+let outTimer;
+function updateCmd() {
+  const args = buildArgs();
+  const inp = S.input ? q(base(S.input)) : "<file>";
+  const outField = $("#output").value.trim();
+  $("#cmd").textContent = `python refit.py ${inp}${args ? " " + args : ""}${outField ? " -o " + q(outField) : ""}`;
+  $$("#presets button").forEach((b) => b.classList.toggle("on", b.dataset.seq === $("#seq").value.trim()));
+  saveOpts();
+  clearTimeout(outTimer);
+  if (S.input) outTimer = setTimeout(async () => {
+    const r = await (await fetch(`/api/default-output?input=${encodeURIComponent(S.input)}&args=${encodeURIComponent(args)}&output=${encodeURIComponent(outField)}`)).json();
+    if (!outField) $("#output").placeholder = base(r.output);
+    $("#cmdnote").textContent = r.exists ? `Overwrites ${base(r.output)}` : `Writes ${base(r.output)}`;
+    $("#cmdnote").classList.toggle("warn", r.exists);
+  }, 200);
+}
+$$("#panel input").forEach((el) => el.addEventListener("input", updateCmd));
+$$("#presets button").forEach((b) => b.addEventListener("click", () => { $("#seq").value = b.dataset.seq; updateCmd(); }));
+$("#cmd").addEventListener("click", () => { navigator.clipboard?.writeText($("#cmd").textContent); flash($("#cmd")); });
+function flash(el) { el.style.borderColor = "var(--accent)"; setTimeout(() => (el.style.borderColor = ""), 400); }
+
+const OPT_IDS = ["seq", "tol", "lintol", "threads", "extra", ...FLAGS.map((f) => f[0]), "o_j1"];
+function saveOpts() {
+  const o = {};
+  for (const id of OPT_IDS) { const el = $("#" + id); o[id] = el.type === "checkbox" ? el.checked : el.value; }
+  try { localStorage.setItem("refit.opts", JSON.stringify(o)); } catch {}
+}
+function loadOpts() {
+  let o = null;
+  try { o = JSON.parse(localStorage.getItem("refit.opts") || "null"); } catch {}
+  if (!o) return;
+  for (const id of OPT_IDS) { const el = $("#" + id); if (!(id in o)) continue; if (el.type === "checkbox") el.checked = o[id]; else el.value = o[id]; }
+}
+
+// ---------------------------------------------------------------- running refit.py
+function lineClass(s) {
+  if (/^== /.test(s)) return "banner";
+  // refit.py --no-color tags: [✓] [!] [✗] [i] [···]
+  const m = /^\[(✓|!|✗|i|···)\]/.exec(s);
+  if (m) return { "✓": "ok", "!": "warn", "✗": "error", "i": "", "···": "debug" }[m[1]];
+  if (/Traceback|Error:/.test(s)) return "error";
+  return "";
+}
+function appendLog(lines) {
+  const pre = $("#logtext");
+  const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+  const frag = document.createDocumentFragment();
+  for (const s of lines) {
+    const span = document.createElement("span");
+    const c = lineClass(s);
+    if (c) span.className = c;
+    span.textContent = s + "\n";
+    frag.appendChild(span);
+  }
+  pre.appendChild(frag);
+  if (stick) pre.scrollTop = pre.scrollHeight;
+}
+function showLog(on) {
+  $("#log").classList.toggle("show", on);
+  $("#view").classList.toggle("logopen", on);
+  $("#logbtn").classList.toggle("on", on);
+}
+$("#logbtn").addEventListener("click", () => showLog(!$("#log").classList.contains("show")));
+$("#logclose").addEventListener("click", () => showLog(false));
+$("#logcopy").addEventListener("click", () => { navigator.clipboard?.writeText($("#logtext").innerText); flash($("#logcopy")); });
+
+$("#go").addEventListener("click", async () => {
+  if (!S.input || S.job) return;
+  const body = { input: S.input, args: buildArgs(), output: $("#output").value.trim() };
+  const res = await fetch("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await res.json();
+  if (!res.ok) { toast(j.error); return; }
+  S.job = { id: j.id, input: S.input, next: 0, output: j.output, phase: "Starting…", t0: performance.now(), summary: [] };
+  $("#logtext").textContent = "";
+  appendLog(["$ " + j.cmd.map(q).join(" "), ""]);
+  $("#logtitle").textContent = "refit.py — " + base(S.input);
+  showLog(true);
+  $("#go").style.display = "none";
+  $("#cancel").style.display = "block";
+  $("#runstate").style.display = "block";
+  $("#runspin").style.display = "";
+  $("#runsum").innerHTML = "";
+  poll();
+});
+$("#cancel").addEventListener("click", async () => {
+  if (!S.job) return;
+  await fetch("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: S.job.id }) });
+});
+
+async function poll() {
+  const job = S.job;
+  if (!job) return;
+  let st;
+  try { st = await (await fetch(`/api/job?id=${job.id}&since=${job.next}`)).json(); }
+  catch { setTimeout(poll, 1000); return; }
+  if (st.lines.length) {
+    appendLog(st.lines);
+    for (const s of st.lines) {
+      const b = /^== (.*?)\s*─*$/.exec(s);
+      if (b) job.phase = b[1];
+      if (/^\[✓\] .*input faces -> /.test(s) || /^\[✓\] Phase .*regions converted/.test(s)) job.summary.push(s.replace(/^\[✓\]\s*/, ""));
+    }
+  }
+  job.next = st.next;
+  $("#runphase").textContent = job.phase;
+  $("#runtime").textContent = fmtTime(st.elapsed);
+  if (st.running) { setTimeout(poll, 400); return; }
+
+  // finished
+  S.job = null;
+  $("#runspin").style.display = "none";
+  $("#go").style.display = "block";
+  $("#cancel").style.display = "none";
+  $("#go").disabled = !S.input;
+  if (st.cancelled) {
+    $("#runphase").innerHTML = '<span style="color:var(--warn)">Cancelled</span>';
+  } else if (st.rc !== 0 || !st.output) {
+    $("#runphase").innerHTML = `<span style="color:var(--err)">Failed (exit ${st.rc})</span> — see the log`;
+  } else {
+    $("#runphase").innerHTML = '<span style="color:var(--ok)">Done</span>';
+    let sum = job.summary.map(escapeHtml).join("<br>");
+    const links = [];
+    if (st.report) links.push(`<a id="openreport">Open report</a>`);
+    if (native()) links.push(`<a id="revealout">Show in folder</a>`);
+    if (links.length) sum += "<br>" + links.join(" · ");
+    $("#runsum").innerHTML = sum;
+    $("#openreport")?.addEventListener("click", () => openReport(st.report));
+    $("#revealout")?.addEventListener("click", () => reveal(st.output));
+    await loadFiles();
+    updateCmd();
+    if (S.input === job.input) {
+      S.paths.output = st.output;
+      refreshTabs();
+      await loadTab("output", true, true);
+    }
+  }
+}
+function fmtTime(s) { s = Math.round(s); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; }
+async function openReport(path) {
+  const t = await (await fetch("/api/text?path=" + encodeURIComponent(path))).text();
+  $("#logtext").textContent = "";
+  $("#logtitle").textContent = base(path);
+  appendLog(t.split(/\r?\n/));
+  $("#logtext").scrollTop = 0;
+  showLog(true);
+}
+
+// ---------------------------------------------------------------- toolbar wiring
+$$("#tabs button").forEach((b) => b.addEventListener("click", () => loadTab(b.dataset.tab)));
+$$("#views button").forEach((b) => b.addEventListener("click", () => fit(null, b.dataset.view === "fit" ? null : b.dataset.view)));
+$$("#display button[data-disp]").forEach((b) => b.addEventListener("click", () => {
+  const k = b.dataset.disp;
+  S.disp[k] = !S.disp[k];
+  if (!S.disp.shaded && !S.disp.edges && !S.disp.mesh) S.disp[k] = true;
+  $$("#display button[data-disp]").forEach((x) => x.classList.toggle("on", S.disp[x.dataset.disp]));
+  applyDisplay(S.models[S.tab]);
+}));
+$$("#display button[data-color]").forEach((b) => b.addEventListener("click", () => {
+  S.color = b.dataset.color;
+  $$("#display button[data-color]").forEach((x) => x.classList.toggle("on", x === b));
+  recolor(S.models[S.tab]);
+}));
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) { e.preventDefault(); openFile(); }
+  else if (e.key === "f" || e.key === "F") fit(null, null);
+  else if (e.key === "i" || e.key === "I") fit(null, "iso");
+  else if (e.key === "l" || e.key === "L") showLog(!$("#log").classList.contains("show"));
+  else if (e.key === "1") loadTab("input");
+  else if (e.key === "2") loadTab("output");
+  else if (e.key === "3") loadTab("cad");
+});
+
+// ---------------------------------------------------------------- desktop window (pywebview)
+const native = () => window.pywebview?.api || null;
+async function openFile() {
+  const api = native();
+  if (!api) { $("#fileinput").click(); return; }
+  const path = await api.open_file();
+  if (!path) return;
+  await loadFiles(path);
+  pickInput(path);
+}
+function reveal(path) {
+  path = path || S.paths[S.tab] || S.input;
+  if (path && native()) native().reveal(path);
+}
+function setTitle() {
+  const t = S.input ? `Refit — ${base(S.input)}` : "Refit";
+  document.title = t;
+  native()?.set_title(t);
+}
+window.refitUI = {
+  openFile, reveal,
+  view: (v) => fit(null, v),
+  tab: (t) => loadTab(t),
+  log: () => showLog(!$("#log").classList.contains("show")),
+};
+window.addEventListener("pywebviewready", () => { document.body.classList.add("native"); setTitle(); });
+
+// ---------------------------------------------------------------- start
+(async () => {
+  loadOpts();
+  const info = await (await fetch("/api/info")).json();
+  $("#enginepath").innerHTML = `${escapeHtml(info.refit)}<br>${escapeHtml(info.python)}`;
+  if (!$("#threads").value) $("#threads").placeholder = `auto (${info.cpus})`;
+  let last = new URLSearchParams(location.search).get("open") || "";
+  if (!last) try { last = localStorage.getItem("refit.input") || ""; } catch {}
+  await loadFiles();
+  if (last) {
+    const ok = S.files.some((f) => f.path === last) || (await (await fetch("/api/exists?path=" + encodeURIComponent(last))).json()).exists;
+    if (ok) { await loadFiles(last); pickInput(last); }
+  }
+  updateCmd();
+})();
+</script>
+</body>
+</html>

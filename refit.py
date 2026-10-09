@@ -53,16 +53,18 @@ PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
                its CAD, one to one).
 
 THE PHASES RUN IN THE ORDER THEY'RE WRITTEN, and none pulls another one in.
-Without flags the sequence is A B C A (the last one re-merges the planar
-faces split up by the replacements). You can write whatever you need:
+Without flags the sequence is A C A(0.005) C A(0.005): the one that came out
+best on the test parts (see DEFAULT_SEQUENCE). You can write whatever you
+need:
   refit.py x.stl -c                 only Phase C, on the raw mesh
-  refit.py x.stl -a -b -c           without the final re-merge
-  refit.py x.stl -a -b -c -a 0.005  wide final re-merge (the cleanest)
+  refit.py x.stl -a -b -c           holes first, without the final re-merge
+  refit.py x.stl -a -c -a 0.005     one Phase C only (faster)
 It's also useful for finding where a defect comes from: if '-c' alone shows
 it, it's not Phase A's fault.
-⚠️ The final 0.005 mm re-merge doesn't move anything: measured on all the
-test files, the maximum distance from the starting part is the same as the
-default, while the face count collapses (test4 333 -> 54, test5 217 -> 116).
+⚠️ The 0.005 mm re-merge doesn't move anything: measured on all the test
+files, the maximum distance from the starting part is the same as with the
+tight default, while the face count collapses (test6 200 -> 99, test9
+1757 -> 1116).
 
 HOW TO READ THE REPORT (--report)
 ----------------------------------
@@ -517,13 +519,13 @@ that's been moved.
 
 USAGE
 -----
-    python refit.py part.stl                  # A + B + C + final A re-merge
+    python refit.py part.stl                  # A C A(0.005) C A(0.005), the default
+    python refit.py part.stl --report         # the same, with a .txt report
     python refit.py part.stl -a               # Phase A only
     python refit.py part.stl -a 0.01          # Phase A only, 10-micron merge
-    python refit.py part.stl -b               # A + holes
-    python refit.py part.stl -c               # A + fillets/machining
-    python refit.py part.stl -b -c --report   # everything, with a .txt report
-    python refit.py part.stl -b -c -a 0.01    # everything, final merge at 10 um
+    python refit.py part.stl -a -b            # A + holes only
+    python refit.py part.stl -a -c -a 0.005   # one Phase C only (faster)
+    python refit.py part.stl -a -b -c -a 0.01 # holes first, final merge at 10 um
     python refit.py part.stl -b -c -i 2       # two B/C cycles before saving
     python refit.py part.stl -j 22            # up to 22 worker processes
     python refit.py part.stl -j 1             # everything sequential, reproducible
@@ -937,9 +939,12 @@ def edge_face_map(shape):
 
 
 def count_free_edges(shape) -> int:
-    """Edges with a single face: 0 = closed shell."""
+    """Edges with a single face: 0 = closed shell.
+    ⚠️ A DEGENERATED edge (a cone's apex, a sphere's pole: a point that
+    spans a stretch of u) belongs to one face by construction: it closes
+    the face's wire in (u, v), not a hole in the shell."""
     m = edge_face_map(shape)
-    return sum(1 for i in range(1, _size(m) + 1) if _size(m.FindFromIndex(i)) == 1)
+    return sum(1 for i in range(1, _size(m) + 1) if _size(m.FindFromIndex(i)) == 1 and not bt_Degenerated(td_Edge(m.FindKey(i))))
 
 
 _SFT = _ShapeFix.ShapeFix_ShapeTolerance
@@ -2992,6 +2997,37 @@ def fit_axial_rev(P: np.ndarray, Nrep: np.ndarray, Wp: np.ndarray) -> Optional[P
     return q
 
 
+def _tangent_cones(cyl: "Prim", P: np.ndarray, keep: int = 40) -> List[Prim]:
+    """
+    Cones osculating a cylinder along the ruling through the data's middle:
+    same tangent plane, same normal curvature across the ruling (the cone's
+    is cos(alpha)/rho, the cylinder's 1/r), for a ladder of semi-angles on
+    both sides. Over the few degrees a cylinder covers by mistake the true
+    cone is one of them to within its curvature along the band. Returned
+    closest to the points first (at most `keep`), as starting points for LM.
+    """
+    if cyl is None or cyl.kind != AXIAL or len(P) < 6:
+        return []
+    a_c = cyl.axis / np.linalg.norm(cyl.axis)
+    x0 = P[int(np.argmin(np.linalg.norm(P - P.mean(axis=0), axis=1)))]
+    c0 = cyl.center + float((x0 - cyl.center) @ a_c) * a_c
+    n = x0 - c0
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-12:
+        return []
+    n = n / nn
+    out = []
+    for deg in range(5, 90, 5):
+        al = math.radians(deg)
+        for sg in (1.0, -1.0):
+            ax = math.cos(al) * a_c + sg * math.sin(al) * n
+            ax = ax / np.linalg.norm(ax)
+            q = Prim(AXIAL, c0.copy(), ax, float(cyl.r0 / math.cos(al)), float(-sg * math.tan(al)))
+            out.append((float(np.abs(q.dist(P)).max()), q))
+    out.sort(key=lambda h: h[0])
+    return [q for _, q in out[:keep]]
+
+
 def revolution_axis(P: np.ndarray, N: np.ndarray, W: np.ndarray):
     """
     Axis of a surface of revolution, in closed form.
@@ -4103,10 +4139,12 @@ LM_MAX_PTS = 900
 LM_MAX_SLOPE = 3.0  # = the fitters' max_slope: atan(3) = 71.6 degrees
 
 
-def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters: int = 80, fix_r: Optional[float] = None, stall: bool = False) -> "Prim":
+def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters: int = 80, fix_r: Optional[float] = None, stall: bool = False, fix_slope: Optional[float] = None) -> "Prim":
     """Minimizes the orthogonal points-to-surface distance. Returns a new Prim.
     fix_r: cylinder or sphere with the radius held at that value (only the
     position and the axis move).
+    fix_slope: cone with the taper held at that value (axis, position and
+    radius move).
     stall: give up on a fit that crawls (exploratory fits on a seed only)."""
     if prim is None or len(P) < 4:
         return prim
@@ -4158,7 +4196,8 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
         a0 = prim.axis / np.linalg.norm(prim.axis)
         u0, v0 = ortho_frame(a0)
         c0 = prim.center.astype(float).copy()
-        is_cyl = abs(prim.slope) < 1e-9 or fix_r is not None
+        is_cyl = (abs(prim.slope) < 1e-9 and fix_slope is None) or fix_r is not None
+        fs = None if (is_cyl or fix_slope is None) else float(fix_slope)
         # ⚠️ THE REFERENCE POINT GOES WHERE THE POINTS ARE. With the cone's
         # origin far along the axis from the data, a tilt of the axis moves
         # the band by (distance x angle) and the radius has to chase it: the
@@ -4171,7 +4210,7 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
         if fix_r is not None:
             x = np.zeros(4)
         else:
-            x = np.array([0.0, 0.0, 0.0, 0.0, r_ref]) if is_cyl else np.array([0.0, 0.0, 0.0, 0.0, r_ref, float(prim.slope)])
+            x = np.array([0.0, 0.0, 0.0, 0.0, r_ref]) if (is_cyl or fs is not None) else np.array([0.0, 0.0, 0.0, 0.0, r_ref, float(prim.slope)])
 
         def build(v):
             a = a0 + v[0] * u0 + v[1] * v0
@@ -4179,7 +4218,7 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
             c = c0 + v[2] * u0 + v[3] * v0
             if fix_r is not None:
                 return Prim(AXIAL, c, a, float(fix_r), 0.0)
-            return Prim(AXIAL, c, a, float(v[4]), 0.0 if is_cyl else float(v[5]))
+            return Prim(AXIAL, c, a, float(v[4]), 0.0 if is_cyl else (fs if fs is not None else float(v[5])))
 
         def batch(X):
             A = a0[None, :] + X[:, 0:1] * u0[None, :] + X[:, 1:2] * v0[None, :]
@@ -4192,7 +4231,7 @@ def lm_refine(prim: "Prim", P: np.ndarray, W: Optional[np.ndarray] = None, iters
                 return rho - float(fix_r)
             if is_cyl:
                 return rho - X[:, 4:5]
-            S_ = X[:, 5:6]
+            S_ = X[:, 5:6] if fs is None else fs
             return (rho - (X[:, 4:5] + S_ * T)) / np.sqrt(1.0 + S_ * S_)
 
     # ⚠️ ALL THE PERTURBATIONS IN ONE PASS. The Jacobian is numeric: m+1
@@ -4742,6 +4781,15 @@ def _cone_plane_curves(cone: "Prim", plane: "Prim", tol: float) -> List["_Curve"
             return out  # it lies on the VIRTUAL nappe (radius < 0)
         ax = abs(D) * ca * sa / abs(A2)
         ay = abs(D) * sa / math.sqrt(-A2)
+        # ⚠️ THE ELLIPSE THAT IS A CIRCLE. A plane orthogonal to the axis
+        # but for a 1e-7 tilt of the fit gives axes equal to the micron
+        # and a major axis pointing anywhere: a closed edge on it starts
+        # at that arbitrary point, not at the boundary's vertex (test10: a
+        # 360-degree countersink rejected at tolerance 1.3e-2). What can't
+        # be told from a circle is a circle.
+        if abs(ax - ay) <= 0.01 * tol and min(ax, ay) > 10.0 * tol:
+            out.append(_circle(C, n, 0.5 * (ax + ay)))
+            return out
         if min(ax, ay) > 10.0 * tol:
             el = _ellipse(C, n, E1, ax, ay)
             if el is not None:
@@ -5866,6 +5914,11 @@ def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
         t = dd @ prim.axis
         R.t_lo, R.t_hi = float(t.min()), float(t.max())
         u, v = ortho_frame(prim.axis)
+        # (a vertex ON the axis - a cone's tip - has no angle: its arctan2 is
+        # the fit's noise, and a 75-degree tip read 187 when a refit moved
+        # the apex by a micron)
+        rho = np.linalg.norm(dd - np.outer(t, prim.axis), axis=1)
+        dd = dd[rho > max(1e-3 * float(rho.max()), 1e-9)]
         ang = np.sort(np.unique(np.round(np.arctan2(dd @ v, dd @ u), 6)))
         if len(ang) >= 3:
             gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * math.pi]]))
@@ -7048,6 +7101,7 @@ class Segmenter:
         changed = [k for k, (q, (pp, _)) in enumerate(zip(cons, found)) if q is not pp]
         found = [(q, rf) for q, (_, rf) in zip(cons, found)]
         found = self._absorb_exact(found, changed)
+        found = [(self._snap_cone_angle(pp, rf), rf) for pp, rf in found]
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
         regions = self._rolling_fillets(regions)
         regions = self._blend_patches(regions, frags)
@@ -7077,12 +7131,16 @@ class Segmenter:
         # (a big facet is a real plane of the part, not a strip)
         loose_f = {i for i in range(nF) if i not in owner_f and len(topo.verts[i]) >= 3 and topo.areas[i] <= 20.0 * med_a}
 
-        def on_chords(p, G):
+        def on_chords(p, G, k):
             """every vertex of G on the surface, or off it no more than the
             strip's own chord (a T-vertex of the next tessellation along its
             long side: on test10 1.8e-3 inside the round, the strip's middle
-            1.3-1.9e-3): on the chord's side, at most twice its sag"""
-            V = np.unique(np.round(np.vstack([topo.verts[i] for i in G]), 9), axis=0)
+            1.3-1.9e-3): on the chord's side, at most twice its sag; or off
+            it on the edge with ANOTHER face, which the CAD itself only
+            approximated (test10: 8.4e-4 off a 45-degree cone where it meets
+            a cylinder that isn't coaxial - the exact consensus' rule)"""
+            vid = sorted({a for i in G for e in topo.f_edges[i] for a in topo.e_verts[e]})
+            V = topo.vpos[vid]
             d = p.dist(V)
             dc = p.dist(np.array([topo.cents[i] for i in G]))
             off = np.abs(d) > self.tol_fit
@@ -7091,7 +7149,21 @@ class Segmenter:
             if not off.any():
                 return True
             sg = float(np.sign(np.mean(dc)))
-            return bool(np.all(np.sign(d[off]) == sg) and float(np.abs(d[off]).max()) <= 2.0 * float(np.abs(dc).max()) + self.tol_fit)
+            if bool(np.all(np.sign(d[off]) == sg) and float(np.abs(d[off]).max()) <= 2.0 * float(np.abs(dc).max()) + self.tol_fit):
+                return True
+            # (an approximated edge strays by a fraction of the tolerance,
+            # not by tol_grow: test11's 1.7e-2 was another surface's vertex)
+            if float(np.abs(d[off]).max()) > 2.0 * self.tol_fit:
+                return False
+            inside = set(regions[k].faces) | set(G)
+
+            def foreign(f):
+                return f not in inside and (owner_f.get(f, k) != k or (f not in owner_f and f not in loose_f))
+
+            ok_ = all(any(foreign(f) for e in topo.v_edges[j] for f in topo.e_faces[e]) for j, o in zip(vid, off) if o)
+            if ok_:
+                Log.debug(f"  strip on the edge with another face: {len(G)} facets at {np.round(topo.cents[min(G)], 2)}, vertices off {float(np.abs(d[off]).max()):.1e}")
+            return ok_
 
         curved = sorted({owner_f[j] for i in loose_f for j in topo.adj[i] if j in owner_f and regions[owner_f[j]].prim.kind not in (PLANE, FREE)})
         for k in curved:
@@ -7115,7 +7187,7 @@ class Segmenter:
             for G in _face_groups(near - set(owner_f), topo.adj):
                 if len(G) > 20 or not any(j in kset for i in G for j in topo.adj[i]):
                     continue
-                if not on_chords(p, G):
+                if not on_chords(p, G, k):
                     continue
                 new = sorted(kset | set(G))
                 if Engine.region_loops(eng_like, new)[0] is None:
@@ -7410,6 +7482,7 @@ class Segmenter:
         topo = self.topo
         alive = [True] * len(found)
         faces = [list(rf) for _, rf in found]
+        prims = [p for p, _ in found]
         changed = True
         n_abs = 0
         while changed:
@@ -7424,15 +7497,38 @@ class Segmenter:
                     continue
                 nbs = {owner[j] for i in faces[a] for j in topo.adj[i] if j in owner and owner[j] != a}
                 for b in sorted(nbs, key=lambda k: -len(faces[k])):
-                    pb = found[b][0]
+                    pb = prims[b]
                     if pb is None or pb.kind == FREE or len(faces[b]) < len(faces[a]):
                         continue
                     P = np.vstack([topo.verts[i] for i in faces[a]])
-                    if float(np.abs(pb.dist(P)).max()) > self.tol_fit:
-                        continue
                     Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in faces[a]])
-                    if normal_deviation(pb, P, Nrep) > 5.0 or not all(self.within(pb, i) for i in faces[a]):
-                        continue
+                    if float(np.abs(pb.dist(P)).max()) > self.tol_fit or normal_deviation(pb, P, Nrep) > 5.0 or not all(self.within(pb, i) for i in faces[a]):
+                        # ⚠️ OR THE NEIGHBOR REFITTED ON BOTH. A 5-facet
+                        # region with a random cone (axis 49 degrees off,
+                        # test10) beside the 7 facets of the same 45-degree
+                        # tip: the 7-facet fit doesn't reach that far out
+                        # unrefitted, but refitted on the union it holds at
+                        # 1.8e-5. Only for small regions (a weak fit's size)
+                        # and only if the union stays as exact as the
+                        # neighbor was on its own.
+                        # (on a noisy mesh a refit on the union moves the
+                        # neighbor within its noise: test8 0.0427 -> 0.0436)
+                        if len(faces[a]) >= 12 or pb.kind not in (AXIAL, SPHERE, TORUS) or not self._mesh_is_exact():
+                            continue
+                        U = sorted(set(faces[b]) | set(faces[a]))
+                        PU = np.vstack([topo.verts[i] for i in U])
+                        q = lm_refine(pb, PU)
+                        if q is None or q is pb or q.kind != pb.kind:
+                            continue
+                        db = float(np.abs(pb.dist(np.vstack([topo.verts[i] for i in faces[b]]))).max())
+                        # (normals at the facets' middles: near a cone's tip a
+                        # facet spans 30 degrees of it, and at its corners the
+                        # surface turns 15 away from the chord's normal)
+                        CU = np.array([topo.cents[i] for i in U])
+                        NU = np.array([topo.norms[i] for i in U])
+                        if float(np.abs(q.dist(PU)).max()) > max(2.0 * db, 0.25 * self.tol_fit) or normal_deviation(q, CU, NU) > 5.0 or not all(self.within(q, i) for i in U):
+                            continue
+                        prims[b] = q
                     faces[b] = sorted(set(faces[b]) | set(faces[a]))
                     alive[a] = False
                     n_abs += 1
@@ -7440,7 +7536,7 @@ class Segmenter:
                     break
         if n_abs:
             Log.debug(f"Regions lying on a neighbor's surface, absorbed: {n_abs}")
-        return [(found[k][0], faces[k]) for k in range(len(found)) if alive[k]]
+        return [(prims[k], faces[k]) for k in range(len(found)) if alive[k]]
 
     def _absorb_exact(self, found, which, rounds: int = 3):
         """
@@ -7502,17 +7598,30 @@ class Segmenter:
         CAD. On a noisy or re-meshed mesh no subset is exact, the search
         gives up after a few tries and nothing changes.
         """
-        if p is None or p.kind not in (AXIAL, SPHERE, TORUS) or (p.kind == AXIAL and abs(p.slope) > 1e-9):
+        if p is None or p.kind not in (AXIAL, SPHERE, TORUS):
             return p
+        # ⚠️ AND THE CONE THAT THOSE OFF VERTICES TILTED. On a short wall
+        # the approximated edge's vertices don't just shift the radius,
+        # they buy the free fit its extra unknown: test0's R3 corner walls
+        # (two CAD faces each, both exact) came out as one CONE, semi-angle
+        # 1.06 degrees and axis 1 degree off, the cylinder through all the
+        # vertices worse than it. The consensus starts from that cylinder.
+        cone_in = p.kind == AXIAL and abs(p.slope) > 1e-9
+        if cone_in and abs(p.slope) > 0.05:
+            return p  # real taper (>2.9 degrees)
         topo = self.topo
+        p_free = p
         try:
             P = np.unique(np.round(np.vstack([topo.verts[i] for i in rf]), 9), axis=0)
+            if cone_in:
+                t_ = (P - p.center) @ p.axis
+                p = Prim(AXIAL, p.center.copy(), p.axis.copy(), float(np.linalg.norm(P - p.center - np.outer(t_, p.axis), axis=1).mean()), 0.0)
             # "exact" = within a few float32 roundings of the coordinates
             # (an STL stores float32: 1e-6 at 20 mm, 1.5e-5 at 160 mm)
             eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(P).max()))
-            d0 = np.abs(p.dist(P))
+            d0 = np.abs(p_free.dist(P))
             if len(P) < 10 or float(d0.max()) <= 10.0 * eps:
-                return p
+                return p_free
             n0 = int((d0 <= eps).sum())
             dof = {SPHERE: 4, TORUS: 7}.get(p.kind, 5 if abs(p.slope) < 1e-9 else 6)
             m = dof + 1
@@ -7536,7 +7645,7 @@ class Segmenter:
             need = max(m + 3, n0 + 3, int(0.3 * len(P)))
             hyp = sorted((h for h in hyp if h[0] >= need), key=lambda h: (-h[0], h[1]))
             if not hyp:
-                return p
+                return p_free
             # ⚠️ the vertices the consensus leaves off are the ones on the
             # CAD's approximated edges, i.e. on the region's BOUNDARY: there
             # the edge tolerance absorbs them (test0's own CAD writes those
@@ -7565,13 +7674,16 @@ class Segmenter:
                 # really draws has round radii: the consensus is taken only
                 # when it turns a non-round radius into a round one (test0:
                 # 3.0150 and 3.0074 -> 3.0000), never the other way round.
-                if not all(round_(r) for r in radii(q)) or all(round_(r) for r in radii(p)):
+                if not all(round_(r) for r in radii(q)) or (not cone_in and all(round_(r) for r in radii(p))):
                     return False
                 # a correction of the least squares' drift (0.5% on test0),
                 # not a different surface that happens to hit a round number
                 if any(abs(a - b) > 0.01 * max(abs(b), 1e-9) for a, b in zip(radii(q), radii(p))):
                     return False
-                if dmax > max(3.0 * float(d0.max()), self.tol_fit):
+                # (from a cone the free fit spent its extra unknown on the
+                # off vertices - test0: 8e-4 against the cylinder's 3.6e-3 -
+                # and only the facets below can judge)
+                if dmax > max(3.0 * float(d0.max()), self.tol_fit) and not cone_in:
                     return False
                 for i in rf:
                     V = topo.verts[i]
@@ -7591,12 +7703,12 @@ class Segmenter:
                 if acceptable(q, dmax):
                     if q.kind == AXIAL and abs(q.slope) < 1e-9:
                         q.slope = 0.0
-                    Log.debug(f"Exact consensus: {p.label()} r {p.r0:.5f} -> {q.r0:.5f} ({n0} -> {n} exact vertices of {len(P)})")
+                    Log.debug(f"Exact consensus: {p_free.label()} r {p_free.r0:.5f} -> {q.label()} r {q.r0:.5f} ({n0} -> {n} exact vertices of {len(P)})")
                     return q
-            Log.debug(f"Exact consensus refused: {p.label()} {n0} -> {hyp[0][0]} exact of {len(P)}, deviation {float(d0.max()):.1e} -> {hyp[0][1]:.1e}")
-            return p
+            Log.debug(f"Exact consensus refused: {p_free.label()} {n0} -> {hyp[0][0]} exact of {len(P)}, deviation {float(d0.max()):.1e} -> {hyp[0][1]:.1e}")
+            return p_free
         except Exception:
-            return p
+            return p_free
 
     def _review_type(self, p, rf):
         """
@@ -7621,6 +7733,10 @@ class Segmenter:
         try:
             P = np.vstack([topo.verts[i] for i in rf])
             d0 = float(np.abs(p.dist(P)).max())
+            if p.kind == AXIAL and abs(p.slope) < 1e-9 and self.allow_cone:
+                q = self._cone_not_cylinder(p, rf, P, d0)
+                if q is not None:
+                    return q
             if d0 > 0.25 * self.tol_fit:
                 return p
             if p.kind == SPHERE and self.allow_cone:
@@ -7646,6 +7762,119 @@ class Segmenter:
         except Exception:
             pass
         return p
+
+    def _snap_cone_angle(self, p, rf):
+        """
+        ⚠️ THE DRAWING SAYS 45 DEGREES. A narrow cone band has its taper
+        badly conditioned - axis tilt and semi-angle trade off against each
+        other - and the free fit lands a few tenths off the drawing's angle
+        with the vertices as close as at the round one (test10: a 45-degree
+        chamfer at 44.33, another at 44.90, a 47.5 at 47.505). The rounder
+        angles are tried first (multiples of 15 degrees, then 5, 1, 0.5),
+        within a degree of the fit: the first that explains the vertices as
+        well as the free cone - no more than two float steps or a tenth of
+        the tolerance further - and still holds every facet, wins.
+        """
+        if p is None or p.kind != AXIAL or abs(p.slope) <= 0.05 or self.only_cyl:
+            return p
+        ang = math.degrees(math.atan(abs(p.slope)))
+        try:
+            topo = self.topo
+            P = np.vstack([topo.verts[i] for i in rf])
+            Wt = np.concatenate([np.full(len(topo.verts[i]), max(topo.areas[i], 1e-12) / max(len(topo.verts[i]), 1)) for i in rf])
+            eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(P).max()))
+            lim = float(np.abs(p.dist(P)).max()) + max(2.0 * eps, 0.1 * self.tol_fit)
+            tried = set()
+            for g in (15.0, 5.0, 1.0, 0.5):
+                for tgt in sorted({math.floor(ang / g) * g, math.ceil(ang / g) * g}, key=lambda x: abs(x - ang)):
+                    if tgt in tried or abs(tgt - ang) > 1.0 or not 0.0 < tgt < 80.0:
+                        continue
+                    tried.add(tgt)
+                    if abs(tgt - ang) < 1e-7:
+                        return p  # already on the drawing's number
+                    q = lm_refine(p, P, Wt, fix_slope=math.copysign(math.tan(math.radians(tgt)), p.slope))
+                    if q is None or q is p or q.kind != AXIAL or abs(abs(q.slope) - math.tan(math.radians(tgt))) > 1e-12:
+                        continue
+                    if float(np.abs(q.dist(P)).max()) <= lim and all(self.within(q, i) for i in rf):
+                        Log.debug(f"Cone angle: {ang:.4f} -> {tgt:g} degrees on {len(rf)} facets")
+                        return q
+        except Exception:
+            pass
+        return p
+
+    def _mesh_is_exact(self) -> bool:
+        """
+        Was the mesh exported from a CAD with its vertices ON the surfaces
+        (to the float32 of the STL), or is it noisy (scanned, re-meshed,
+        exported through other software)? Judged once on the planar faces
+        with five or more vertices: on an exact mesh their vertices sit on
+        the plane to a few float roundings (test10: ~1e-6), on a noisy one
+        at the Phase A merge tolerance.
+        """
+        ex = getattr(self, "_exact_mesh", None)
+        if ex is None:
+            topo = self.topo
+            eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(topo.vpos).max()))
+            devs = []
+            for i in range(topo.nF):
+                V = topo.verts[i]
+                if len(V) >= 5 and topo.planar[i]:
+                    W = V - V.mean(axis=0)
+                    try:
+                        devs.append(float(np.abs(W @ np.linalg.svd(W, full_matrices=False)[2][2]).max()))
+                    except np.linalg.LinAlgError:
+                        continue
+            ex = len(devs) >= 5 and float(np.median(devs)) <= 4.0 * eps
+            self._exact_mesh = ex
+            Log.debug(f"Mesh exact to the float: {ex} ({len(devs)} planar faces, median deviation {float(np.median(devs)) if devs else -1:.1e}, float step {eps:.1e})")
+        return ex
+
+    def _cone_not_cylinder(self, p, rf, P, d0):
+        """
+        ⚠️ THE CHAMFER ON A BIG ARC THAT PASSES FOR A CYLINDER. A 45-degree
+        chamfer band around an R36 arc covers a few degrees of it, and over
+        those few degrees its rulings are nearly parallel: a cylinder with
+        the axis along them and r = R/cos(45) passes within the tolerance
+        (test10: r52.68 at 3.2e-4 against tol_fit 5e-4), and the simplest
+        primitive that fits wins. On an exact mesh the cone through the same
+        vertices sits at float precision (4.4e-6), seventy times closer: the
+        cylinder is a coincidence of the tolerance, the cone is the CAD's.
+        Only when the cone is exact and the cylinder clearly isn't; on a
+        noisy mesh no cone gets there and nothing changes.
+        """
+        topo = self.topo
+        eps = max(1e-6, 2.5 * 2.0**-24 * float(np.abs(P).max()))
+        if d0 <= 10.0 * eps or not self._mesh_is_exact():
+            return None
+        Wt = np.concatenate([np.full(len(topo.verts[i]), max(topo.areas[i], 1e-12) / max(len(topo.verts[i]), 1)) for i in rf])
+        Nr = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in rf])
+        # (over a few degrees the facet normals can't tell the cone's axis
+        # from the cylinder's - revolution_axis lands on the rulings - so the
+        # cones osculating the cylinder are tried too, every one refined:
+        # the problem is ill-conditioned and only the right angle's start
+        # reaches the float precision)
+        best = None
+        for q in [fit_axial_rev(P, Nr, Wt)] + _tangent_cones(p, P):
+            q = lm_refine(q, P, Wt) if q is not None else None
+            if q is None or q.kind != AXIAL or abs(q.slope) <= 0.05 or prim_radius(q) > self.max_radius:
+                continue
+            dq_ = float(np.abs(q.dist(P)).max())
+            if best is None or dq_ < best[0]:
+                best = (dq_, q)
+        if best is None:
+            return None
+        dq, q = best
+        if dq > max(2.0 * eps, 0.05 * self.tol_fit) or dq > 0.1 * d0:
+            return None
+        if normal_deviation(q, P, Nr) > 15.0 or not all(self.within(q, i) for i in rf):
+            return None
+        Q = sag_points(topo, rf)
+        s_p = float(np.sqrt(np.mean(p.dist(Q) ** 2)))
+        s_q = float(np.sqrt(np.mean(q.dist(Q) ** 2)))
+        if s_q > 1.5 * s_p + eps:
+            return None
+        Log.debug(f"Type review: {p.label()} -> {q.label()} on {len(rf)} facets (vertices {d0:.1e} -> {dq:.1e})")
+        return q
 
     def _blend_patches(self, regions, frags=None):
         """
@@ -9587,6 +9816,20 @@ def make_pcurve(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, 
 def _make_pcurve_n(sp: SurfParam, curve, t0: float, t1: float, traverse_fwd: bool, u_prev: Optional[float], v_prev: Optional[float], n: int):
     P, ts = curve_points(curve, t0, t1, n)
     u, v = sp.uv(P)
+    # ⚠️ A CONE'S APEX HAS NO u: arctan2 of the fit's noise, anywhere in
+    # [-pi, pi]. An edge ending there (a ruling of a cone tip) gets the u of
+    # its own neighbouring sample - a ruling has one u all along - instead
+    # of a jump that unwrapped the wire by a whole turn (test10: a 32-facet
+    # tip converted or not depending on a micron of the apex)
+    pk_ = getattr(sp, "prim", None)  # (snap_arcs' _ArcSurf has none)
+    if pk_ is not None and pk_.kind == AXIAL and abs(pk_.slope) >= 1e-12 and len(u) > 2:
+        d_ = P - sp.C
+        rho_ = np.linalg.norm(d_ - np.outer(d_ @ sp.Z, sp.Z), axis=1)
+        tip = rho_ <= max(1e-9, 1e-4 * float(rho_.max()))
+        if tip.any() and not tip.all():
+            idx = np.nonzero(~tip)[0]
+            for i in np.nonzero(tip)[0]:
+                u[i] = u[idx[int(np.argmin(np.abs(idx - i)))]]
     if not traverse_fwd:
         u, v = u[::-1], v[::-1]
     if sp.periodic_u:
@@ -10490,6 +10733,8 @@ class Engine:
         # the face can carry along the tolerance the edges already had:
         # we're not the ones who put it there
         if mt > max(tol_cap, max((t for _, t, _ in wires), default=0.0)):
+            if self.verbose:
+                Log.debug("    worst entity: " + worst_tolerance_entity(F))
             self._restore_all(vtol_backup)
             return False, f"tolerance {mt:.1e} on the new face beyond the ceiling {tol_cap:.1e}"
         a_mesh = float(sum(topo.areas[i] for i in rf))
@@ -10794,13 +11039,27 @@ class Engine:
         D = np.abs(np.angle(np.exp(1j * (u2[None, :] - u1[:, None]))))
         ia, ib = np.unravel_index(int(np.argmin(D)), D.shape)
         r_eff = max(prim_radius(sp.prim), 1e-6)
+        # ⚠️ the offset is a length at the VERTICES' radius: on a
+        # countersink the wide rim is 10% further out than r_eff (test10:
+        # 9.5e-3 by r_eff, 1.26e-2 on the vertex, over the ceiling)
+        if sp.prim.kind in (AXIAL, TORUS):
+            def rad(J):
+                d_ = topo.vpos[J] - sp.prim.center
+                return np.linalg.norm(d_ - np.outer(d_ @ sp.prim.axis, sp.prim.axis), axis=1)
+            r1v, r2v = rad(c1), rad(c2)
+            Dm = D * np.maximum(r1v[:, None], r2v[None, :])
+        else:
+            Dm = D * r_eff
         # among the aligned pairs (each A with its best B), the seam with
-        # the widest margin from the boundary (see _seam_clearance)
+        # the widest margin from the boundary (see _seam_clearance) - up to
+        # a margin that is safe anyway, past which the better aligned wins:
+        # the misalignment becomes the vertices' tolerance
         pairs = [(a, int(np.argmin(D[a]))) for a in range(len(c1))]
-        pairs = [(a, b) for a, b in pairs if D[a, b] * r_eff <= self.max_edge_tol]
+        pairs = [(a, b) for a, b in pairs if Dm[a, b] <= self.max_edge_tol]
         crossing = False
         if pairs:
-            scored = [(self._seam_clearance(loops, sp, c1[a], c2[b], r_eff), -D[a, b], a, b) for a, b in pairs]
+            cap = 10.0 * self.max_edge_tol
+            scored = [(min(self._seam_clearance(loops, sp, c1[a], c2[b], r_eff), cap), -D[a, b], a, b) for a, b in pairs]
             cl, _, ia, ib = max(scored)
             crossing = cl < 0  # every aligned seam cuts the boundary: a path of mesh edges instead
         A, B = c1[ia], c2[ib]
@@ -10811,14 +11070,16 @@ class Engine:
         # the surface, with both pcurves computed the same way as any other
         # edge.
         self._seam_path = None
-        if D[ia, ib] * r_eff > self.max_edge_tol or crossing:
+        if Dm[ia, ib] > self.max_edge_tol or crossing:
             path = self._seam_path_search(set(c1), set(c2), sp, r_eff)
             if path is None:
                 if crossing:
                     return "seam: every aligned seam crosses the region's boundary"
-                return f"seam: no aligned vertex on the second ring (deviation {D[ia, ib] * r_eff:.1e} mm)"
+                return f"seam: no aligned vertex on the second ring (deviation {Dm[ia, ib]:.1e} mm)"
             A, B, edges = path
             self._seam_path = (A, B, edges)
+        if self.verbose:
+            Log.debug(f"    seam {A}->{B}: u offset {D[ia, ib]:.2e} rad ({Dm[ia, ib]:.1e} mm), {len(pairs)} aligned pairs{', path of mesh edges' if self._seam_path else ''}")
         for ch in L1.chains:
             if ch.closed:
                 rotate(ch, A)
@@ -11182,7 +11443,7 @@ class Engine:
             own = TopTools_IndexedMapOfShape()
             for f in faces:
                 te_MapShapes(f, TopAbs_EDGE, own)
-            free = sum(1 for q in range(1, _size(own) + 1) if _size(m.FindFromKey(own.FindKey(q))) == 1)
+            free = sum(1 for q in range(1, _size(own) + 1) if _size(m.FindFromKey(own.FindKey(q))) == 1 and not bt_Degenerated(td_Edge(own.FindKey(q))))
             return free, m
 
         f_new, m_new = _map(list(born))
@@ -12226,7 +12487,7 @@ def run_phase(
         Log.info(f"Candidate holes (cylinders closed 360 degrees, concave): {len(regions)}")
     Log.debug(f"Segmentation in {time.perf_counter() - t0:.2f}s")
     if not regions:
-        Log.warn("No region to convert.")
+        Log.info("No region to convert.")
         res.shape = shape
         res.faces_after = res.faces_before
         res.free_after = res.free_before
@@ -12380,6 +12641,22 @@ def default_threads() -> int:
     return max(1, min(22, n - 2))
 
 
+# ⚠️ THE DEFAULT SEQUENCE IS MEASURED, NOT GUESSED (13 test parts, four with
+# the CAD they came from, every sequence run on all of them):
+#  - Phase B before C adds nothing: Phase C finds the holes itself, and with
+#    B first two parts came out slightly worse (test4 one CAD face fewer
+#    reproduced one to one, test6 one face more) for 10-30% more time;
+#  - the re-merge at 0.005 mm leaves the part as close to the mesh as the
+#    tight default and merges far more (test6 200 -> 99, test9 1757 -> 1116);
+#  - a SECOND Phase C after it: the merged planes give the curved regions
+#    their true boundaries (test2 96 -> 82, test6 98 -> 89, test9 1116 ->
+#    1100, test11 577 -> 572), at the same distance; a third finds nothing;
+#  - a wide FIRST Phase A (0.005) flattens fillets into planes before Phase C
+#    sees them (test13 58 -> 1770 faces); no final A leaves the planes split
+#    by the replacements (test9 1813).
+DEFAULT_SEQUENCE = (("A", None), ("C", None), ("A", 0.005), ("C", None), ("A", 0.005))
+
+
 class _PhaseArg(argparse.Action):
     """
     ⚠️ PHASES RUN IN THE ORDER THEY'RE WRITTEN. argparse only gives the
@@ -12417,15 +12694,16 @@ def parse_args(argv=None):
             "closed, faces valid, consistent orientation, area and volume consistent\n"
             "with the mesh): if a check fails it's rolled back and that piece stays\n"
             "tessellated. The output is always consistent with the input, at worst\n"
-            "it's less clean. Without -a/-b/-c all three phases run."
+            "it's less clean. Without -a/-b/-c the sequence is A C A(0.005) C A(0.005)."
         ),
         epilog=(
             "examples\n"
-            "  python refit.py part.stl                  all phases\n"
+            "  python refit.py part.stl                  default sequence A C A(0.005) C A(0.005)\n"
+            "  python refit.py part.stl --report         the same, with a .txt report\n"
             "  python refit.py part.stl -a               only merging coplanar faces\n"
             "  python refit.py part.stl -a 0.01          same, merging up to 10 microns\n"
-            "  python refit.py part.stl -b -c --report   holes and features, with a .txt report\n"
-            "  python refit.py part.stl -b -c -a 0.01    final merge at 10 microns\n"
+            "  python refit.py part.stl -a -c -a 0.005   one Phase C only (faster)\n"
+            "  python refit.py part.stl -a -b -c -a 0.01 holes first, final merge at 10 microns\n"
             "  python refit.py part.stl -b -c -i 2       two B/C cycles before saving\n"
             "  python refit.py part.step -o out.step     STEP input\n"
             "  python refit.py part.stl -j 1             everything sequential (reproducible)\n"
@@ -12448,7 +12726,7 @@ def parse_args(argv=None):
     p.add_argument("-o", "--output", metavar="FILE", help="output STEP file (default: <name>.step, or <name>_phaseA.step with Phase A alone)")
     p.add_argument("--check", action="store_true", help="check the environment (OpenCascade, numpy, required functions) and exit")
 
-    g = p.add_argument_group("phases (none = A B C A)")
+    g = p.add_argument_group("phases (none = A C A 0.005 C A 0.005)")
     g.add_argument(
         "-a",
         nargs="?",
@@ -12629,10 +12907,10 @@ def main(argv=None) -> int:
         Log.error("Missing input file (.stl or .step). Use -h for help.")
         return 2
 
-    # phase sequence, in the order written. No flags: A B C A.
+    # phase sequence, in the order written. No flags: DEFAULT_SEQUENCE.
     seq = list(getattr(args, "sequence", None) or [])
     if not seq:
-        seq = [("A", None), ("B", None), ("C", None), ("A", None)]
+        seq = list(DEFAULT_SEQUENCE)
     stem, _ = os.path.splitext(args.input)
     only_a = all(w == "A" for w, _ in seq)
     out_path = args.output or (f"{stem}_phaseA.step" if only_a else f"{stem}.step")

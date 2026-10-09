@@ -28,14 +28,14 @@ check still runs (on `numpy` alone) and defects are reported but left unrepaired
 ### First run
 
 ```bash
-python refit.py part.stl -a -b -c -a 0.005
+python refit.py part.stl
 ```
 
-This runs the default phase sequence (`A B C A`, see below) with tolerance `0.005` and writes
-`part.step` next to the input. A few of the bundled test meshes are a good first try:
+This runs the default phase sequence (`A C A(0.005) C A(0.005)`, see below) and writes `part.step`
+next to the input. A few of the bundled test meshes are a good first try:
 
 ```bash
-python refit.py test0.stl -a -b -c -a 0.005
+python refit.py test0.stl
 ```
 
 Then check the result against the input mesh:
@@ -53,6 +53,25 @@ python tools/cadcmp.py test0_original.step test0.step -v
 
 See the docstring at the top of [`refit.py`](refit.py) for the full guide (every flag, how to read
 the report, the final arc-snapping step).
+
+### Viewer
+
+```bash
+pip install pywebview
+python viewer/server.py              # or double-click viewer/Refit Viewer.pyw
+python viewer/server.py part.stl     # with part.stl already open
+```
+
+opens a desktop window (pywebview: a normal Windows window drawn by the system's WebView2, the way
+Tauri apps are; three.js comes from a CDN) where you pick a mesh, set the phases and tolerances, run `refit.py` with its log streamed live, and look at
+the result: input mesh, converted STEP and, when there is one, the `<name>_original.step` CAD, side
+by side. Faces are coloured by surface type (the triangles still left from the mesh in yellow), the
+B-Rep edges can be coloured by curve type, hovering a face shows its type, radius or angles and
+area, and the panel compares face and edge counts with the original CAD. The command it runs is
+shown in the page and is exactly what you'd type; the line under it warns when the output file
+already exists and will be overwritten. `--browser` shows the same page in the default browser
+instead (that's also the fallback without pywebview), `--serve` only runs the local server; in the
+browser, files dropped on the view are copied into `viewer_uploads/`.
 
 ## Mesh check (STL input)
 
@@ -94,10 +113,21 @@ are reported but left in.
   reproduces all 57 faces of its CAD one to one).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
-`A B C A` (the last one re-merges the planar faces split by the replacements).
+`A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
+of them:
+
+- Phase B before C adds nothing (Phase C finds the holes itself) and costs time;
+- re-merging the planar faces at 0.005 mm leaves the part exactly as close to the mesh as the tight
+  default, with far fewer faces;
+- a second Phase C after that re-merge finds what the first one couldn't, because the merged planes
+  give the curved regions their true boundaries (`test2` 96 → 82 faces, `test6` 98 → 89); a third
+  finds nothing;
+- a wide first Phase A flattens fillets into planes before Phase C can see them.
 
 ```bash
-python refit.py part.stl -a -b -c -a 0.005
+python refit.py part.stl                     # the default: A C A(0.005) C A(0.005)
+python refit.py part.stl -a -c -a 0.005      # one Phase C only, faster
+python refit.py part.stl -a -b -c -a 0.005   # holes first, the previous recipe
 ```
 
 ## Output file
@@ -115,6 +145,7 @@ come back worse get their pcurves written after all. `--pcurves` always writes t
 ## Repository layout
 
 - [`refit.py`](refit.py) — the main tool, run directly from the repo root.
+- [`viewer/`](viewer) — the local viewer (`python viewer/server.py`, see above).
 - [`tools/`](tools) — QA, analysis and debug scripts, all run from the repo root
   (e.g. `python tools/qa.py ...`); each imports `refit.py` by locating it relative to its own path,
   so the repo can be moved around freely as long as this layout is kept:
