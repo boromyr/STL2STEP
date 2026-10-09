@@ -158,6 +158,10 @@ def main():
     Tm = stl_tris(inp)
     sh, _ = rf.read_step(out)
     st = brep_stats(sh)
+    # validity of the file AS READ, before triangulating it: BRepMesh adds
+    # polygons to the edges, and a polygonal edge left on a curved face
+    # (within its tolerance) then fails BRepCheck although the file is fine
+    valid = rf.is_valid(sh)
     diag = float(np.linalg.norm(Tm.reshape(-1, 3).max(0) - Tm.reshape(-1, 3).min(0)))
     To = mesh_tris_from_shape(sh, 2e-5 * diag)
     rng = np.random.default_rng(0)
@@ -166,7 +170,7 @@ def main():
     d_om = dist_to_tris(Po, Tm)
     Pm = sample(Tm, n, rng)
     d_mo = dist_to_tris(Pm, To)
-    res = dict(file=os.path.basename(inp), valid=rf.is_valid(sh), free=rf.count_free_edges(sh), volume=rf.shape_volume(sh),
+    res = dict(file=os.path.basename(inp), valid=valid, free=rf.count_free_edges(sh), volume=rf.shape_volume(sh),
                out2mesh_mean=float(d_om.mean()), out2mesh_p99=float(np.percentile(d_om, 99)), out2mesh_max=float(d_om.max()),
                mesh2out_mean=float(d_mo.mean()), mesh2out_p99=float(np.percentile(d_mo, 99)), mesh2out_max=float(d_mo.max()),
                out2mesh_at=[round(float(x), 3) for x in Po[int(d_om.argmax())]],

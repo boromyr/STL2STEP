@@ -142,6 +142,13 @@ the reader rebuilds them, and the file is 3-7 times smaller. The output is read 
 and checked (validity, free edges, every face triangulated against its own area); the faces that
 come back worse get their pcurves written after all. `--pcurves` always writes them all.
 
+STEP keeps no tolerances, so a face that was valid in memory only thanks to a vertex's tolerance
+(two edges reaching their vertex at a narrow angle and crossing just past it, or a lens-shaped
+sliver whose ring touches the face's rim) can read back invalid with or without pcurves. When that
+happens the part as read back is mended — the vertex moved to the edges' crossing, the sliver
+covered by the face around it — and written again, kept only if it reads back better and with the
+same volume (`test12` now reads back valid).
+
 ## Repository layout
 
 - [`refit.py`](refit.py) — the main tool, run directly from the repo root.
