@@ -4950,13 +4950,6 @@ def _ellipse(c, n, u, a: float, b: float) -> Optional[CEllipse]:
     if b > a:
         a, b = b, a
         u = np.cross(n, u)
-    # ⚠️ AN ELLIPSE THAT STRAYS FROM ITS MEAN CIRCLE BY A TENTH OF A MICRON IS
-    # A CIRCLE: a plane cutting a cone 1e-5 off square gave test12's
-    # countersink a closed ring with axes 3.29547 and 3.29531, and BRepMesh
-    # then laid a triangle 1.55 mm across the hole (its twin, ringed by a
-    # circle, meshed clean). The circle keeps the ellipse's frame.
-    if a - b <= 2e-4:
-        return CCircle(np.asarray(c, float), n, u, np.cross(n, u), 0.5 * float(a + b))
     return CEllipse(np.asarray(c, float), n, u, np.cross(n, u), float(a), float(b))
 
 
@@ -10913,6 +10906,16 @@ class Engine:
                 if ch.closed and cv.period is None:
                     n_poly += 1
                     continue
+                # ⚠️ A CLOSED RING ON AN ELLIPSE WITHIN A TENTH OF A MICRON OF ITS
+                # MEAN CIRCLE IS A CIRCLE: a plane cutting a cone 1e-5 off
+                # square gave test12's countersink a ring with axes 3.29547 and
+                # 3.29531, and BRepMesh laid a triangle 1.55 mm across the hole
+                # (its twin, ringed by a circle, meshed clean). Only a closed
+                # ring: an OPEN arc made a circle strays off its surface by that
+                # much and crosses its neighbours at narrow corners (two o3.4
+                # holes of test12 came out SelfIntersectingWire).
+                if ch.closed and isinstance(cv, CEllipse) and cv.a - cv.b <= 2e-4:
+                    cv = CCircle(cv.c, cv.n, cv.u, cv.v, 0.5 * float(cv.a + cv.b))
                 j1, j2 = ch.verts[0], ch.verts[-1]
                 V1, V2 = vertex_obj(j1), vertex_obj(j2)
                 for j in (j1, j2):
@@ -12572,6 +12575,10 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
                 vt_backup.setdefault(j, cur)
                 grow_vertex_tolerance(Vj, dist)
 
+        # (a closed ring on a near-circular ellipse is a circle: see the same
+        # rule in Engine._convert)
+        if closed and isinstance(cv, CEllipse) and cv.a - cv.b <= 2e-4:
+            cv = CCircle(cv.c, cv.n, cv.u, cv.v, 0.5 * float(cv.a + cv.b))
         for j in {i1, i2}:
             bump(j, float(np.abs(cv.dist(topo.vpos[j][None, :]))[0]))
         Pmid = P[len(P) // 2] if len(P) > 2 else None
