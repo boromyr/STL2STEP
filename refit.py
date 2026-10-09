@@ -1750,6 +1750,208 @@ def _lost_faces(shape, ri, tol: float) -> Set[int]:
     return lost
 
 
+def fix_crossing_vertices(shape, faces, reach: float = 5e-3) -> int:
+    """
+    ⚠️ VALID IN MEMORY, SELF-INTERSECTING ONCE WRITTEN. Where two edges of a
+    face reach their vertex at a narrow angle - a straight wall running into
+    an arc, two arcs in a row, or the cusp where a line and an arc arrive
+    from the same side - a small gap between the two curves makes them
+    CROSS away from the vertex: gap/sin(angle), sqrt(2 R gap) when tangent
+    (2.5e-4 from a gap of 3e-8 on test12). In memory the
+    vertex's tolerance covers the crossing and BRepCheck is happy; STEP
+    keeps no tolerance, the reader gives that vertex 1e-7, and the face
+    reads back SelfIntersectingWire (test12: four faces, the whole part
+    invalid, with or without pcurves). The vertex is moved TO the crossing
+    and the two edges end there: the other edges at that vertex keep a gap
+    instead, which the reader covers by itself (it raises a vertex's
+    tolerance over a gap, never over a crossing).
+    Only the vertices of `faces`; returns how many moved.
+    """
+    from OCP.GeomAPI import GeomAPI_ExtremaCurveCurve
+    bb = BRep_Builder()
+    vmap_e = TopTools_IndexedDataMapOfShapeListOfShape()
+    te_MapAncestors(shape, TopAbs_VERTEX, TopAbs_EDGE, vmap_e)
+    emap_f = edge_face_map(shape)
+    fmap = TopTools_IndexedMapOfShape()
+    te_MapShapes(shape, TopAbs_FACE, fmap)
+    verts = TopTools_IndexedMapOfShape()
+    for f in faces:
+        te_MapShapes(f, TopAbs_VERTEX, verts)
+    # (not only tangent pairs: a vertex 1.06e-4 off an arc that meets the
+    # next one at 18 degrees makes them cross gap/sin = 3.4e-4 away)
+    cos_t = math.cos(math.radians(80.0))
+    moved = 0
+    for iv in range(1, _size(verts) + 1):
+        V = td_Vertex(verts.FindKey(iv))
+        if vmap_e.FindIndex(V) == 0:
+            continue
+        P_v = vpos(V)
+        es = []
+        for e in _iter_list(vmap_e.FindFromKey(V)):
+            e = td_Edge(e)
+            if bt_Degenerated(e) or any(e.IsSame(x[0]) for x in es) or te_FirstVertex(e).IsSame(te_LastVertex(e)):
+                continue
+            c, c0, c1 = edge_curve(e)
+            if c is None:
+                continue
+            first = te_FirstVertex(e).IsSame(V)
+            p_, v_ = gp_Pnt(), gp_Vec()
+            c.D1(c0 if first else c1, p_, v_)
+            d_ = np.array([v_.X(), v_.Y(), v_.Z()]) * (1.0 if first else -1.0)
+            nd = float(np.linalg.norm(d_))
+            if nd < 1e-12:
+                continue
+            fs = {fmap.FindIndex(f) for f in _iter_list(emap_f.FindFromKey(e))}
+            line = BRepAdaptor_Curve(e).GetType() == GeomAbs_Line
+            L = max(edge_length(e), 1e-12)
+            fr = min(1.0, reach / L)
+            near = (c0, c0 + fr * (c1 - c0)) if first else (c1 - fr * (c1 - c0), c1)
+            es.append((e, c, c0, c1, first, d_ / nd, fs, line, near))
+        hits = []
+        for a in range(len(es)):
+            for b in range(a + 1, len(es)):
+                A, B = es[a], es[b]
+                if (A[7] and B[7]) or not (A[6] & B[6]) or abs(float(A[5] @ B[5])) < cos_t:
+                    continue
+                try:
+                    # (parallel curves have no isolated extremum: Points raises,
+                    # and the pair is skipped)
+                    ex = GeomAPI_ExtremaCurveCurve(A[1], B[1], A[8][0], A[8][1], B[8][0], B[8][1])
+                    for n in range(1, ex.NbExtrema() + 1):
+                        if ex.Distance(n) > 1e-7:
+                            continue
+                        q1, q2 = gp_Pnt(), gp_Pnt()
+                        ex.Points(n, q1, q2)
+                        X = np.array([q1.X(), q1.Y(), q1.Z()])
+                        ua, ub = ex.Parameters(n)
+                        dv = float(np.linalg.norm(X - P_v))
+                        if 1e-6 < dv < reach and A[2] < ua < A[3] and B[2] < ub < B[3]:
+                            hits.append((dv, a, b, X, ua, ub))
+                except Exception:
+                    continue
+        if not hits:
+            continue
+        dv, a, b, X, ua, ub = min(hits, key=lambda h: h[0])
+        for (e, c, c0, c1, first, *_), u in ((es[a], ua), (es[b], ub)):
+            if first:
+                bb.Range(e, float(u), c1)
+            else:
+                bb.Range(e, c0, float(u))
+        gap = 0.0
+        for e, c, *_ in es:
+            c, c0, c1 = edge_curve(e)
+            for u in (c0, c1):
+                q = c.Value(u)
+                g = float(np.linalg.norm(np.array([q.X(), q.Y(), q.Z()]) - X))
+                if g < 10.0 * reach:
+                    gap = max(gap, g)
+        tol = max(1.2 * gap, float(bt_Tolerance(V)) if gap > 0 else 1e-7, 1e-7)
+        bb.UpdateVertex(V, gp_Pnt(*map(float, X)), tol)
+        for (e, c, c0, c1, first, *_), u in ((es[a], ua), (es[b], ub)):
+            bb.UpdateVertex(V, float(u), e, tol)
+        moved += 1
+    return moved
+
+
+def remove_lens_holes(shape, faces, max_dev: float):
+    """
+    ⚠️ A LENS-SHAPED HOLE TOUCHING THE FACE'S RIM. A facet cut by an exact
+    curve can end up as a planar sliver bounded by two edges only - the
+    exact arc and the mesh's chord - sitting as an inner ring of the curved
+    face around it (test12: two cylinders, slivers of 0.008 and 0.002 mm2
+    between an ellipse and its chord). When that ring touches the outer one
+    at a vertex the face is valid in memory and reads back from STEP as
+    IntersectingWires. The sliver goes, and the face covers it with its
+    own surface: the ring's edges must lie within max_dev of it (the lens
+    is that thin), so nothing moves further than that.
+    Only `faces` (those that read back broken). Returns (shape, removed).
+    """
+    GeomAPI_ProjectPointOnSurf = _m("GeomAPI").GeomAPI_ProjectPointOnSurf
+    ef = edge_face_map(shape)
+    fmap = TopTools_IndexedMapOfShape()
+    te_MapShapes(shape, TopAbs_FACE, fmap)
+    rs = BRepTools_ReShape()
+    gone = []
+    bb = BRep_Builder()
+    for F in faces:
+        F = td_Face(F)
+        ws = [td_Wire(w) for w in explore(F, TopAbs_WIRE)]
+        if len(ws) < 2:
+            continue
+        outer = _BRepTools.BRepTools.OuterWire_s(F)
+        keep, drop = [], []
+        for w in ws:
+            es = [td_Edge(e) for e in explore(w, TopAbs_EDGE)]
+            lens = None
+            if not w.IsSame(outer) and len(es) == 2:
+                nb = [[g for g in _iter_list(ef.FindFromKey(e)) if not g.IsSame(F)] for e in es]
+                if all(len(x) == 1 for x in nb) and nb[0][0].IsSame(nb[1][0]):
+                    L = td_Face(nb[0][0])
+                    if count_sub(L, TopAbs_EDGE) == 2 and not any(L.IsSame(g) for g in gone):
+                        srf = BRep_Tool.Surface_s(F)
+                        dev = 0.0
+                        for e in es:
+                            c, c0, c1 = edge_curve(e)
+                            for u in np.linspace(c0, c1, 9):
+                                q = c.Value(float(u))
+                                pr = GeomAPI_ProjectPointOnSurf(q, srf)
+                                dev = max(dev, pr.LowerDistance() if pr.NbPoints() else math.inf)
+                        if dev <= max_dev:
+                            lens = L
+            if lens is None:
+                keep.append(w)
+            else:
+                drop.append(lens)
+        if not drop:
+            continue
+        F2 = TopoDS_Face()
+        bb.MakeFace(F2, BRep_Tool.Surface_s(F), F.Location(), float(bt_Tolerance(F)))
+        for w in keep:
+            bb.Add(F2, w)
+        F2.Orientation(F.Orientation())
+        rs.Replace(F, F2)
+        for L in drop:
+            rs.Remove(L)
+            gone.append(L)
+    if not gone:
+        return shape, 0
+    return rs.Apply(shape), len(gone)
+
+
+def _mend_for_step(ri, bad, max_dev: float, v_ref: float):
+    """
+    The part AS READ BACK (ri), with the faces that came back invalid (bad:
+    indices in ri) mended: vertices moved to their edges' crossing, lens
+    slivers removed. It works on what the reader sees - its own curves and
+    ranges - rather than on the part in memory, whose tolerances hid the
+    problem. None unless it leaves fewer invalid faces, no new one, no free
+    edge and the volume of the part in memory (v_ref).
+    """
+    try:
+        faces = [td_Face(f) for f in explore(ri, TopAbs_FACE)]
+        sel = [faces[i] for i in sorted(bad) if i < len(faces)]
+        if not sel:
+            return None
+        nbad = lambda sh: sum(1 for f in explore(sh, TopAbs_FACE) if check_detail(td_Face(f)))
+        b0, f0 = nbad(ri), count_free_edges(ri)
+        n = fix_crossing_vertices(ri, sel)
+        cp, nl = remove_lens_holes(ri, [f for f in sel if check_detail(f)], max_dev)
+        if not (n or nl):
+            return None
+        b1, f1 = nbad(cp), count_free_edges(cp)
+        # (the volume of a part with an invalid face is no measure: test12
+        # with one left read 44091 for 44160 - checked once all are valid)
+        v1 = shape_volume(cp) if b1 == 0 else v_ref
+        if b1 >= b0 or f1 > f0 or abs(v1 - v_ref) > max(1e-6 * abs(v_ref), 1e-3):
+            Log.debug(f"STEP mending refused: invalid faces {b0} -> {b1}, free edges {f0} -> {f1}, volume {v_ref:.4f} -> {v1:.4f}")
+            return None
+        Log.debug(f"STEP mending: {n} vertices moved to their edges' crossing, {nl} lens slivers removed, invalid faces {b0} -> {b1}")
+        return cp
+    except Exception as ex:
+        Log.debug(f"STEP mending failed: {type(ex).__name__}: {ex}")
+        return None
+
+
 def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: bool = False):
     """
     write_step, then read back. Without pcurves the file is checked and, if
@@ -1777,6 +1979,25 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     sc, why, bad = _read_back_check(shape, ri, base_bad, defl)
     if sc == (0, 0, 0):
         return ri
+    # ⚠️ AN INVALID FILE FROM A VALID PART: faces that only their vertices'
+    # tolerances kept valid, and STEP doesn't carry tolerances - pcurves or
+    # not (see fix_crossing_vertices, remove_lens_holes). Mended on a copy,
+    # kept only if the part stays valid, closed, of the same volume, and
+    # the file reads back better.
+    if sc[0] == 1 and bad and is_valid(shape):
+        fixed = _mend_for_step(ri, bad, 10.0 * defl, shape_volume(shape))
+        if fixed is not None:
+            write_step(fixed, path, src=src, pcurves=False)
+            ri_f, _ = read_step(path)
+            base_f = set(unmeshable_faces(copy_shape(fixed), defl))
+            sc_f, why_f, bad_f = _read_back_check(fixed, ri_f, base_f, defl)
+            if sc_f < sc:
+                Log.info(f"the file read back with {why}: vertices and slivers mended, now " + (why_f or "faithful"))
+                shape, ri, sc, why, bad, base_bad = fixed, ri_f, sc_f, why_f, bad_f, base_f
+                if sc == (0, 0, 0):
+                    return ri
+            else:
+                write_step(shape, path, src=src, pcurves=False)
     tried = [(sc, 0, "without pcurves", None)]
     if bad:
         # the faces to blame, then those plus their neighbors (an edge is
@@ -3305,6 +3526,27 @@ def fit_free(
         Z = -Z
     ct = Nrep @ Z
     if float(np.quantile(ct, 0.02)) < math.cos(math.radians(max_tilt_deg)):
+        # ⚠️ THE LEAST-SQUARES PLANE ISN'T THE LEAST-TILTED VIEW. On a lopsided
+        # patch (test12: a 60 mm2 B-spline face turning 140 degrees, more on
+        # one side) its normal leaves the steep side at 76 degrees while the
+        # axis of the normals' narrowest cone sees every facet within 70:
+        # pushed toward the most tilted normals until they stop improving.
+        Zb, qb = Z, float(np.quantile(ct, 0.02))
+        Zc = Nrep.sum(axis=0)
+        Zc = Zc / max(float(np.linalg.norm(Zc)), 1e-12)
+        step = 0.5
+        for _ in range(40):
+            c_ = Nrep @ Zc
+            q_ = float(np.quantile(c_, 0.02))
+            if q_ > qb:
+                Zb, qb = Zc, q_
+            low = Nrep[c_ <= q_]
+            Zn = Zc + step * (low.mean(axis=0) - Zc)
+            Zc = Zn / max(float(np.linalg.norm(Zn)), 1e-12)
+            step *= 0.85
+        Z = Zb
+        ct = Nrep @ Z
+    if float(np.quantile(ct, 0.02)) < math.cos(math.radians(max_tilt_deg)):
         return None  # the patch folds back on itself
     X, Y = ortho_frame(Z)
     C = P.mean(axis=0)
@@ -4708,6 +4950,13 @@ def _ellipse(c, n, u, a: float, b: float) -> Optional[CEllipse]:
     if b > a:
         a, b = b, a
         u = np.cross(n, u)
+    # ⚠️ AN ELLIPSE THAT STRAYS FROM ITS MEAN CIRCLE BY A TENTH OF A MICRON IS
+    # A CIRCLE: a plane cutting a cone 1e-5 off square gave test12's
+    # countersink a closed ring with axes 3.29547 and 3.29531, and BRepMesh
+    # then laid a triangle 1.55 mm across the hole (its twin, ringed by a
+    # circle, meshed clean). The circle keeps the ellipse's frame.
+    if a - b <= 2e-4:
+        return CCircle(np.asarray(c, float), n, u, np.cross(n, u), 0.5 * float(a + b))
     return CEllipse(np.asarray(c, float), n, u, np.cross(n, u), float(a), float(b))
 
 
@@ -7977,17 +8226,20 @@ class Segmenter:
             # to not be worse than the ones it replaces.
             sag_old = max([region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in dentro] + [region_sag(frags[q].prim, topo, list(frags[q].faces)) for q in dentro_f])
             chk = sag_points(topo, faces)
-            pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
             # ⚠️ A TORUS REBUILT FROM STRIPS STAYS, THE BLEND GOES AROUND IT.
             # On test8's finger tips two r0.3 cylinders, one inside the tip's
             # blend and one straddling its edge (so left out of the patch),
             # were merged into one torus by _merge_promote: now wholly inside
             # the section, it dragged the patch over the rim where the height
             # field folds, the fit failed, and the tip stayed a mosaic of
-            # fifteen quadrics (17 -> 35 faces). If that's why it fails, the
-            # patch is tried again on the rest, the torus kept as it is.
+            # fifteen quadrics (17 -> 35 faces). So the patch is tried FIRST
+            # on the rest, the torus kept as it is - it's the CAD's own
+            # surface, and a patch that can see steeper sections would
+            # swallow it otherwise (test8: four R2 r0.3 rims turned into
+            # B-spline) - and only if the rest doesn't hold is it taken in.
             prom = [q for q in dentro if getattr(regions[q].prim, "promoted", False)]
-            if pr is None and prom:
+            pr = None
+            if prom:
                 keep_out = {i for q in prom for i in regions[q].faces}
                 faces2 = [i for i in faces if i not in keep_out]
                 dentro2 = [q for q in dentro if q not in prom]
@@ -7999,6 +8251,8 @@ class Segmenter:
                     pr = fit_free(P2, N2, self.tol_fit, check=chk2, check_tol=2.0 * sag2 + 2.0 * self.tol_fit, soft=chk2)
                     if pr is not None:
                         faces, dentro, sag_old = faces2, dentro2, sag2
+            if pr is None:
+                pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
             if pr is None:
                 Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)}: no B-spline holds on its {len(faces)} facets ({len(dentro)} regions, {len(dentro_f)} fragments)")
                 continue
@@ -9081,11 +9335,23 @@ class Segmenter:
             return sorted(gs)
         comps.sort(key=len, reverse=True)
         cap = max(4, int(max_frac * len(gs)))
+        # ⚠️ AN ISLAND STANDING ACROSS THE PATCH IS ANOTHER SURFACE. The wall
+        # of a small hole or boss through a free-form face is enclosed by it
+        # too: taken in, its facets stand at 90-150 degrees from the patch
+        # and the height field folds (test12: a 175 mm2 B-spline bent by 18
+        # degrees at most, refused at 113 because of the walls inside it).
+        # Such an island stays out - the face gets an inner ring there.
+        W = np.array([max(topo.areas[i], 1e-12) for i in gs])
+        nb = (np.array([topo.norms[i] for i in gs]) * W[:, None]).sum(axis=0)
+        nb = nb / max(float(np.linalg.norm(nb)), 1e-12)
+        cos_wall = math.cos(math.radians(75.0))
         for c in comps[1:]:
             if len(c) > cap:
                 continue
             if any(i in owner for i in c):
                 continue  # the island is a real region: leave it
+            if any(float(topo.norms[i] @ nb) < cos_wall for i in c):
+                continue
             gs |= set(c)
         return sorted(gs)
 
@@ -10182,75 +10448,115 @@ class Engine:
                     bnd[k] = i
         if not bnd:
             return None, "no boundary"
-        # direction of travel: the face's interior to the left relative to
-        # the outward normal (independent of OCC's orientation conventions)
-        dir_edge: Dict[int, Tuple[int, int]] = {}
-        out_v: Dict[int, List[int]] = defaultdict(list)
-        undecided: List[int] = []
-        for k, i in bnd.items():
-            a, b = topo.e_verts[k]
-            A, B = topo.vpos[a], topo.vpos[b]
-            n = topo.norms[i]
-            inward = np.cross(n, B - A)
-            s = float((topo.cents[i] - 0.5 * (A + B)) @ inward)
-            # ⚠️ A COLLAPSED FACET (two coincident vertices, area 4e-13 on
-            # test10) has its centroid ON the edge: s = 0 and no side to
-            # tell. Its direction is taken from the boundary's continuity
-            # instead - with a coin toss, one chamfer in two was left as
-            # mesh ("boundary can't be closed").
-            if abs(s) <= 1e-9 * max(float((B - A) @ (B - A)), 1e-30):
-                undecided.append(k)
-                continue
-            if s < 0:
-                a, b = b, a
-            dir_edge[k] = (a, b)
-            out_v[a].append(k)
-        for k in undecided:
-            a, b = topo.e_verts[k]
-            n_in_a = sum(1 for e in dir_edge.values() if e[1] == a)
-            if n_in_a <= len(out_v.get(a, [])):
-                a, b = b, a
-            dir_edge[k] = (a, b)
-            out_v[a].append(k)
 
-        # traversal by rotating around the vertex (handles degree-4 nodes)
-        def next_edge(k_in: int) -> Optional[int]:
-            a, b = dir_edge[k_in]
-            cands = out_v.get(b, [])
-            if len(cands) == 1:
-                return cands[0]
-            if not cands:
+        def walk(topological: bool):
+            """(dir_edge, loops) or None if a loop doesn't close."""
+            dir_edge: Dict[int, Tuple[int, int]] = {}
+            out_v: Dict[int, List[int]] = defaultdict(list)
+            if topological:
+                # ⚠️ THE CENTROID CAN SIT ON THE WRONG SIDE. Phase A's merged
+                # faces are non-convex polygons, and their centroid can fall
+                # outside them: the side test below then reverses an edge and
+                # the walk stops (test12: 24 regions, a 360-degree o6 hole
+                # among them, all manifold, no pinch). The B-Rep says it
+                # exactly: the edge's orientation in its face's wire.
+                for k, i in bnd.items():
+                    o = None
+                    for e in explore(topo.faces[i], TopAbs_EDGE):
+                        if topo.emap.FindIndex(e) - 1 == k:
+                            o = e.Orientation()
+                            break
+                    if o is None:
+                        return None
+                    a, b = topo.e_verts[k]
+                    if o == TopAbs_REVERSED:
+                        a, b = b, a
+                    dir_edge[k] = (a, b)
+                    out_v[a].append(k)
+            else:
+                # direction of travel: the face's interior to the left relative
+                # to the outward normal (independent of OCC's orientation
+                # conventions)
+                undecided: List[int] = []
+                for k, i in bnd.items():
+                    a, b = topo.e_verts[k]
+                    A, B = topo.vpos[a], topo.vpos[b]
+                    n = topo.norms[i]
+                    inward = np.cross(n, B - A)
+                    s_ = float((topo.cents[i] - 0.5 * (A + B)) @ inward)
+                    # ⚠️ A COLLAPSED FACET (two coincident vertices, area 4e-13
+                    # on test10) has its centroid ON the edge: s = 0 and no
+                    # side to tell. Its direction is taken from the boundary's
+                    # continuity instead - with a coin toss, one chamfer in two
+                    # was left as mesh ("boundary can't be closed").
+                    if abs(s_) <= 1e-9 * max(float((B - A) @ (B - A)), 1e-30):
+                        undecided.append(k)
+                        continue
+                    if s_ < 0:
+                        a, b = b, a
+                    dir_edge[k] = (a, b)
+                    out_v[a].append(k)
+                for k in undecided:
+                    a, b = topo.e_verts[k]
+                    n_in_a = sum(1 for e in dir_edge.values() if e[1] == a)
+                    if n_in_a <= len(out_v.get(a, [])):
+                        a, b = b, a
+                    dir_edge[k] = (a, b)
+                    out_v[a].append(k)
+
+            # traversal by rotating around the vertex (handles degree-4 nodes)
+            def next_edge(k_in: int) -> Optional[int]:
+                a, b = dir_edge[k_in]
+                cands = out_v.get(b, [])
+                if len(cands) == 1:
+                    return cands[0]
+                if not cands:
+                    return None
+                f = bnd[k_in]
+                seen = set()
+                for _ in range(64):
+                    es_at_b = [e for e in topo.f_edges[f] if b in topo.e_verts[e] and e != k_in]
+                    es_at_b = [e for e in es_at_b if e not in seen]
+                    if not es_at_b:
+                        return None
+                    e = es_at_b[0]
+                    seen.add(e)
+                    if e in bnd:
+                        return e if bnd[e] == f and dir_edge[e][0] == b else None
+                    nxt = [g for g in topo.e_faces[e] if g in rset and g != f]
+                    if not nxt:
+                        return None
+                    f, k_in = nxt[0], e
                 return None
-            f = bnd[k_in]
-            seen = set()
-            for _ in range(64):
-                es_at_b = [e for e in topo.f_edges[f] if b in topo.e_verts[e] and e != k_in]
-                es_at_b = [e for e in es_at_b if e not in seen]
-                if not es_at_b:
-                    return None
-                e = es_at_b[0]
-                seen.add(e)
-                if e in bnd:
-                    return e if bnd[e] == f and dir_edge[e][0] == b else None
-                nxt = [g for g in topo.e_faces[e] if g in rset and g != f]
-                if not nxt:
-                    return None
-                f, k_in = nxt[0], e
-            return None
 
-        used = set()
-        loops: List[List[int]] = []
-        for k0 in sorted(bnd):
-            if k0 in used:
-                continue
-            seq, k = [], k0
-            while k is not None and k not in used:
-                used.add(k)
-                seq.append(k)
-                k = next_edge(k)
-            if k != k0 and (not seq or dir_edge[seq[-1]][1] != dir_edge[seq[0]][0]):
-                return None, "boundary can't be closed"
-            loops.append(seq)
+            used = set()
+            loops: List[List[int]] = []
+            for k0 in sorted(bnd):
+                if k0 in used:
+                    continue
+                seq, k = [], k0
+                while k is not None and k not in used:
+                    used.add(k)
+                    seq.append(k)
+                    k = next_edge(k)
+                if k != k0 and (not seq or dir_edge[seq[-1]][1] != dir_edge[seq[0]][0]):
+                    return None
+                loops.append(seq)
+            return dir_edge, loops
+
+        walked = walk(False)
+        # (only for a conversion: the segmentation's own checks - a strip, a
+        # fillet's rail joining a region - keep the stricter answer, or they
+        # grow regions the engine then rejects: test8 479 -> 488 faces)
+        # and not where the boundary pinches: there the engine trims the
+        # pinched facets and converts the rest, which works better than a
+        # walk through the pinch (test8: a 79-facet patch then rejected)
+        if walked is None and getattr(self, "shape", None) is not None and not self._pinch_vertices(rf):
+            walked = walk(True)
+        if walked is None:
+            return None, "boundary can't be closed"
+        dir_edge, loops = walked
+
         # chains: split where the neighbor changes
         out: List[Loop] = []
         for seq in loops:
@@ -12654,6 +12960,17 @@ def default_threads() -> int:
 #  - a wide FIRST Phase A (0.005) flattens fillets into planes before Phase C
 #    sees them (test13 58 -> 1770 faces); no final A leaves the planes split
 #    by the replacements (test9 1813).
+# And the tolerances, swept one at a time around it (CAD faces reproduced one
+# to one on test0/4/10/13, out of 332; mean distance from the mesh):
+#  - first A at 2e-6 x diagonal: 1e-6 or 4e-6 x diag, 1e-5 or 3e-4 mm all
+#    reproduce fewer CAD faces (315-325), and test8 can come out invalid;
+#  - Phase C at 1e-5 x diagonal: 5e-6 or 2e-5 x diag, 306 and 318;
+#  - middle A at 0.005: 0.002 the same with more faces, 0.01 and 0.02 move
+#    the part further from the mesh (one and three parts worse);
+#  - last A at 0.005: 0.002 the same with 18 more faces; 0.01 the same CAD
+#    faces and worst distances with 107 faces fewer, but 0.7% further on
+#    average - the cleaner option, not the more faithful; 0.02 moves three
+#    parts away (test10 0.0025 -> 0.0138 mm).
 DEFAULT_SEQUENCE = (("A", None), ("C", None), ("A", 0.005), ("C", None), ("A", 0.005))
 
 
