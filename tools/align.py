@@ -55,10 +55,31 @@ def inertia_frame(shape):
 
 
 def best_transform(shA, shB, PA, PB):
-    """Rigid transform taking A onto B, chosen among the 24 axis combinations."""
-    cA, VA, wA = inertia_frame(shA)
-    cB, VB, wB = inertia_frame(shB)
+    """Rigid transform taking A onto B, chosen among the 24 axis combinations
+    of the inertia frames and the 24 of the world axes around the bounding
+    boxes' centres.
+    ⚠️ AN OPEN SHELL HAS NO INERTIA: test14's CAD is a surface model, its
+    volume properties are noise and every inertia candidate came out tilted
+    (ICP then settled 0.5 mm off). A part exported from an assembly is most
+    often just moved: the world axes around the boxes' centres catch it."""
     best = None
+    bA = 0.5 * (PA.min(axis=0) + PA.max(axis=0))
+    bB = 0.5 * (PB.min(axis=0) + PB.max(axis=0))
+    for perm in itertools.permutations(range(3)):
+        for sg in itertools.product((1, -1), repeat=3):
+            Rm = np.zeros((3, 3))
+            for i in range(3):
+                Rm[perm[i], i] = sg[i]
+            if abs(np.linalg.det(Rm) - 1) > 1e-6:
+                continue
+            d = chamfer(bB + (PA - bA) @ Rm.T, PB)
+            if best is None or d < best[0]:
+                best = (d, bA, bB, Rm)
+    try:
+        cA, VA, wA = inertia_frame(shA)
+        cB, VB, wB = inertia_frame(shB)
+    except Exception:
+        return best
     for perm in itertools.permutations(range(3)):
         for sg in itertools.product((1, -1), repeat=3):
             Q = VA[:, list(perm)] * np.array(sg)
@@ -91,7 +112,8 @@ def point_tri_dist(P, T, chunk=400):
         a, b, c = A[s:s + chunk], B[s:s + chunk], C[s:s + chunk]
         ab, ac = b - a, c - a
         n = np.cross(ab, ac)
-        nn = np.maximum(np.linalg.norm(n, axis=1), 1e-12)
+        n_len = np.linalg.norm(n, axis=1)
+        nn = np.maximum(n_len, 1e-12)
         nu = n / nn[:, None]
         w = P[:, None, :] - a[None, :, :]
         h = np.einsum("pij,ij->pi", w, nu)
@@ -105,7 +127,9 @@ def point_tri_dist(P, T, chunk=400):
         den = np.maximum(d00 * d11 - d01 * d01, 1e-20)
         u = (d11 * d20 - d01 * d21) / den
         v = (d00 * d21 - d01 * d20) / den
-        inside = (u >= 0) & (v >= 0) & (u + v <= 1)
+        # (a zero-area triangle has no plane: its "inside" took every point
+        # at distance 0 - only its sides count)
+        inside = (u >= 0) & (v >= 0) & (u + v <= 1) & (n_len > 1e-12 * np.maximum(d00, d11))[None, :]
         d = np.where(inside, np.abs(h), np.inf)
         # outside the triangle: distance to the three sides
         for p0, p1 in ((a, b), (b, c), (c, a)):

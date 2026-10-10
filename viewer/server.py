@@ -643,13 +643,27 @@ def run_window(url):
     from webview.menu import Menu, MenuAction, MenuSeparator
 
     api = NativeApi()
-    # 85% of the screen (in its own scaled pixels), never past it
+    # The window as the user laid it out: 2547 x 1495 at (6, 15), in the
+    # display's own pixels (2560 x 1600 at 175%). pywebview takes logical
+    # pixels and multiplies them by the scale, so they go in divided by it
+    # (+0.5: its int() must land on the very pixel).
+    W_PX, H_PX, X_PX, Y_PX = 2547, 1495, 6, 15
     w, h, x, y = 1480, 920, None, None
     try:
-        sc = webview.screens[0]
-        w, h = min(w, int(sc.width * 0.85)), min(h, int(sc.height * 0.85))
-        # centred, a bit above the middle (the taskbar takes the bottom)
-        x, y = sc.x + (sc.width - w) // 2, sc.y + max(0, (sc.height - h) // 2 - 24)
+        sc = webview.screens[0]  # logical pixels
+        try:
+            import ctypes
+
+            k = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100.0
+        except Exception:
+            k = 1.0
+        if X_PX + W_PX <= (sc.x + sc.width) * k + 1 and Y_PX + H_PX <= (sc.y + sc.height) * k + 1:
+            w, h, x, y = ((v + 0.5) / k for v in (W_PX, H_PX, X_PX, Y_PX))
+        else:
+            # a smaller display: 85% of it, never past it, centred a bit
+            # above the middle (the taskbar takes the bottom)
+            w, h = min(w, int(sc.width * 0.85)), min(h, int(sc.height * 0.85))
+            x, y = sc.x + (sc.width - w) // 2, sc.y + max(0, (sc.height - h) // 2 - 24)
     except Exception:
         pass
     win = webview.create_window(

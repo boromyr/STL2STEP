@@ -36,7 +36,14 @@ PHASE C (-c) : fillets, chamfers, countersinks, counterbores, corner spheres,
                the walls of an extruded outline - a spline sketch, embossed
                text - become one surface swept along the extrusion
                direction: a cylinder on a circular profile, otherwise a
-               B-spline profile (Segmenter._extrusion_bands).
+               B-spline profile (Segmenter._extrusion_bands), cut where the
+               outline's curvature jumps and taking back the cylinders the
+               seeds had found on it.
+               Every facet must be a chord of its surface: a region whose
+               facets sag below it further than the mesh's own chords do
+               (MESH_SAG, measured on the regions that fit exactly) has the
+               wrong surface and is rejected, or only the facets that
+               aren't chords of it are left out.
                A constant-radius fillet between two curved walls - a hole
                meeting another hole, a round meeting a bore - is neither a
                torus nor a cylinder: its width changes all along. It's
@@ -1273,6 +1280,9 @@ def ensure_solid(shape):
 # Mesh pre-check / repair settings (set by main from the command line).
 MESH_REPAIR = True  # repair the defects that would break the conversion
 MESH_CLOSE_HOLES = 10  # close holes up to this many boundary edges (0 = none)
+# The input mesh's chord sag, measured on its exact regions by the first
+# curved phase (_measure_mesh_sag); None until then, or with too few of them.
+MESH_SAG: Optional[float] = None
 
 
 def _tri_arrays(tri):
@@ -1355,6 +1365,81 @@ def _flip_needles(P, T):
     return np.array(T, dtype=np.int64).reshape(-1, 3), flipped
 
 
+def _open_edges(T) -> int:
+    """Directed edges with no opposite twin: a crack or a hole's rim."""
+    E = np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    k = E[:, 0] * (int(T.max()) + 1) + E[:, 1]
+    r = E[:, 1] * (int(T.max()) + 1) + E[:, 0]
+    return int((~np.isin(k, r)).sum())
+
+
+def _zip_needles(P, T):
+    """
+    Zero-area triangles the flip couldn't take away, removed, and the crack
+    they leave zipped shut. Returns (triangles, how many were removed).
+
+    ⚠️ A STRIP OF NEEDLES DEFEATS THE FLIP: test14 (Fusion's exporter) has
+    zero-width slivers tessellated as fans of flat triangles all on one
+    line; flipping a needle against a needle gives two needles (478 flipped,
+    376 left - and each one MakeShapeOnMesh drops became a crack: 441 free
+    edges where the mesh has 54). The strip is a line, both its sides are
+    polylines along it with different vertices. Removed, every open edge
+    with a vertex of the other side strictly inside it gets its triangle
+    split there (a fan from the opposite corner, orientation kept), until
+    the two sides run through the same vertices and pair up. No vertex
+    moves; kept only if no edge is left more open than before.
+    """
+    bad = _needles(P, T)
+    if not len(bad):
+        return T, 0
+    from scipy.spatial import cKDTree
+
+    keep = np.ones(len(T), bool)
+    keep[bad] = False
+    TT = T[keep].tolist()
+    for _ in range(50):
+        have = set()
+        for a, b, c in TT:
+            have.update(((a, b), (b, c), (c, a)))
+        be = [(a, b) for a, b in have if (b, a) not in have]
+        if not be:
+            break
+        bv = np.array(sorted({v for e in be for v in e}))
+        tree = cKDTree(P[bv])
+        split = {}
+        for a, b in be:
+            A, B = P[a], P[b]
+            L = float(np.linalg.norm(B - A))
+            ins = []
+            for j in tree.query_ball_point(0.5 * (A + B), 0.5 * L + 1e-12):
+                v = int(bv[j])
+                if v in (a, b):
+                    continue
+                w = P[v] - A
+                s = float(np.dot(w, B - A)) / (L * L)
+                if 1e-9 < s < 1.0 - 1e-9 and float(np.linalg.norm(w - s * (B - A))) <= 1e-9 * L:
+                    ins.append((s, v))
+            if ins:
+                split[(a, b)] = [v for _, v in sorted(ins)]
+        if not split:
+            break
+        new = []
+        for t in TT:
+            a, b, c = t
+            for x, y, z in ((a, b, c), (b, c, a), (c, a, b)):
+                if (x, y) in split:
+                    ch = [x] + split[(x, y)] + [y]
+                    new.extend([p, q, z] for p, q in zip(ch[:-1], ch[1:]))
+                    break
+            else:
+                new.append(t)
+        TT = new
+    T2 = np.array(TT, dtype=np.int64).reshape(-1, 3)
+    if len(_needles(P, T2)) or _open_edges(T2) > _open_edges(T):
+        return T, 0
+    return T2, len(bad)
+
+
 def mesh_census(P, T) -> Dict[str, object]:
     """
     The mesh's health from the arrays alone (numpy + scipy, no other
@@ -1429,6 +1514,7 @@ def mesh_precheck(P, T, name: str = "mesh"):
     for THAT defect (MeshLab, through pymeshlab if installed), never by a
     global remesh: the vertices of a CAD export are exact and must stay so.
       - zero-area triangles with a vertex on their side: flipped (ours);
+        strips of them removed and the crack zipped (ours);
       - duplicate triangles: removed;
       - non-manifold edges and vertices: vertices SPLIT, nothing moves
         (touching bodies come apart instead of losing faces);
@@ -1439,6 +1525,7 @@ def mesh_precheck(P, T, name: str = "mesh"):
     Returns (P, T, report dict).
     """
     T, nflip = _flip_needles(P, T)
+    T, nzip = _zip_needles(P, T)
     c0 = mesh_census(P, T)
     ms = None
     try:
@@ -1457,6 +1544,8 @@ def mesh_precheck(P, T, name: str = "mesh"):
     issues = []
     if nflip:
         issues.append(f"{nflip} zero-area triangle(s) flipped with their neighbor")
+    if nzip:
+        issues.append(f"{nzip} zero-area triangle(s) in strips removed and the crack zipped")
     labels = (
         ("repeated_vertex", "triangles with a repeated vertex"),
         ("zero_area", "zero-area triangles left"),
@@ -1713,18 +1802,24 @@ def _strip_pcurves(shape, keep: Set[int]):
     return cp
 
 
-def _read_back_check(shape, ri, base_bad: Set[int], defl: float):
+def _read_back_check(shape, ri, base_bad: Set[int], defl: float, mended: bool = False):
     """
     (score, what's wrong, faces to blame) of a written file read back as ri,
-    against the part in memory. score = (invalid, extra free edges, faces
-    that triangulate worse than in memory): (0, 0, 0) is a faithful file,
-    and lower is better.
+    against the part in memory. score = (invalid, extra free edges or
+    invalid faces, faces that triangulate worse than in memory): (0, 0, 0)
+    is a faithful file, and lower is better. mended: shape is a read-back
+    part already mended (_mend_for_step), maybe still invalid - ri is
+    judged on its own validity, and the reader may have cut one of its
+    faces in two (more faces, none lost).
     """
-    if ri is None or count_sub(ri, TopAbs_FACE) != count_sub(shape, TopAbs_FACE):
+    n_ri = count_sub(ri, TopAbs_FACE) if ri is not None else -1
+    n_sh = count_sub(shape, TopAbs_FACE)
+    if n_ri != n_sh and not (mended and n_ri > n_sh):
         return (1, 1 << 20, 1 << 20), "a different face count", set()
     faces = explore(ri, TopAbs_FACE)
-    if is_valid(shape) and not is_valid(ri):
-        return (1, 0, 0), "an invalid part", {i for i, f in enumerate(faces) if not is_valid(f)}
+    if not is_valid(ri) and (mended or is_valid(shape)):
+        bad = {i for i, f in enumerate(faces) if not is_valid(f)}
+        return (1, len(bad), 0), f"an invalid part ({len(bad)} face{'s' if len(bad) != 1 else ''})", bad
     nfree0, nfree = count_free_edges(shape), count_free_edges(ri)
     if nfree > nfree0:
         # the faces along the free edges (test10: a seam read back as two)
@@ -1853,7 +1948,7 @@ def fix_crossing_vertices(shape, faces, reach: float = 5e-3) -> int:
     return moved
 
 
-def remove_lens_holes(shape, faces, max_dev: float):
+def remove_lens_holes(shape, faces, max_dev: float, max_edges: Optional[int] = None):
     """
     ⚠️ A LENS-SHAPED HOLE TOUCHING THE FACE'S RIM. A facet cut by an exact
     curve can end up as a planar sliver bounded by two edges only - the
@@ -1864,6 +1959,13 @@ def remove_lens_holes(shape, faces, max_dev: float):
     IntersectingWires. The sliver goes, and the face covers it with its
     own surface: the ring's edges must lie within max_dev of it (the lens
     is that thin), so nothing moves further than that.
+    ⚠️ AND A LONE FACET. The same with one triangle of the mesh left inside
+    a curved face, its corner on the face's rim (test14: ten faces, islands
+    of 0.003-0.3 mm2 within 1e-3..3e-2 of the surface around them): any
+    inner ring whose other side is a face bounded by that ring alone - and
+    its inside within max_dev of the surface too, not only its rim (test12
+    has a facet so: covered, the part lost 2 mm3). max_edges: rings of at
+    most that many edges.
     Only `faces` (those that read back broken). Returns (shape, removed).
     """
     GeomAPI_ProjectPointOnSurf = _m("GeomAPI").GeomAPI_ProjectPointOnSurf
@@ -1875,27 +1977,37 @@ def remove_lens_holes(shape, faces, max_dev: float):
     bb = BRep_Builder()
     for F in faces:
         F = td_Face(F)
-        ws = [td_Wire(w) for w in explore(F, TopAbs_WIRE)]
+        # (the wires as stored, from the face taken FORWARD: explored from a
+        # reversed face they come out reversed, and the new face, reversed
+        # in turn, had them both ways - BadOrientationOfSubshape)
+        Ff = td_Face(F.Oriented(TopAbs_FORWARD))
+        ws = [td_Wire(w) for w in explore(Ff, TopAbs_WIRE)]
         if len(ws) < 2:
             continue
-        outer = _BRepTools.BRepTools.OuterWire_s(F)
+        outer = _BRepTools.BRepTools.OuterWire_s(Ff)
         keep, drop = [], []
         for w in ws:
             es = [td_Edge(e) for e in explore(w, TopAbs_EDGE)]
             lens = None
-            if not w.IsSame(outer) and len(es) == 2:
+            if not w.IsSame(outer) and 2 <= len(es) <= (max_edges or len(es)):
                 nb = [[g for g in _iter_list(ef.FindFromKey(e)) if not g.IsSame(F)] for e in es]
-                if all(len(x) == 1 for x in nb) and nb[0][0].IsSame(nb[1][0]):
+                if all(len(x) == 1 for x in nb) and all(x[0].IsSame(nb[0][0]) for x in nb):
                     L = td_Face(nb[0][0])
-                    if count_sub(L, TopAbs_EDGE) == 2 and not any(L.IsSame(g) for g in gone):
+                    if count_sub(L, TopAbs_EDGE) == len(es) and count_sub(L, TopAbs_WIRE) == 1 and not any(L.IsSame(g) for g in gone):
                         srf = BRep_Tool.Surface_s(F)
                         dev = 0.0
+                        Q = []
                         for e in es:
                             c, c0, c1 = edge_curve(e)
-                            for u in np.linspace(c0, c1, 9):
-                                q = c.Value(float(u))
-                                pr = GeomAPI_ProjectPointOnSurf(q, srf)
-                                dev = max(dev, pr.LowerDistance() if pr.NbPoints() else math.inf)
+                            Q.extend(c.Value(float(u)) for u in np.linspace(c0, c1, 9))
+                        if len(es) > 2:
+                            # (a facet's inside: towards its centre from every corner)
+                            V = face_vertices(L)
+                            m = V.mean(axis=0)
+                            Q.extend(gp_Pnt(*map(float, m + t * (p - m))) for p in V for t in (0.0, 0.5))
+                        for q in Q:
+                            pr = GeomAPI_ProjectPointOnSurf(q, srf)
+                            dev = max(dev, pr.LowerDistance() if pr.NbPoints() else math.inf)
                         if dev <= max_dev:
                             lens = L
             if lens is None:
@@ -1904,8 +2016,14 @@ def remove_lens_holes(shape, faces, max_dev: float):
                 drop.append(lens)
         if not drop:
             continue
+        # (the raw surface and its location: Surface_s(F) alone is the surface
+        # already moved, and moved again by the location it came out at the
+        # wrong place, with no pcurve of its edges on it - test14 reads back
+        # with located faces, test12 didn't)
+        loc = TopLoc_Location()
+        srf0 = BRep_Tool.Surface_s(F, loc)
         F2 = TopoDS_Face()
-        bb.MakeFace(F2, BRep_Tool.Surface_s(F), F.Location(), float(bt_Tolerance(F)))
+        bb.MakeFace(F2, srf0, loc, float(bt_Tolerance(F)))
         for w in keep:
             bb.Add(F2, w)
         F2.Orientation(F.Orientation())
@@ -1935,18 +2053,31 @@ def _mend_for_step(ri, bad, max_dev: float, v_ref: float):
         nbad = lambda sh: sum(1 for f in explore(sh, TopAbs_FACE) if check_detail(td_Face(f)))
         b0, f0 = nbad(ri), count_free_edges(ri)
         n = fix_crossing_vertices(ri, sel)
-        cp, nl = remove_lens_holes(ri, [f for f in sel if check_detail(f)], max_dev)
-        if not (n or nl):
-            return None
-        b1, f1 = nbad(cp), count_free_edges(cp)
-        # (the volume of a part with an invalid face is no measure: test12
-        # with one left read 44091 for 44160 - checked once all are valid)
-        v1 = shape_volume(cp) if b1 == 0 else v_ref
-        if b1 >= b0 or f1 > f0 or abs(v1 - v_ref) > max(1e-6 * abs(v_ref), 1e-3):
-            Log.debug(f"STEP mending refused: invalid faces {b0} -> {b1}, free edges {f0} -> {f1}, volume {v_ref:.4f} -> {v1:.4f}")
-            return None
-        Log.debug(f"STEP mending: {n} vertices moved to their edges' crossing, {nl} lens slivers removed, invalid faces {b0} -> {b1}")
-        return cp
+        # the most mending first, then less: lone facets and lenses, lenses
+        # only, the vertices alone (each one checked on its own - one island
+        # too many mustn't throw away the vertices that were right)
+        tried, cands = set(), []
+        for me in (None, 2):
+            cp, nl = remove_lens_holes(ri, [f for f in sel if check_detail(f)], max_dev, me)
+            if nl and nl not in tried:
+                tried.add(nl)
+                cands.append((cp, nl))
+        if n:
+            cands.append((ri, 0))
+        for cp, nl in cands:
+            b1, f1 = nbad(cp), count_free_edges(cp)
+            # (the volume of a part with an invalid face is no measure: test12
+            # with one left read 44091 for 44160 - checked once all are valid;
+            # and the file itself reads back 1-2 mm3 off the part in memory,
+            # 5e-5 - a face turned inside out costs 70 on test12, 1000 on
+            # test14)
+            v1 = shape_volume(cp) if b1 == 0 else v_ref
+            if b1 >= b0 or f1 > f0 or abs(v1 - v_ref) > max(1e-4 * abs(v_ref), 1e-3):
+                Log.debug(f"STEP mending refused: invalid faces {b0} -> {b1}, free edges {f0} -> {f1}, volume {v_ref:.4f} -> {v1:.4f}")
+                continue
+            Log.debug(f"STEP mending: {n} vertices moved to their edges' crossing, {nl} lens slivers and lone facets removed, invalid faces {b0} -> {b1}")
+            return cp
+        return None
     except Exception as ex:
         Log.debug(f"STEP mending failed: {type(ex).__name__}: {ex}")
         return None
@@ -1979,6 +2110,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     sc, why, bad = _read_back_check(shape, ri, base_bad, defl)
     if sc == (0, 0, 0):
         return ri
+    mended = False
     # ⚠️ AN INVALID FILE FROM A VALID PART: faces that only their vertices'
     # tolerances kept valid, and STEP doesn't carry tolerances - pcurves or
     # not (see fix_crossing_vertices, remove_lens_holes). Mended on a copy,
@@ -1990,10 +2122,13 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
             write_step(fixed, path, src=src, pcurves=False)
             ri_f, _ = read_step(path)
             base_f = set(unmeshable_faces(copy_shape(fixed), defl))
-            sc_f, why_f, bad_f = _read_back_check(fixed, ri_f, base_f, defl)
+            # (the mended part may still hold a face the reader cuts in two:
+            # test14's eight that the reader joins at a vertex)
+            sc_f, why_f, bad_f = _read_back_check(fixed, ri_f, base_f, defl, mended=True)
             if sc_f < sc:
                 Log.info(f"the file read back with {why}: vertices and slivers mended, now " + (why_f or "faithful"))
                 shape, ri, sc, why, bad, base_bad = fixed, ri_f, sc_f, why_f, bad_f, base_f
+                mended = True
                 if sc == (0, 0, 0):
                     return ri
             else:
@@ -2021,7 +2156,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
                     if not lost or lost <= keep:
                         break
                     keep = keep | lost
-                sc1, _, _ = _read_back_check(shape, ri1, base_bad, defl)
+                sc1, _, _ = _read_back_check(shape, ri1, base_bad, defl, mended)
                 if sc1 == (0, 0, 0):
                     Log.info(f"the file without pcurves read back with {why}: written again with pcurves on {len(keep)} faces only")
                     return ri1
@@ -2032,7 +2167,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
                 break
     write_step(shape, path, src=src, pcurves=True)
     ri2, _ = read_step(path)
-    sc2, why2, _ = _read_back_check(shape, ri2, base_bad, defl)
+    sc2, why2, _ = _read_back_check(shape, ri2, base_bad, defl, mended)
     tried.append((sc2, 2, "pcurves everywhere", None))
     best = min(tried, key=lambda t: (t[0], t[1]))
     if best[1] == 2:
@@ -5954,6 +6089,9 @@ class Region:
     coverage: float = 0.0  # fraction of the full angle covered
     status: str = ""  # conversion outcome
     note: str = ""
+    # what it replaced, converted instead if it's rejected (_extrusion_bands)
+    fallback: List["Region"] = field(default_factory=list)
+    left_out: str = ""  # facets the engine left tessellated, and why
 
     def label(self) -> str:
         p = self.prim
@@ -8191,6 +8329,23 @@ class Segmenter:
             if any(regions[q].rms <= 0.05 * self.tol_fit and tot[q] >= 8 and sum(topo.areas[i] for i in regions[q].faces) > 0.25 * a_sec for q in dentro):
                 Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)} left alone: a strong region owns it")
                 continue
+            # ⚠️ ...AND SO DOES A PLANE. A flat side of test14 (two coplanar CAD
+            # faces, 486 mm2) shared its section with the fragments of the
+            # fillets along it, and the patch over all of them came out a
+            # B-spline flat to 6e-3 - where the CAD has a plane. Facets
+            # coplanar with one of the section's largest (vertices within the
+            # tolerance of its plane) covering a quarter of it are that plane.
+            cos1 = math.cos(math.radians(1.0))
+            owned = False
+            for i0 in sorted(m, key=lambda i: -topo.areas[i])[:5]:
+                n_pl, c_pl = topo.norms[i0], topo.cents[i0]
+                a_pl = sum(topo.areas[i] for i in m if float(topo.norms[i] @ n_pl) > cos1 and float(np.abs((topo.verts[i] - c_pl) @ n_pl).max()) <= self.tol_fit)
+                if a_pl > 0.25 * a_sec:
+                    owned = True
+                    break
+            if owned:
+                Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)} left alone: a plane owns it")
+                continue
             dentro_f = [q for q, (c0, ok) in enumerate(f_sec) if ok and c0 == c]
             # ⚠️ TWO PIECES ARE ENOUGH. How many quadrics a band breaks into
             # is scheduling noise: on test0's R3 corner the sequential seeds
@@ -9120,14 +9275,37 @@ class Segmenter:
         crease, all the creases parallel to one direction d (within 3
         degrees) and every facet's normal perpendicular to it. Each band
         becomes one free-form face swept along d; a band that doesn't fit
-        is cut at its sharpest crease (a real corner of the outline, e.g.
-        the tip of a letter) and the pieces are tried again.
+        is cut where its curvature jumps (see kink: a real corner of the
+        outline, the tip of a letter, the end of a fillet) and the pieces
+        are tried again.
+
+        ⚠️ THE CYLINDERS ON A SPLINE OUTLINE ARE ITS PIECES, NOT ITS FACES.
+        test14's walls are extruded splines (5,130 of its 8,041 mm2 of
+        B-spline faces are exact extrusions), tessellated in strips a degree
+        or two apart: four strips of a spline whose radius drifts from 20 to
+        24 mm sit on SOME cylinder within the tolerance, so the seeds made a
+        ø45.9 cylinder of seven strips in the middle of a wall, and the loose
+        strips on either side became two more cylinders and a few planes -
+        one CAD face in six pieces. So the band also runs through the
+        cylinders along d that aren't exact (rms above a tenth of the
+        tolerance: test14's sat at a fifth; a real arc of the sketch sits on
+        its cylinder to the mesh's rounding - test4's r1 rounds at 0.05-0.085,
+        and taking them in cost a CAD face). The band is fitted with them
+        and without them, and kept with them only if it ends up in two faces
+        fewer at least; each swept piece carries the regions it replaced,
+        converted instead if the engine rejects it.
         """
         if self.only_cyl:
             return regions
         topo = self.topo
         claimed = {i for R in regions for i in R.faces}
-        cand = [i for i in range(topo.nF) if i not in claimed and topo.planar[i] and len(topo.verts[i]) >= 3]
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        soft = {
+            k
+            for k, R in enumerate(regions)
+            if R.prim.kind == AXIAL and abs(R.prim.slope) < 1e-3 and getattr(R.prim, "ball", None) is None and R.rms > 0.1 * self.tol_fit
+        }
+        cand = [i for i in range(topo.nF) if (i not in claimed or owner[i] in soft) and topo.planar[i] and len(topo.verts[i]) >= 3]
         cset = set(cand)
         c_lo, c_hi = math.cos(math.radians(30.0)), math.cos(math.radians(0.3))
         cos3, sin3 = math.cos(math.radians(3.0)), math.sin(math.radians(3.0))
@@ -9147,33 +9325,33 @@ class Segmenter:
         for (i, j), (dd, _) in crease.items():
             nb[i].append((j, dd))
             nb[j].append((i, dd))
-        done = set()
-        bands = []
-        for (i, j), (d0, _) in sorted(crease.items(), key=lambda kv: -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]])):
-            if i in done or j in done:
-                continue
-            g = {i, j}
-            st = [i, j]
-            while st:
-                a = st.pop()
-                for b, dd in nb[a]:
-                    if b in g or b in done:
-                        continue
-                    if abs(float(dd @ d0)) >= cos3 and abs(float(topo.norms[b] @ d0)) <= sin3:
-                        g.add(b)
-                        st.append(b)
-            if len(g) >= 3:
-                done |= g
-                bands.append((g, d0))
+        def grow_bands(allowed):
+            done = set()
+            bands_ = []
+            for (i, j), (d0, _) in sorted(crease.items(), key=lambda kv: -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]])):
+                if i in done or j in done or i not in allowed or j not in allowed:
+                    continue
+                g = {i, j}
+                st = [i, j]
+                while st:
+                    a = st.pop()
+                    for b, dd in nb[a]:
+                        if b in g or b in done or b not in allowed:
+                            continue
+                        if abs(float(dd @ d0)) >= cos3 and abs(float(topo.norms[b] @ d0)) <= sin3:
+                            g.add(b)
+                            st.append(b)
+                if len(g) >= 3:
+                    done |= g
+                    bands_.append((g, d0))
+            return bands_
 
         out = []
 
         def links(g):
             return [(k, v[1]) for k, v in crease.items() if k[0] in g and k[1] in g]
 
-        def fit_band(g, d0, cut, depth):
-            if len(g) < 3:
-                return
+        def fit_once(g, d0, cut):
             fs = sorted(g)
             # the extrusion direction: the band's creases averaged (sign-aligned)
             ds = [crease[k][0] * (1.0 if float(crease[k][0] @ d0) >= 0 else -1.0) for k, _ in links(g) if k not in cut]
@@ -9202,6 +9380,60 @@ class Segmenter:
             # doesn't say where the wall is: it stays as it was.
             ceiling = max(20.0 * self.tol_fit, 2e-4 * self.diag)
             pr = fit_extrusion(P, Nrep, d, self.tol_fit, check=sag_points(topo, fs), check_tol=min(2.0 * sag + 2.0 * self.tol_fit, ceiling), max_radius=self.max_radius, spline=self.allow_free)
+            return pr, fs, P, d, sag, width
+
+        def kink(fs, live, d, width):
+            """
+            ⚠️ CUT WHERE THE CURVATURE JUMPS, NOT AT THE SHARPEST CREASE. On
+            an outline whose radius drifts from 20 to 24 mm the strips meet at
+            1-5 degrees, the widest strips at the widest angles: cutting at
+            the sharpest crease split test14's wall in the middle of a smooth
+            stretch, again and again, into six pieces - while what kept the
+            band from fitting was a 2 mm fillet at one end (curving the other
+            way) and a reversed 1.4-degree crease (two CAD faces meeting at a
+            corner of 4 degrees) where the turns run +2.3, +2.4. Along the
+            strips' chain each crease's signed curvature (turn over the mean
+            width of its two strips) is compared with its neighbours'; the
+            crease that departs most is cut. None if the band isn't a chain.
+            """
+            sfs = set(fs)
+            adj_ = defaultdict(list)
+            for (a_, b_), th in live:
+                if a_ in sfs and b_ in sfs:
+                    adj_[a_].append(b_)
+                    adj_[b_].append(a_)
+            if not adj_ or any(len(v) > 2 for v in adj_.values()):
+                return None
+            ends = [i for i, v in adj_.items() if len(v) == 1]
+            if len(ends) != 2:
+                return None
+            chain = [ends[0]]
+            while len(chain) < len(adj_):
+                nx = [j for j in adj_[chain[-1]] if j not in chain[-2:-1]]
+                if not nx or nx[0] in chain:
+                    return None
+                chain.append(nx[0])
+            if len(chain) < 3:
+                return None
+            k_ = []
+            for a_, b_ in zip(chain[:-1], chain[1:]):
+                na, nb_ = topo.norms[a_], topo.norms[b_]
+                th = math.acos(max(-1.0, min(1.0, float(na @ nb_))))
+                sg = 1.0 if float(np.cross(na, nb_) @ d) >= 0.0 else -1.0
+                k_.append(sg * th / max(0.5 * (width[a_] + width[b_]), 1e-9))
+            best, kb = -1.0, None
+            for m in range(len(k_)):
+                nbk = [k_[j] for j in (m - 1, m + 1) if 0 <= j < len(k_)]
+                dev = abs(k_[m] - sum(nbk) / len(nbk))
+                if dev > best:
+                    a_, b_ = chain[m], chain[m + 1]
+                    best, kb = dev, (min(a_, b_), max(a_, b_))
+            return kb
+
+        def fit_band(g, d0, cut, depth, out):
+            if len(g) < 3:
+                return
+            pr, fs, P, d, sag, width = fit_once(g, d0, cut)
             if pr is not None:
                 if Log.level <= 10:
                     chk = sag_points(topo, fs)
@@ -9228,7 +9460,9 @@ class Segmenter:
                 g = set(g) - {i_w}
                 live = [(k, th) for k, th in live if i_w not in k]
             else:
-                k_max = max(live, key=lambda t: t[1])[0]
+                k_max = kink(fs, live, d, width)
+                if k_max is None:
+                    k_max = max(live, key=lambda t: t[1])[0]
                 cut2 = cut | {k_max}
             # connected pieces over the creases left
             par = {i: i for i in g}
@@ -9246,14 +9480,64 @@ class Segmenter:
             for i in g:
                 comps[find(i)].add(i)
             for c in comps.values():
-                fit_band(c, d, cut2, depth + 1)
+                fit_band(c, d, cut2, depth + 1, out)
 
-        for g, d0 in bands:
-            fit_band(g, d0, frozenset(), 0)
+        # the loose strips, as they always were
+        loose = {i for i in cand if i not in owner}
+        for g, d0 in grow_bands(loose):
+            fit_band(g, d0, frozenset(), 0, out)
+        # then the bands through the cylinders: kept only where they end up
+        # in two faces fewer at least than the cylinders plus what the loose
+        # strips gave (one less isn't worth a swept face in place of a
+        # cylinder - test6, 3 -> 2, and 0.0104 off the mesh where the
+        # cylinder was 0.008); never touching a piece that runs outside them
+        dissolved = set()
+        fallback = {}
+        for g, d0 in (grow_bands(cset) if soft else []):
+            sk = {owner[i] for i in g if i in owner}
+            if not sk or sk & dissolved:
+                continue
+            old = [(p_, f_) for p_, f_ in out if g.intersection(f_)]
+            if any(not g.issuperset(f_) for _, f_ in old):
+                continue
+            new = []
+            fit_band(g, d0, frozenset(), 0, new)
+            cov_new = {i for _, fs in new for i in fs}
+            cov_old = {i for _, fs in old for i in fs}
+            rest = [k for k in sk if any(i not in cov_new for i in regions[k].faces)]
+            n_new = len(new) + sum(1 for i in g if i not in owner and i not in cov_new) + len(rest)
+            n_old = len(old) + sum(1 for i in g if i not in owner and i not in cov_old) + len(sk)
+            if not new or n_new > n_old - 2:
+                continue
+            Log.debug(f"  extruded band through {len(sk)} cylinders at {np.round(np.mean([topo.cents[i] for i in g], axis=0), 2)}: {n_old} faces -> {n_new}")
+            # each piece keeps what it replaces: the engine may still reject
+            # a swept face (test4: a 32x4 spline whose rims stay 3e-2 off
+            # it), and the cylinders must not be lost
+            for pr_, fs_ in new:
+                sf = set(fs_)
+                fallback[tuple(fs_)] = [regions[k] for k in sk if sf.intersection(regions[k].faces)] + [describe_region(p_, topo, f_) for p_, f_ in old if sf.intersection(f_)]
+            out = [(p_, f_) for p_, f_ in out if not g.intersection(f_)] + new
+            dissolved |= sk
         if not out:
             return regions
+        if dissolved:
+            taken = {i for _, fs in out for i in fs}
+            kept = []
+            for k, R in enumerate(regions):
+                if k in dissolved:
+                    rest = [i for i in R.faces if i not in taken]
+                    if len(rest) >= self.min_faces:
+                        kept.append(describe_region(R.prim, topo, rest))
+                    continue
+                kept.append(R)
+            regions = kept
         Log.debug(f"Extruded bands: {len(out)} swept faces ({sum(1 for p, _ in out if p.kind == AXIAL)} cylinders) in place of {sum(len(f) for _, f in out)} planar strips")
-        return regions + [describe_region(p, topo, fs) for p, fs in out]
+        made = []
+        for p, fs in out:
+            R = describe_region(p, topo, fs)
+            R.fallback = fallback.get(tuple(fs), [])
+            made.append(R)
+        return regions + made
 
     def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
         """
@@ -10412,6 +10696,8 @@ class Engine:
         self.vol0 = shape_volume(shape)
         self.n_ok = 0
         self.n_fail = 0
+        self.sag_cap: Optional[float] = None  # the mesh's chords sag no more (run_phase)
+        self.min_faces_hint = 4  # the segmentation's min_faces (run_phase)
         self.log: List[str] = []
 
     # --- analytic primitives of the neighbors ---------------------------------
@@ -10610,6 +10896,26 @@ class Engine:
             return False, f"exception {type(ex).__name__}"
 
     def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
+        cap = self.sag_cap
+        if cap is not None and R.sag > cap:
+            # the facets that aren't chords stay tessellated, if the surface
+            # holds the others within the tolerance: the boss's own r2 torus,
+            # found once the sphere is gone, only had the flat top in it (its
+            # rim on the torus' crest) and sits on the rest to 6e-4; the r21
+            # sphere misses the fillet's first row by 1.3e-2, it's the
+            # surface that's wrong
+            ix = [self.topo.face_index(f) for f in R.fobjs]
+            good = [j for j, i in enumerate(ix) if i >= 0 and region_sag(R.prim, self.topo, [i]) <= cap]
+            dev = float(np.abs(R.prim.dist(np.vstack([self.topo.verts[ix[j]] for j in good]))).max()) if good else math.inf
+            if len(good) < max(3, self.min_faces_hint) or dev > self.tol_fit:
+                self.n_fail += 1
+                R.status = f"rejected: the facets sag {R.sag:.1e} below it, the mesh's chords at most {cap:.1e}"
+                Log.debug(f"  {R.label()} -> {R.status}")
+                return False, R.status[10:]
+            R.left_out = f"{len(ix) - len(good)} facets that aren't chords of it left out"
+            R.faces = [R.faces[j] for j in good]
+            R.fobjs = [R.fobjs[j] for j in good]
+            R.sag = region_sag(R.prim, self.topo, [ix[j] for j in good])
         mt0 = max_tolerance(self.shape) if self.verbose else 0.0
         ok, why = self._safe(R, strict_hole)
         if not ok and self.verbose:
@@ -10679,8 +10985,31 @@ class Engine:
         # facets). The facets passing through those vertices are removed,
         # the largest component is kept and it's retried: the bulk of the
         # region converts, the slivers stay tessellated.
+        # ⚠️ ...AND RINGS THAT TOUCH. An island of other facets inside the
+        # region whose rim reaches the region's own at one vertex closes into
+        # two rings sharing that vertex: valid in memory (the vertex's
+        # tolerance), IntersectingWires once written - STEP carries no
+        # tolerance (test14: 13 faces like that, 9 of them invalid in the
+        # file, the whole part with them). Same remedy: the facets at the
+        # shared vertex go.
+        # (a ring meeting the same vertex twice, a figure eight, reads back
+        # fine: test14's two r6 cones do)
+        def rings_touch(loops_):
+            if loops_ is None or len(loops_) < 2:
+                return False
+            pinch_ = self._pinch_vertices(rf)
+            if not pinch_:
+                return False
+            seen_ = defaultdict(set)
+            for n_, L in enumerate(loops_):
+                for ch in L.chains:
+                    for v in ch.verts:
+                        if v in pinch_:
+                            seen_[v].add(n_)
+            return any(len(x) > 1 for x in seen_.values())
+
         for _ in range(3):
-            if loops is not None:
+            if loops is not None and not rings_touch(loops):
                 break
             pinch = self._pinch_vertices(rf)
             if not pinch:
@@ -10698,6 +11027,8 @@ class Engine:
             loops, why = self.region_loops(rf)
         if loops is None:
             return False, why
+        if rings_touch(loops):
+            return False, "the boundary touches itself at a vertex"
         if strict_hole:
             if not (prim.kind == AXIAL and abs(prim.slope) < 1e-12 and R.closed_u and R.concave):
                 return False, "not a through/blind cylindrical hole"
@@ -11108,7 +11439,7 @@ class Engine:
         self.shape = new_shape
         if not (INCREMENTAL_TOPO and self.topo.update(new_shape, gone, born)):
             self.topo = Topo(new_shape, prev=self.topo) if not INCREMENTAL_TOPO else Topo(new_shape)
-        R.note = f"{n_analytic} analytic edges · {n_reused} reused · {n_poly} polygonal"
+        R.note = f"{n_analytic} analytic edges · {n_reused} reused · {n_poly} polygonal" + (f" · {R.left_out}" if R.left_out else "")
         return True, ""
 
     def _seam_path_search(self, targets_a: set, targets_b: set, sp: SurfParam, r_eff: float):
@@ -12749,6 +13080,41 @@ def snap_arcs(shape, tol: float, title: str = "Arcs"):
     return nuovo, fatti
 
 
+def _measure_mesh_sag(regions: List[Region], tol_fit: float) -> Optional[float]:
+    """
+    How far the mesh's facets sag below the surfaces they tessellate: the
+    exporter's chord tolerance, measured where nobody can doubt the surface
+    - regions whose vertices sit on a cylinder, a sphere or a torus to a
+    twentieth of the tolerance, over eight facets or more. (A sag above a
+    tenth of the radius isn't a chord: a 0.36 mm "torus" through ten facets
+    of test14 fits its vertices and sags 0.2 mm, it's the fit that's wrong.)
+    The largest of them, outliers left out: past three times the 90th
+    percentile an exact region has taken in a facet that isn't a chord (one
+    of test14's sagged 0.46 mm where the CAD and the mesh are 0.05 apart at
+    most). test8's legitimate sags run up to four times their 90th
+    percentile: its exact r0.3 torus at 0.045 is left out of the
+    reference (0.029) and still well within the engine's cap, twice that
+    plus twice the tolerance. None with fewer than five.
+    """
+    s = []
+    for R in regions:
+        p = R.prim
+        if p.kind == SPHERE:
+            r = abs(p.r0)
+        elif p.kind == TORUS:
+            r = abs(p.r1)
+        elif p.kind == AXIAL and abs(p.slope) < 1e-3:
+            r = abs(p.r0)
+        else:
+            continue
+        if R.rms <= 0.05 * tol_fit and len(R.faces) >= 8 and R.sag <= 0.1 * r:
+            s.append(float(R.sag))
+    if len(s) < 5:
+        return None
+    p90 = float(np.quantile(s, 0.9))
+    return max(x for x in s if x <= 3.0 * p90)
+
+
 def run_phase(
     shape,
     which: str,
@@ -12810,6 +13176,21 @@ def run_phase(
         return res
 
     eng = Engine(shape, tol_fit, diag, max_edge_tol, allow_polyline=not is_b, verbose=(Log.level <= 10))
+    # ⚠️ A FACET IS A CHORD OF ITS SURFACE, NEVER MORE. A disc planed flat on
+    # top of a test14 boss (r2.5, ringed by a torus fillet) has vertices only
+    # on its rim: a r21 sphere goes through all of them and through the
+    # fillet's first row, and stands 0.13 mm above the flat top in the
+    # middle. The edge ceiling lets it through - it widens with the region's
+    # own sag, for coarse meshes - but no exporter leaves a 0.13 mm chord
+    # where its exact surfaces sag 0.045 at most: those facets aren't chords
+    # of that sphere. Measured once, on the first curved phase's regions.
+    global MESH_SAG
+    if MESH_SAG is None:
+        MESH_SAG = _measure_mesh_sag(regions, tol_fit)
+        if MESH_SAG is not None:
+            Log.info(f"Mesh chord sag (on its exact regions): {MESH_SAG:.1e} mm")
+    eng.sag_cap = None if MESH_SAG is None else 2.0 * MESH_SAG + 2.0 * tol_fit
+    eng.min_faces_hint = min_faces
     # order: large regions first (more analytic boundary for the following ones)
     order = sorted(range(len(regions)), key=lambda k: -sum(topo.areas[i] for i in regions[k].faces))
     pending = list(order)
@@ -12830,6 +13211,19 @@ def run_phase(
             break
         pending = again
         Log.info(f"Second pass on {len(pending)} regions rejected for polygonal boundaries")
+    # a rejected swept face: what it had replaced, as it was
+    backs = []
+    for R in regions:
+        if R.fallback and R.status.startswith("rejected"):
+            for Q in R.fallback:
+                if any(Q is B for B in backs):
+                    continue
+                Q.fobjs = [topo.faces[i] for i in Q.faces]
+                Q.status, Q.note = "", ""
+                eng.convert(Q, strict_hole=is_b)
+                Q.note = (Q.note + " · " if Q.note else "") + "in place of a rejected swept face"
+                backs.append(Q)
+    regions = regions + backs
 
     res.shape = eng.shape
     # ⚠️ EVERY REPLACEMENT IS CHECKED, THE SUM ISN'T ALWAYS. On test12 four
@@ -13195,7 +13589,8 @@ def main(argv=None) -> int:
         pass
     Log.no_color = args.no_color or not sys.stdout.isatty()
     Log.level = 10 if args.verbose else (30 if args.quiet else 20)
-    global MESH_REPAIR, MESH_CLOSE_HOLES
+    global MESH_REPAIR, MESH_CLOSE_HOLES, MESH_SAG
+    MESH_SAG = None
     MESH_REPAIR = not args.no_mesh_repair
     MESH_CLOSE_HOLES = max(0, int(args.close_holes))
 

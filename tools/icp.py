@@ -17,7 +17,8 @@ def closest_on_tris(P, T, chunk=300):
         a, b, c = A[s:s + chunk], B[s:s + chunk], C[s:s + chunk]
         ab, ac = b - a, c - a
         nrm = np.cross(ab, ac)
-        nn = np.maximum(np.linalg.norm(nrm, axis=1), 1e-12)
+        n_len = np.linalg.norm(nrm, axis=1)
+        nn = np.maximum(n_len, 1e-12)
         nu = nrm / nn[:, None]
         w = P[:, None, :] - a[None, :, :]
         h = np.einsum("pij,ij->pi", w, nu)
@@ -31,7 +32,9 @@ def closest_on_tris(P, T, chunk=300):
         den = np.maximum(d00 * d11 - d01 * d01, 1e-20)
         u = (d11 * d20 - d01 * d21) / den
         v = (d00 * d21 - d01 * d20) / den
-        inside = (u >= 0) & (v >= 0) & (u + v <= 1)
+        # (a zero-area triangle has no plane: its "inside" put every point
+        # at distance 0 and the ICP "converged" on test14 0.5 mm off)
+        inside = (u >= 0) & (v >= 0) & (u + v <= 1) & (n_len > 1e-12 * np.maximum(d00, d11))[None, :]
         d = np.where(inside, np.abs(h), np.inf)
         Q = np.where(inside[:, :, None], proj, 0.0)
         for p0, p1 in ((a, b), (b, c), (c, a)):

@@ -82,7 +82,10 @@ the solid, as in the CAD's `BREP_WITH_VOIDS`). The defects that would break the 
 repaired with [MeshLab](https://www.meshlab.net/) through `pymeshlab`, one filter per defect and never
 by remeshing, so the vertices of a CAD export stay exact:
 
-- zero-area triangles with a vertex on their side: flipped with the neighbor (no crack);
+- zero-area triangles with a vertex on their side: flipped with the neighbor (no crack); strips of
+  them (a zero-width sliver the exporter tessellated as a fan of flat triangles, which flipping
+  can't take away) removed and the crack zipped, the triangles on both sides split at each
+  other's vertices (`test14`: 441 free edges → 11);
 - duplicate triangles: removed;
 - non-manifold edges and vertices: vertices split (bodies that touch come apart, nothing moves);
 - inconsistent winding: re-oriented coherently;
@@ -104,8 +107,14 @@ are reported but left in.
   cylinder or a cone) is merged back into one torus when the torus explains the strips better
   than their own cylinders did. The walls of an extruded outline — a sketch with splines, embossed
   or engraved text — become one surface swept along the extrusion direction: a cylinder when the
-  profile is a circular arc, otherwise a B-spline profile. Stretches tessellated so coarsely that
-  the mesh doesn't say where the curve runs stay planar. A constant-radius fillet between two
+  profile is a circular arc, otherwise a B-spline profile. A band that doesn't take one profile is
+  cut where its curvature jumps (the end of a fillet, the corner between two curves), and a spline
+  wall the seeds had already cut into a few osculating cylinders is taken whole again when one
+  profile holds it (`test9` 1,062 → 954 faces, `test8` 479 → 468). Stretches tessellated so
+  coarsely that the mesh doesn't say where the curve runs stay planar. Every facet is a chord of
+  the surface under it: a region whose facets sag below its surface further than the mesh's own
+  chords ever do (measured on the regions that fit exactly) has the wrong surface - a sphere
+  standing over a flat disc - and is rejected, or only the facets that don't belong are left out. A constant-radius fillet between two
   curved walls (a hole meeting another hole, whose width changes all along) is rebuilt from the
   two walls and the ball rolling between them, as one B-spline face whose edges follow the ball's
   contact lines; the straight and circular pieces of the same chain become the exact cylinders and
@@ -171,10 +180,13 @@ same volume (`test12` now reads back valid).
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
     used during development.
-- `test0.stl` … `test13.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10`,
-  `test12` and `test13` come with the CAD file they were exported from (`testN_original.step`): the
-  reference for `tools/cadcmp.py`. `test12` is the hardest one: 1,328 CAD faces (169 free-form), six
-  internal cavities. `test13` has rolling-ball fillets between two crossing holes.
+- `test0.stl` … `test14.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10`,
+  `test12`, `test13` and `test14` come with the CAD file they were exported from
+  (`testN_original.step`): the reference for `tools/cadcmp.py`. `test12` is the hardest one: 1,328
+  CAD faces (169 free-form), six internal cavities. `test13` has rolling-ball fillets between two
+  crossing holes. `test14` is the biggest (189k triangles, 965 CAD faces, most of its 229 B-spline
+  faces extruded spline walls); its `_original.step` is the part alone, a surface model left in the
+  assembly's frame (`cadcmp.py` aligns it).
 
 ## Branches
 
