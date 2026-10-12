@@ -212,7 +212,10 @@ def step_payload(path):
         lo, hi = V.min(0), V.max(0)
         diag = float(np.linalg.norm(hi - lo)) or 1.0
         lin = max(diag * 4e-4, 1e-4)
-        R._BRepMesh.BRepMesh_IncrementalMesh(shape, lin, False, 0.3, True)
+        # angular deflection: what shows when zoomed in is the angle between two
+        # chords, not their sag - at 0.3 rad a fillet's smooth B-spline rim
+        # read as a polyline (test13); 0.1 on faces, 0.05 (~3 deg) on edges
+        R._BRepMesh.BRepMesh_IncrementalMesh(shape, lin, False, 0.1, True)
 
         fmap = R.TopTools_IndexedMapOfShape()
         R.te_MapShapes(shape, R.TopAbs_FACE, fmap)
@@ -275,7 +278,7 @@ def step_payload(path):
                     a, b = c.Value(c.FirstParameter()), c.Value(c.LastParameter())
                     pts = np.array([[a.X(), a.Y(), a.Z()], [b.X(), b.Y(), b.Z()]])
                 else:
-                    d = GCPnts.GCPnts_TangentialDeflection(c, 0.15, lin, 2)
+                    d = GCPnts.GCPnts_TangentialDeflection(c, 0.05, lin, 2)
                     pts = np.array([[q.X(), q.Y(), q.Z()] for q in (d.Value(k) for k in range(1, d.NbPoints() + 1))])
             except Exception:
                 continue
@@ -685,6 +688,7 @@ def run_window(url):
             MenuAction("Top", js("refitUI.view('top')")),
             MenuAction("Front", js("refitUI.view('front')")),
             MenuAction("Right", js("refitUI.view('right')")),
+            MenuAction("Free / Z-up orbit (O)", js("refitUI.orbit()")),
             MenuSeparator(),
             MenuAction("Input (1)", js("refitUI.tab('input')")),
             MenuAction("STEP (2)", js("refitUI.tab('output')")),

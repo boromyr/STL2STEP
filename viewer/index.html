@@ -160,6 +160,8 @@ table.stats tr.gap td { padding-top: 10px; }
       <button data-view="top">Top</button>
       <button data-view="front">Front</button>
       <button data-view="right">Right</button>
+      <span class="sep"></span>
+      <button id="orbitbtn" title="Orbit: Z-up (turntable) or free (O)">Z-up</button>
     </div>
     <div class="seg" id="display">
       <button data-disp="shaded" class="on">Shaded</button>
@@ -247,7 +249,6 @@ table.stats tr.gap td { padding-top: 10px; }
 
 <script type="module">
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
@@ -286,12 +287,164 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f48, 1.25));
 const key = new THREE.DirectionalLight(0xffffff, 1.6);
 key.position.set(0.6, 1.0, 1.4);
 camera.add(key);
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-controls.dampingFactor = 0.15;
-controls.screenSpacePanning = true;
-controls.zoomToCursor = true;
-controls.rotateSpeed = 0.9;
+
+// ---------------------------------------------------------------- camera controls
+// Our own instead of OrbitControls, for three things it can't do:
+//  * Alt pans and Ctrl rotates just by MOVING the mouse while held
+//    (no button needed, handy on a touchpad), and with the left button too.
+//    ⚠️ Any Ctrl, read from the mouse event's own modifier state: a key
+//    remapped to Ctrl (the Copilot key through Windhawk) arrives without the
+//    "right" side, so e.code === "ControlRight" never saw it;
+//  * free orbit (trackball: the part turns any way) or Z-up (turntable);
+//  * zoom toward the point under the cursor with no practical floor: the
+//    near plane follows the distance, so zooming in never clips the part.
+// Left = rotate, middle / right = pan, wheel = zoom.
+class CadControls {
+  constructor(camera, el) {
+    this.camera = camera;
+    this.el = el;
+    this.target = new THREE.Vector3();
+    this.center = new THREE.Vector3();
+    this.radius = 1;
+    this.free = false;
+    this.drag = null;                       // "rotate" | "pan" while a button is down
+    this.keys = { alt: false, ctrl: false };
+    this.last = null;                       // last pointer position
+    this.pickPoint = null;                  // (clientX, clientY) -> Vector3 on the part, or null
+    this._ray = new THREE.Raycaster();
+    el.addEventListener("pointerdown", (e) => this._down(e));
+    el.addEventListener("pointermove", (e) => this._move(e));
+    el.addEventListener("pointerup", (e) => this._up(e));
+    el.addEventListener("pointercancel", (e) => this._up(e));
+    el.addEventListener("pointerleave", () => { if (!this.drag) this.last = null; });
+    el.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });  // no autoscroll
+    el.addEventListener("wheel", (e) => this._wheel(e), { passive: false });
+    el.addEventListener("contextmenu", (e) => e.preventDefault());
+    window.addEventListener("keydown", (e) => this._key(e, true), true);
+    window.addEventListener("keyup", (e) => this._key(e, false), true);
+    window.addEventListener("blur", () => { this.keys.alt = this.keys.ctrl = false; this.drag = null; });
+  }
+  get active() { return !!this.drag || this.keys.alt || this.keys.ctrl; }
+  get minDist() { return this.radius * 1e-6; }
+  get maxDist() { return this.radius * 100; }
+  setBounds(center, radius) { this.center.copy(center); this.radius = radius; }
+
+  _key(e, down) {
+    // ⚠️ preventDefault on Alt: in the desktop window a lone Alt would
+    // otherwise activate the File / View / Help menu bar
+    if (e.key === "Alt") { this.keys.alt = down; e.preventDefault(); }
+    else if (e.key === "Control") this.keys.ctrl = down;
+  }
+  _down(e) {
+    if (e.button === 0) this.drag = e.altKey ? "pan" : "rotate";
+    else if (e.button === 1 || e.button === 2) this.drag = "pan";
+    else return;
+    e.preventDefault();
+    this.el.focus({ preventScroll: true });
+    this.el.setPointerCapture(e.pointerId);
+    this.last = [e.clientX, e.clientY];
+  }
+  _up(e) {
+    if (!this.drag) return;
+    this.drag = null;
+    try { this.el.releasePointerCapture(e.pointerId); } catch {}
+  }
+  _move(e) {
+    // the modifiers as the system has them right now: also fixes a key whose
+    // keyup got lost (released outside the window)
+    this.keys.alt = e.altKey;
+    this.keys.ctrl = e.ctrlKey;
+    const p = [e.clientX, e.clientY], last = this.last;
+    this.last = p;
+    if (!last) return;
+    const dx = p[0] - last[0], dy = p[1] - last[1];
+    if (!dx && !dy) return;
+    const mode = this.drag || (e.altKey ? "pan" : e.ctrlKey ? "rotate" : null);
+    if (mode === "pan") this.pan(dx, dy);
+    else if (mode === "rotate") this.rotate(dx, dy);
+  }
+  _wheel(e) {
+    e.preventDefault();
+    const d = e.deltaY * (e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1);
+    this.zoom(Math.exp(d * 0.0015), e.clientX, e.clientY);
+  }
+
+  rotate(dx, dy) {
+    const cam = this.camera, h = this.el.clientHeight || 1;
+    const a = (2 * Math.PI * dx) / h, b = (2 * Math.PI * dy) / h;   // a full turn per view height
+    const off = cam.position.clone().sub(this.target);
+    if (this.free) {
+      // trackball: around the SCREEN's vertical and horizontal axes
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
+      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
+      const q = new THREE.Quaternion().setFromAxisAngle(up, -a)
+        .multiply(new THREE.Quaternion().setFromAxisAngle(right, -b));
+      off.applyQuaternion(q);
+      cam.up.copy(up.applyQuaternion(q));
+    } else {
+      // turntable around world Z, never past the poles
+      const r = off.length();
+      const theta = Math.atan2(off.y, off.x) - a;
+      const phi = THREE.MathUtils.clamp(Math.acos(THREE.MathUtils.clamp(off.z / r, -1, 1)) - b, 1e-4, Math.PI - 1e-4);
+      off.set(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+    }
+    cam.position.copy(this.target).add(off);
+    this.update();
+  }
+  pan(dx, dy) {
+    const cam = this.camera, h = this.el.clientHeight || 1;
+    const dist = cam.position.distanceTo(this.target);
+    const s = (2 * dist * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2))) / h;   // world units per pixel at the target
+    const v = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion).multiplyScalar(-dx * s)
+      .add(new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion).multiplyScalar(dy * s));
+    cam.position.add(v);
+    this.target.add(v);
+    this.update();
+  }
+  zoom(k, cx, cy) {
+    const cam = this.camera;
+    const dist = cam.position.distanceTo(this.target);
+    k = THREE.MathUtils.clamp(k, this.minDist / dist, this.maxDist / dist);
+    if (Math.abs(k - 1) < 1e-12) return;
+    // toward the point under the cursor: on the part if there's one, else on
+    // the plane through the target facing the camera
+    let p = cx != null && this.pickPoint ? this.pickPoint(cx, cy) : null;
+    if (!p && cx != null) {
+      const r = this.el.getBoundingClientRect();
+      this._ray.setFromCamera(new THREE.Vector2(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1), cam);
+      const n = cam.getWorldDirection(new THREE.Vector3());
+      p = this._ray.ray.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(n, this.target), new THREE.Vector3());
+    }
+    p = p || this.target.clone();
+    cam.position.sub(p).multiplyScalar(k).add(p);
+    this.target.sub(p).multiplyScalar(k).add(p);
+    this.update();
+  }
+  update() {
+    const cam = this.camera;
+    if (!this.free) {
+      // looking straight along Z with Z up is undefined: nudge the camera
+      // toward its current screen-down so the view keeps its orientation
+      const off = cam.position.clone().sub(this.target), r = off.length();
+      if (r > 0 && Math.abs(off.z) / r > 0.999999) {
+        const down = cam.up.clone().setZ(0);
+        if (down.lengthSq() < 1e-12) down.set(0, 1, 0);
+        cam.position.addScaledVector(down.normalize(), -r * 1e-4);
+      }
+      cam.up.set(0, 0, 1);
+    }
+    cam.lookAt(this.target);
+    if (this.free) {
+      // keep up orthogonal to the view (rounding drifts it over many turns)
+      cam.up.copy(new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion));
+    }
+    const dist = cam.position.distanceTo(this.target);
+    cam.near = Math.max(dist * 0.005, 1e-9);
+    cam.far = cam.position.distanceTo(this.center) + this.radius * 3;
+    cam.updateProjectionMatrix();
+  }
+}
+const controls = new CadControls(camera, canvas);
 
 const S = {
   files: [], input: null, paths: { input: null, output: null, cad: null },
@@ -486,12 +639,10 @@ function fit(m, view) {
   else { dir = camera.position.clone().sub(controls.target).normalize(); up = camera.up.clone(); }
   const dist = r / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.05;
   camera.up.copy(up);
+  controls.setBounds(c, r);
   controls.target.copy(c);
   camera.position.copy(c).addScaledVector(dir, dist);
-  camera.near = dist / 200; camera.far = dist * 50;
-  camera.updateProjectionMatrix();
   controls.update();
-  if (view === "top") camera.up.set(0, 0, 1);   // keep orbiting around Z afterwards
 }
 
 // ---------------------------------------------------------------- hover
@@ -526,7 +677,8 @@ function faceDesc(f) {
   return out.join(" · ");
 }
 function hoverTick() {
-  if (!lastMove || S.dragging) return;
+  if (!lastMove) return;
+  if (controls.active) { lastMove = null; $("#tip").style.display = "none"; return; }
   const e = lastMove; lastMove = null;
   const hit = pick(e);
   const tip = $("#tip");
@@ -546,8 +698,7 @@ function hoverTick() {
   tip.style.left = Math.min(x, r.width - tip.offsetWidth - 8) + "px";
   tip.style.top = Math.min(y, r.height - tip.offsetHeight - 8) + "px";
 }
-controls.addEventListener("start", () => { S.dragging = true; $("#tip").style.display = "none"; });
-controls.addEventListener("end", () => { S.dragging = false; });
+controls.pickPoint = (x, y) => pick({ clientX: x, clientY: y })?.point || null;
 canvas.addEventListener("dblclick", (e) => {
   const hit = pick(e);
   if (hit) { controls.target.copy(hit.point); controls.update(); }
@@ -574,7 +725,6 @@ function drawGizmo() {
 }
 
 function loop() {
-  controls.update();
   hoverTick();
   renderer.render(scene, camera);
   drawGizmo();
@@ -880,7 +1030,19 @@ async function openReport(path) {
 
 // ---------------------------------------------------------------- toolbar wiring
 $$("#tabs button").forEach((b) => b.addEventListener("click", () => loadTab(b.dataset.tab)));
-$$("#views button").forEach((b) => b.addEventListener("click", () => fit(null, b.dataset.view === "fit" ? null : b.dataset.view)));
+$$("#views button[data-view]").forEach((b) => b.addEventListener("click", () => fit(null, b.dataset.view === "fit" ? null : b.dataset.view)));
+function setOrbit(free) {
+  controls.free = free;
+  const b = $("#orbitbtn");
+  b.textContent = free ? "Free" : "Z-up";
+  b.classList.toggle("on", free);
+  controls.update();
+  try { localStorage.setItem("refit.orbit", free ? "free" : "z"); } catch {}
+}
+$("#orbitbtn").addEventListener("click", () => setOrbit(!controls.free));
+let _orbit = null;
+try { _orbit = localStorage.getItem("refit.orbit"); } catch {}
+setOrbit(_orbit === "free");
 $$("#display button[data-disp]").forEach((b) => b.addEventListener("click", () => {
   const k = b.dataset.disp;
   S.disp[k] = !S.disp[k];
@@ -898,6 +1060,7 @@ window.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) { e.preventDefault(); openFile(); }
   else if (e.key === "f" || e.key === "F") fit(null, null);
   else if (e.key === "i" || e.key === "I") fit(null, "iso");
+  else if (e.key === "o" || e.key === "O") setOrbit(!controls.free);
   else if (e.key === "l" || e.key === "L") showLog(!$("#log").classList.contains("show"));
   else if (e.key === "1") loadTab("input");
   else if (e.key === "2") loadTab("output");
@@ -928,6 +1091,7 @@ window.refitUI = {
   view: (v) => fit(null, v),
   tab: (t) => loadTab(t),
   log: () => showLog(!$("#log").classList.contains("show")),
+  orbit: () => setOrbit(!controls.free),
 };
 window.addEventListener("pywebviewready", () => { document.body.classList.add("native"); setTitle(); });
 

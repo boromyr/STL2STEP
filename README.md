@@ -118,8 +118,11 @@ are reported but left in.
   curved walls (a hole meeting another hole, whose width changes all along) is rebuilt from the
   two walls and the ball rolling between them, as one B-spline face whose edges follow the ball's
   contact lines; the straight and circular pieces of the same chain become the exact cylinders and
-  tori the ball sweeps there, and each fillet ends where its ball leaves the walls' facets (`test13`
-  reproduces all 57 faces of its CAD one to one).
+  tori the ball sweeps there, and each fillet ends where its ball leaves the walls' facets. A facet
+  left over at a fillet's corner, wedged among faces already found, joins the fillet when its
+  vertices are on it and its middle sags no deeper than a chord of the ball does; a fillet that then
+  fails to convert is converted without it (`test13` reproduces all 57 faces of its CAD one to one, and has no others; `test8` 468 → 463
+  faces).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
@@ -143,8 +146,17 @@ python refit.py part.stl -a -b -c -a 0.005   # holes first, the previous recipe
 
 After the phases, the edges that are still polylines of the mesh get the curve they really sit
 on: the exact intersection of the two faces, a circle, or a spline through its vertices (checked on
-both faces). A chain that doesn't take one curve as a whole is cut at its corners and tried again in
-pieces, and the step repeats while it finds something.
+both faces). A chain that doesn't take one curve as a whole is cut at its corners, or halved when
+it has none (a short one loses its last or first segment), and tried again in pieces, and the step
+repeats while it finds something. A chain of only two segments gets the circle through its three
+vertices when that circle lies on both faces (where a rolling-ball fillet hands over to the
+cylinder its ball sweeps next, the two meet along the ball's own section). Between two tangent
+faces the spline leaves out the vertices where the two faces' normals part by more than 1.5°:
+they're off the line of contact, a row of the fillet's facets left with the wall, and the spline
+through them waved (`test13`: its fillets' rails within 6 µm of the CAD's edges instead of 67).
+Before that, a needle triangle left on a rim - two edges between the same two faces running out to
+a tip and back - is collapsed, so the rim runs through as one chain (`test13`: edges 163 → 139, no
+more kinks at the fillets' corners).
 
 The STEP file is written without pcurves (the edges' 2D curves on the faces), as CAD systems do:
 the reader rebuilds them, and the file is 3-7 times smaller. The output is read back right away
