@@ -111,7 +111,10 @@ are reported but left in.
   cut where its curvature jumps (the end of a fillet, the corner between two curves), and a spline
   wall the seeds had already cut into a few osculating cylinders is taken whole again when one
   profile holds it (`test9` 1,062 → 954 faces, `test8` 479 → 468). Stretches tessellated so
-  coarsely that the mesh doesn't say where the curve runs stay planar. Every facet is a chord of
+  coarsely that the mesh doesn't say where the curve runs stay planar. Where a free-form band runs
+  into a round it's tangent to, the facets along the contact line sit on both: one with more sides
+  on its neighbour than on its own region, and on the neighbour's surface, goes over to it (`test4`:
+  no more notches at the ends of the chamfer bands, edges 137 → 126). Every facet is a chord of
   the surface under it: a region whose facets sag below its surface further than the mesh's own
   chords ever do (measured on the regions that fit exactly) has the wrong surface - a sphere
   standing over a flat disc - and is rejected, or only the facets that don't belong are left out. A constant-radius fillet between two
@@ -168,7 +171,10 @@ STEP keeps no tolerances, so a face that was valid in memory only thanks to a ve
 sliver whose ring touches the face's rim) can read back invalid with or without pcurves. When that
 happens the part as read back is mended — the vertex moved to the edges' crossing, the sliver
 covered by the face around it — and written again, kept only if it reads back better and with the
-same volume (`test12` now reads back valid).
+same volume (`test12` now reads back valid), also when the reader has cut a face in two. A
+degenerate edge on a surface that has no pole there (a plane, a cylinder, a torus with R > r) is
+dropped before writing: the reader made a wire of its own out of one, and a 0.33 mm² face of a
+`test14` spindle torus came back as the whole torus, 36,342 mm².
 
 ## Repository layout
 

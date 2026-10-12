@@ -2090,6 +2090,43 @@ def _mend_for_step(ri, bad, max_dev: float, v_ref: float):
         return None
 
 
+def drop_stray_degenerate(shape):
+    """
+    ⚠️ A DEGENERATE EDGE WHERE THE SURFACE ISN'T. A degenerate edge (a
+    point in 3D, a segment in (u,v)) belongs where the surface collapses: a
+    sphere's pole, a cone's apex. On test14 the engine closed the wire of a
+    0.33 mm2 face of a spindle torus (R 30.36 r 30.32, the face near the
+    inner equator, 0.05 mm from the axis) with one: valid in memory, but the
+    STEP reader made a wire of its own out of it and the face came back as
+    the whole torus less a hole - 36,342 mm2, 57 mm off the mesh. On a plane,
+    a cylinder or a torus with R > r nothing collapses: those edges go, the
+    wire stays closed through their vertex. Kept only if no edge comes free
+    and a valid part stays valid. Returns (shape, edges removed).
+    """
+    rs = BRepTools_ReShape()
+    n = 0
+    for f in explore(shape, TopAbs_FACE):
+        f = td_Face(f)
+        ad = BRepAdaptor_Surface(f, True)
+        t = ad.GetType()
+        if not (t in (GeomAbs_Plane, GeomAbs_Cylinder) or (t == GeomAbs_Torus and ad.Torus().MajorRadius() > ad.Torus().MinorRadius())):
+            continue
+        for e in explore(f, TopAbs_EDGE):
+            e = td_Edge(e)
+            if bt_Degenerated(e):
+                rs.Remove(td_Edge(e.Oriented(TopAbs_FORWARD)))
+                n += 1
+    if not n:
+        return shape, 0
+    try:
+        new = rs.Apply(shape)
+    except Exception:
+        return shape, 0
+    if count_free_edges(new) > count_free_edges(shape) or (is_valid(shape) and not is_valid(new)):
+        return shape, 0
+    return new, n
+
+
 def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: bool = False):
     """
     write_step, then read back. Without pcurves the file is checked and, if
@@ -2105,6 +2142,9 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     whatever is written (circles ending 5e-4 off a B-spline face's vertex):
     there the file without them is just as good, and three times smaller.
     """
+    shape, n_deg = drop_stray_degenerate(shape)
+    if n_deg:
+        Log.info(f"Degenerate edges on surfaces with no pole removed before writing: {n_deg}")
     write_step(shape, path, src=src, pcurves=pcurves)
     ri, _ = read_step(path)
     if pcurves:
@@ -2117,6 +2157,12 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     sc, why, bad = _read_back_check(shape, ri, base_bad, defl)
     if sc == (0, 0, 0):
         return ri
+    # (the reader cut a face in two - more faces, none lost - and the part
+    # came back invalid: its invalid faces are mended all the same, on what
+    # the reader made of it, as after a first mending; on test14 this went
+    # straight to the pcurves, which mended nothing)
+    if not bad and ri is not None and count_sub(ri, TopAbs_FACE) > count_sub(shape, TopAbs_FACE) and not is_valid(ri):
+        bad = {i for i, f in enumerate(explore(ri, TopAbs_FACE)) if not is_valid(f)}
     mended = False
     # ⚠️ AN INVALID FILE FROM A VALID PART: faces that only their vertices'
     # tolerances kept valid, and STEP doesn't carry tolerances - pcurves or
@@ -7505,6 +7551,62 @@ class Segmenter:
         if len(merged) < len(analytic):
             same = {tuple(sorted(R.faces)): R for R in analytic}
             regions = [same.get(tuple(sorted(rf))) or describe_region(p, topo, rf) for p, rf in merged] + [R for R in regions if R.prim.kind == FREE]
+        # ⚠️ A NOTCH IN A TANGENT BORDER. Where a free-form band runs into the
+        # round it's tangent to (test4: the chamfer bands at the R3 corners),
+        # the band's facets along the contact line are within a micron of the
+        # round as well, and the round, grown first, took four of them at one
+        # end: the band came out with a notch, its rail a zigzag of three short
+        # segments 0.2 mm inside the CAD's band. A facet with more of its sides
+        # on a neighbouring region than on its own (one of the two free-form,
+        # neither planar),
+        # every vertex on the neighbour's surface within tol_fit and its normal
+        # the neighbour's, goes over to it - round after round, while both can
+        # still be walked.
+        owner_n = {i: k for k, R in enumerate(regions) for i in R.faces}
+        fset_n = [set(R.faces) for R in regions]
+        eng_n = types.SimpleNamespace(topo=topo)
+        cos5 = math.cos(math.radians(5.0))
+        changed_n = set()
+        for _ in range(8):
+            cand = defaultdict(set)
+            for i, a in owner_n.items():
+                nb = [owner_n.get(j) for j in topo.adj[i]]
+                for b in set(nb) - {a, None}:
+                    # (more sides on the neighbour than on its own region: a
+                    # facet's fourth side often runs along a plane, no region)
+                    if nb.count(b) < 2 or nb.count(b) <= nb.count(a):
+                        continue
+                    pa_, pb_ = regions[a].prim, regions[b].prim
+                    # (a rolling-ball fillet's rails have their own trimming,
+                    # against the ball: here test13 came out with 5 more edges)
+                    if FREE not in (pa_.kind, pb_.kind) or PLANE in (pa_.kind, pb_.kind) or getattr(pa_, "ball", None) is not None or getattr(pb_, "ball", None) is not None:
+                        continue
+                    if float(np.abs(pb_.dist(topo.verts[i])).max()) > self.tol_fit:
+                        continue
+                    if abs(float(pb_.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) < cos5:
+                        continue
+                    cand[(a, b)].add(i)
+            moved = False
+            for (a, b), G in cand.items():
+                G = {i for i in G if owner_n[i] == a}
+                fa_, fb_ = fset_n[a] - G, fset_n[b] | G
+                if not G or len(fa_) < self.min_faces:
+                    continue
+                if Engine.region_loops(eng_n, sorted(fa_))[0] is None or Engine.region_loops(eng_n, sorted(fb_))[0] is None:
+                    continue
+                fset_n[a], fset_n[b] = fa_, fb_
+                for i in G:
+                    owner_n[i] = b
+                changed_n |= {a, b}
+                moved = True
+            if not moved:
+                break
+        if changed_n:
+            Log.debug(f"Tangent borders smoothed: {sum(len(fset_n[k] ^ set(regions[k].faces)) for k in changed_n) // 2} facets between {len(changed_n)} regions")
+            for k in changed_n:
+                R0 = regions[k]
+                regions[k] = describe_region(R0.prim, topo, sorted(fset_n[k]))
+                regions[k].fallback = R0.fallback
         # ⚠️ THE WIDE STRIP ON A ROUND. Where the tessellator crossed a round
         # with one wide strip, the growth took it for a real plane of the
         # part (big facets are walls) and it stayed a planar face beside its

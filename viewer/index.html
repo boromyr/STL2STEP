@@ -167,6 +167,7 @@ table.stats tr.gap td { padding-top: 10px; }
       <button data-disp="shaded" class="on">Shaded</button>
       <button data-disp="edges" class="on">Edges</button>
       <button data-disp="mesh">Triangles</button>
+      <button id="flatbtn" title="Unlit: every face its own colour, no shading">Flat</button>
       <span class="sep"></span>
       <button data-color="type" class="on" title="Faces coloured by surface type">Type</button>
       <button data-color="faces" title="One colour per face">Faces</button>
@@ -283,10 +284,25 @@ const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 1e5);
 camera.up.set(0, 0, 1);
 scene.add(camera);
-scene.add(new THREE.HemisphereLight(0xffffff, 0x3a3f48, 1.25));
-const key = new THREE.DirectionalLight(0xffffff, 1.6);
-key.position.set(0.6, 1.0, 1.4);
-camera.add(key);
+// Matte CAD lighting: the materials are Lambert (no specular, so no shiny
+// spot), a key light from the viewer's upper left and a weak fill from the
+// lower right, both riding with the camera, over an even ambient. Planes facing
+// different ways get clearly different greys; nothing is "realistic".
+// "Flat" (see material()) switches lighting off: every face its own colour.
+// ⚠️ A DirectionalLight shines from its position TOWARD ITS TARGET, and the
+// target sits at the world origin unless it's moved: with the light in camera
+// space and the target left there, every light came from the camera itself
+// whatever its offset (that was the fixed shiny spot in the middle). The
+// targets ride with the camera too, so the offsets are the directions.
+scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+function cameraLight(intensity, x, y, z) {
+  const l = new THREE.DirectionalLight(0xffffff, intensity);
+  l.position.set(x, y, z);   // camera space
+  camera.add(l, l.target);   // target at the camera's origin
+  return l;
+}
+cameraLight(1.8, -0.5, 0.8, 0.6);   // key: upper left
+cameraLight(0.5, 0.8, -0.4, 0.5);   // fill: lower right
 
 // ---------------------------------------------------------------- camera controls
 // Our own instead of OrbitControls, for three things it can't do:
@@ -449,7 +465,7 @@ const controls = new CadControls(camera, canvas);
 const S = {
   files: [], input: null, paths: { input: null, output: null, cad: null },
   models: { input: null, output: null, cad: null }, tab: "input",
-  disp: { shaded: true, edges: true, mesh: false }, color: "type",
+  disp: { shaded: true, edges: true, mesh: false }, color: "type", flat: false,
   isolate: null, hover: -1, job: null, fitted: null,
 };
 
@@ -482,10 +498,22 @@ async function fetchModel(path) {
 }
 
 function material(flat) {
-  return new THREE.MeshStandardMaterial({
-    vertexColors: true, metalness: 0.05, roughness: 0.62, side: THREE.DoubleSide, flatShading: flat,
+  const opt = {
+    vertexColors: true, side: THREE.DoubleSide,
     polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
-  });
+  };
+  // matte shading (Lambert: no specular highlight); "Flat": unlit colour
+  return S.flat ? new THREE.MeshBasicMaterial(opt) : new THREE.MeshLambertMaterial({ ...opt, flatShading: flat });
+}
+function setFlat(on) {
+  S.flat = on;
+  $("#flatbtn").classList.toggle("on", on);
+  for (const m of Object.values(S.models)) {
+    if (!m) continue;
+    m.mesh.material.dispose();
+    m.mesh.material = material(m.kind === "stl");
+  }
+  try { localStorage.setItem("refit.flat", on ? "1" : "0"); } catch {}
 }
 
 function buildSTL(h, pos) {
@@ -957,7 +985,6 @@ $("#go").addEventListener("click", async () => {
   $("#logtext").textContent = "";
   appendLog(["$ " + j.cmd.map(q).join(" "), ""]);
   $("#logtitle").textContent = "refit.py — " + base(S.input);
-  showLog(true);
   $("#go").style.display = "none";
   $("#cancel").style.display = "block";
   $("#runstate").style.display = "block";
@@ -1050,6 +1077,8 @@ $$("#display button[data-disp]").forEach((b) => b.addEventListener("click", () =
   $$("#display button[data-disp]").forEach((x) => x.classList.toggle("on", S.disp[x.dataset.disp]));
   applyDisplay(S.models[S.tab]);
 }));
+$("#flatbtn").addEventListener("click", () => setFlat(!S.flat));
+try { setFlat(localStorage.getItem("refit.flat") === "1"); } catch { setFlat(false); }
 $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () => {
   S.color = b.dataset.color;
   $$("#display button[data-color]").forEach((x) => x.classList.toggle("on", x === b));
