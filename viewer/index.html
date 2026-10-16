@@ -41,10 +41,30 @@ button, input, select { font: inherit; color: inherit; }
 .seg button.on { background: #2a2e37; color: var(--text); }
 .seg button:disabled { color: #3f444d; cursor: default; }
 .seg .sep { width: 1px; background: var(--line); margin: 4px 4px; }
-#tabs { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); }
+/* top row: tabs centred in the free space, views on the right; when they don't
+   fit side by side the views wrap to a second row instead of overlapping */
+#topbar { position: absolute; top: 18px; left: 18px; right: 18px; display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; pointer-events: none; z-index: 5; }
+#topbar > .seg { pointer-events: auto; position: relative; }
+#topbar > .grow { flex: 1; }
+#views { margin-left: auto; }
 #display { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); }
-#views { position: absolute; top: 18px; right: 18px; }
 #views button { padding: 6px 10px; font-size: 12.5px; }
+/* section: one button, a menu with the three axes, and a Fusion-style value box by the arrow */
+#secmenu { position: absolute; top: calc(100% + 6px); right: 0; display: none; flex-direction: column; gap: 2px; padding: 5px; min-width: 132px; background: rgba(23,25,30,.96); border: 1px solid var(--line); border-radius: 10px; z-index: 6; }
+#secmenu.show { display: flex; }
+#secmenu button { border: 0; background: transparent; color: #b7bcc5; padding: 7px 10px; border-radius: 7px; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 9px; font-size: 13px; }
+#secmenu button:hover:not(:disabled) { background: #2a2e37; color: var(--text); }
+#secmenu button.on { background: #2a2e37; color: var(--text); }
+#secmenu button:disabled { color: #3f444d; cursor: default; }
+#secmenu .ax { width: 18px; height: 18px; border-radius: 5px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 11.5px; color: #111; }
+#secmenu hr { border: 0; border-top: 1px solid var(--line); margin: 3px 2px; }
+#secbox { position: absolute; display: none; align-items: center; gap: 4px; padding: 4px; background: rgba(23,25,30,.95); border: 1px solid var(--line); border-radius: 8px; z-index: 4; font-size: 12.5px; }
+#secbox.show { display: flex; }
+#secbox .ax { font-weight: 700; padding: 0 4px 0 6px; }
+#secbox input { width: 96px; background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 4px 7px; text-align: right; outline: none; font-variant-numeric: tabular-nums; }
+#secbox input:focus { border-color: var(--accent); }
+#secbox button { border: 0; background: transparent; color: var(--muted); padding: 4px 7px; border-radius: 6px; cursor: pointer; }
+#secbox button:hover { color: var(--text); background: #2a2e37; }
 #gizmo { position: absolute; left: 14px; bottom: 14px; width: 96px; height: 96px; pointer-events: none; }
 
 #tip { position: absolute; pointer-events: none; background: rgba(15,17,21,.94); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 12.5px; display: none; white-space: nowrap; z-index: 5; }
@@ -149,19 +169,39 @@ table.stats tr.gap td { padding-top: 10px; }
   <main id="view">
     <canvas id="c" tabindex="0"></canvas>
     <div id="empty">Pick a mesh on the right, or drop an .stl / .step here</div>
-    <div class="seg" id="tabs">
-      <button data-tab="input" disabled>Input</button>
-      <button data-tab="output" disabled>STEP</button>
-      <button data-tab="cad" disabled title="&lt;name&gt;_original.step">Original CAD</button>
+    <div id="topbar">
+      <span class="grow"></span>
+      <div class="seg" id="tabs">
+        <button data-tab="input" disabled>Input</button>
+        <button data-tab="output" disabled>STEP</button>
+        <button data-tab="cad" disabled title="&lt;name&gt;_original.step">Original CAD</button>
+      </div>
+      <span class="grow"></span>
+      <div class="seg" id="views">
+        <button data-view="fit" title="Fit (F)">Fit</button>
+        <button data-view="iso" title="Isometric (I)">Iso</button>
+        <button data-view="top">Top</button>
+        <button data-view="front">Front</button>
+        <button data-view="right">Right</button>
+        <span class="sep"></span>
+        <button id="orbitbtn" title="Orbit: Z-up (turntable) or free (O)">Z-up</button>
+        <span class="sep"></span>
+        <button id="secbtn" title="Section view along X, Y or Z">Section</button>
+        <div id="secmenu">
+          <button data-axis="x"><span class="ax" style="background:#f05a5a">X</span>Along X</button>
+          <button data-axis="y"><span class="ax" style="background:#6fd65c">Y</span>Along Y</button>
+          <button data-axis="z"><span class="ax" style="background:#5a8cf0">Z</span>Along Z</button>
+          <hr>
+          <button id="secmflip">⇅ Flip side</button>
+          <button id="secmoff">✕ Off</button>
+        </div>
+      </div>
     </div>
-    <div class="seg" id="views">
-      <button data-view="fit" title="Fit (F)">Fit</button>
-      <button data-view="iso" title="Isometric (I)">Iso</button>
-      <button data-view="top">Top</button>
-      <button data-view="front">Front</button>
-      <button data-view="right">Right</button>
-      <span class="sep"></span>
-      <button id="orbitbtn" title="Orbit: Z-up (turntable) or free (O)">Z-up</button>
+    <div id="secbox">
+      <span class="ax" id="secax">X</span>
+      <input id="secval" inputmode="decimal" spellcheck="false" title="Section position (Enter to apply, ↑ ↓ to step, Shift ×10)">
+      <button id="secflip" title="Flip: keep the other side">⇅</button>
+      <button id="secoff" title="Section off">✕</button>
     </div>
     <div class="seg" id="display">
       <button data-disp="shaded" class="on">Shaded</button>
@@ -278,8 +318,9 @@ const faceKey = (f) => (f.facet ? "facet" : f.type);
 
 // ---------------------------------------------------------------- three
 const canvas = $("#c");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, stencil: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.localClippingEnabled = true;   // section view (per-material, so its arrow isn't cut)
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 1e5);
 camera.up.set(0, 0, 1);
@@ -503,7 +544,43 @@ function material(flat) {
     polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
   };
   // matte shading (Lambert: no specular highlight); "Flat": unlit colour
-  return S.flat ? new THREE.MeshBasicMaterial(opt) : new THREE.MeshLambertMaterial({ ...opt, flatShading: flat });
+  const mat = S.flat ? new THREE.MeshBasicMaterial(opt) : new THREE.MeshLambertMaterial({ ...opt, flatShading: flat });
+  return mat;
+}
+// Section cap, the usual stencil way: the cut part's back faces add 1 and its
+// front faces take 1 off (colour and depth untouched), so wherever the plane
+// lies inside the solid the count is not 0; there the cap (secCap, drawn next)
+// paints the plane, hatched, WITH depth: the faces behind the cut, and their
+// edges, stay hidden instead of showing through.
+const stencilMat = (side, op) => new THREE.MeshBasicMaterial({
+  side, colorWrite: false, depthWrite: false, depthTest: false,
+  stencilWrite: true, stencilFunc: THREE.AlwaysStencilFunc,
+  stencilFail: op, stencilZFail: op, stencilZPass: op,
+});
+function makeStencil(m) {
+  const g = new THREE.Group();
+  for (const [side, op] of [[THREE.BackSide, THREE.IncrementWrapStencilOp], [THREE.FrontSide, THREE.DecrementWrapStencilOp]]) {
+    const o = new THREE.Mesh(m.geo, stencilMat(side, op));
+    o.material.clippingPlanes = [secPlane];
+    o.renderOrder = 1;
+    g.add(o);
+  }
+  g.userData.stencil = true;
+  return g;
+}
+// every material of a model is cut by the section plane, or none
+function applyClip(m) {
+  if (!m) return;
+  const want = SEC.axis ? 1 : 0;
+  if (want && !m.stencil) { m.stencil = makeStencil(m); m.group.add(m.stencil); }
+  if (m.stencil) m.stencil.visible = !!want;
+  m.group.traverse((o) => {
+    if (o.parent?.userData.stencil) return;
+    const mat = o.material;
+    if (!mat || (mat.clippingPlanes?.length || 0) === want) return;
+    mat.clippingPlanes = want ? [secPlane] : null;
+    mat.needsUpdate = true;
+  });
 }
 function setFlat(on) {
   S.flat = on;
@@ -512,6 +589,7 @@ function setFlat(on) {
     if (!m) continue;
     m.mesh.material.dispose();
     m.mesh.material = material(m.kind === "stl");
+    applyClip(m);
   }
   try { localStorage.setItem("refit.flat", on ? "1" : "0"); } catch {}
 }
@@ -597,6 +675,7 @@ function applyDisplay(m) {
     m.wire.visible = S.disp.mesh;
     m.wire.material.opacity = S.disp.shaded ? 0.85 : 1;
   }
+  applyClip(m);
 }
 
 // ---------------------------------------------------------------- tabs
@@ -612,6 +691,7 @@ function setTab(tab) {
   scene.add(m.group);
   recolor(m);
   applyDisplay(m);
+  if (SEC.axis) updateSection();
   if (S.fitted !== S.paths.input) { fit(m, "iso"); S.fitted = S.paths.input; }
   $$("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
   renderStats();
@@ -685,7 +765,8 @@ function pick(e) {
   const r = canvas.getBoundingClientRect();
   ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(ndc, camera);
-  return ray.intersectObject(m.mesh, false)[0] || null;
+  // skip what the section cut away
+  return ray.intersectObject(m.mesh, false).find((h) => !SEC.axis || secPlane.distanceToPoint(h.point) >= 0) || null;
 }
 function setHover(i) {
   const m = S.models[S.tab];
@@ -706,7 +787,7 @@ function faceDesc(f) {
 }
 function hoverTick() {
   if (!lastMove) return;
-  if (controls.active) { lastMove = null; $("#tip").style.display = "none"; return; }
+  if (controls.active || SEC.drag || SEC.hover) { lastMove = null; setHover(-1); $("#tip").style.display = "none"; return; }
   const e = lastMove; lastMove = null;
   const hit = pick(e);
   const tip = $("#tip");
@@ -732,6 +813,254 @@ canvas.addEventListener("dblclick", (e) => {
   if (hit) { controls.target.copy(hit.point); controls.update(); }
 });
 
+// ---------------------------------------------------------------- section
+// One plane across X, Y or Z. The material on the side the arrow points to is
+// cut away (Flip keeps the other side). As with an extrusion in Fusion 360, the
+// arrow drags the plane along its axis and the box next to it takes a number.
+const AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) };
+const AXIS_COLORS = { x: "#f05a5a", y: "#6fd65c", z: "#5a8cf0" };
+const SEC = { axis: null, d: 0, flip: false, hover: false, drag: null, lo: 0, hi: 1 };
+const secPlane = new THREE.Plane();
+const secN = new THREE.Vector3();        // arrow direction: toward the removed side
+const secO = new THREE.Vector3();        // arrow base: the plane at the part's centre
+
+// the plane, drawn faintly so it shows where the cut is
+const secFill = new THREE.Mesh(new THREE.BufferGeometry(),
+  new THREE.MeshBasicMaterial({ color: 0x6fd6bf, transparent: true, opacity: 0.07, side: THREE.DoubleSide, depthWrite: false }));
+secFill.geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+secFill.geometry.setIndex([0, 1, 2, 0, 2, 3]);
+const secLine = new THREE.LineLoop(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: 0x6fd6bf, transparent: true, opacity: 0.55, depthWrite: false }));
+secLine.geometry.setAttribute("position", secFill.geometry.attributes.position);
+
+// the arrow, drawn over the part and sized in pixels: shaft + head along +Y,
+// plus a fatter invisible cylinder so it's easy to grab
+const secArrow = new THREE.Group();
+const arrowMat = new THREE.MeshBasicMaterial({ color: 0x6fd6bf, depthTest: false, depthWrite: false, transparent: true });
+{
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, 0.72, 12), arrowMat);
+  shaft.position.y = 0.36;
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.11, 0.28, 20), arrowMat);
+  head.position.y = 0.86;
+  const base = new THREE.Mesh(new THREE.SphereGeometry(0.07, 16, 12), arrowMat);
+  const grab = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.16, 1.1, 8),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthTest: false, depthWrite: false }));
+  grab.position.y = 0.5;
+  grab.name = "grab";
+  for (const o of [shaft, head, base]) o.renderOrder = 10;
+  secArrow.add(shaft, head, base, grab);
+}
+// the cap: the plane's rectangle, drawn only where the stencil count isn't 0
+// (and setting it back to 0), after the stencil passes (renderOrder 1)
+const secCap = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial({
+  side: THREE.DoubleSide,
+  stencilWrite: true, stencilRef: 0, stencilFunc: THREE.NotEqualStencilFunc,
+  stencilFail: THREE.ReplaceStencilOp, stencilZFail: THREE.ReplaceStencilOp, stencilZPass: THREE.ReplaceStencilOp,
+}));
+secCap.geometry.setAttribute("position", secFill.geometry.attributes.position);
+secCap.geometry.setIndex([0, 1, 2, 0, 2, 3]);
+secCap.material.onBeforeCompile = (sh) => {
+  sh.fragmentShader = sh.fragmentShader.replace("#include <dithering_fragment>", `#include <dithering_fragment>
+  float hatch = step(0.6, fract((gl_FragCoord.x + gl_FragCoord.y) / 14.0));
+  gl_FragColor = vec4(mix(vec3(0.30, 0.33, 0.38), vec3(0.44, 0.84, 0.75), hatch), 1.0);`);
+};
+secCap.renderOrder = 1.1;
+secCap.onAfterRender = (r) => r.clearStencil();
+const secHelp = new THREE.Group();
+secHelp.add(secCap, secFill, secLine, secArrow);
+secHelp.visible = false;
+scene.add(secHelp);
+
+function sectionBounds() {
+  const m = S.models[S.tab];
+  if (!m) return null;
+  const [lo, hi] = m.h.bbox;
+  return { lo: new THREE.Vector3(...lo), hi: new THREE.Vector3(...hi) };
+}
+// plane, helper geometry and UI from SEC
+function updateSection() {
+  const b = sectionBounds();
+  const on = !!SEC.axis && !!b;
+  secHelp.visible = on;
+  $("#secbox").classList.toggle("show", on);
+  $("#secbtn").classList.toggle("on", !!SEC.axis);
+  $("#secbtn").textContent = SEC.axis ? `Section ${SEC.axis.toUpperCase()}` : "Section";
+  $$("#secmenu button[data-axis]").forEach((x) => x.classList.toggle("on", x.dataset.axis === SEC.axis));
+  $("#secmflip").disabled = $("#secmoff").disabled = !SEC.axis;
+  if (!on) return;
+  const k = "xyz".indexOf(SEC.axis), u = AXES[SEC.axis];
+  SEC.lo = b.lo.getComponent(k); SEC.hi = b.hi.getComponent(k);
+  const span = SEC.hi - SEC.lo, pad = Math.max(span, 1e-9) * 0.02;
+  if (!Number.isFinite(SEC.d)) SEC.d = (SEC.lo + SEC.hi) / 2;
+  SEC.d = THREE.MathUtils.clamp(SEC.d, SEC.lo - pad, SEC.hi + pad);
+  // keep n·p <= d (n = arrow direction): Plane(-n, n·P0), negative side is cut
+  secN.copy(u).multiplyScalar(SEC.flip ? -1 : 1);
+  secPlane.normal.copy(secN).negate();
+  secPlane.constant = (SEC.flip ? -1 : 1) * SEC.d;
+  secO.copy(b.lo).add(b.hi).multiplyScalar(0.5).setComponent(k, SEC.d);
+  // the plane's rectangle over the other two axes, 5% larger than the part
+  const [i, j] = [0, 1, 2].filter((x) => x !== k);
+  const size = b.hi.clone().sub(b.lo), pos = secFill.geometry.attributes.position;
+  const ci = secO.getComponent(i), cj = secO.getComponent(j);
+  const hi_ = size.getComponent(i) * 0.55 + pad, hj = size.getComponent(j) * 0.55 + pad;
+  [[-1, -1], [1, -1], [1, 1], [-1, 1]].forEach(([si, sj], v) => {
+    const p = new THREE.Vector3().setComponent(k, SEC.d).setComponent(i, ci + si * hi_).setComponent(j, cj + sj * hj);
+    pos.setXYZ(v, p.x, p.y, p.z);
+  });
+  pos.needsUpdate = true;
+  secFill.geometry.computeBoundingSphere();
+  secCap.geometry.computeBoundingSphere();
+  secLine.geometry.computeBoundingSphere();
+  secArrow.position.copy(secO);
+  secArrow.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), secN);
+  $("#secax").textContent = SEC.axis.toUpperCase();
+  $("#secax").style.color = AXIS_COLORS[SEC.axis];
+  if (document.activeElement !== $("#secval")) $("#secval").value = secFmt(SEC.d);
+}
+const secFmt = (d) => String(+d.toFixed(Math.abs(SEC.hi - SEC.lo) >= 10 ? 3 : 4));
+
+function setSection(axis) {
+  axis = axis || null;
+  $("#secval").blur();   // a pending edit belongs to the old axis (its "change" fires now)
+  if (axis && axis !== SEC.axis) {
+    // a new axis starts through the middle of the part
+    const b = sectionBounds();
+    const k = "xyz".indexOf(axis);
+    SEC.d = b ? (b.lo.getComponent(k) + b.hi.getComponent(k)) / 2 : NaN;   // NaN: centre once loaded
+    SEC.flip = false;
+  }
+  SEC.axis = axis;
+  SEC.hover = false;
+  canvas.style.cursor = "";
+  updateSection();
+  for (const m of Object.values(S.models)) applyClip(m);
+  showSecMenu(false);
+}
+function flipSection() {
+  if (!SEC.axis) return;
+  SEC.flip = !SEC.flip;
+  updateSection();
+}
+
+// arrow size and the value box follow the camera every frame
+const _v = new THREE.Vector3();
+function secTick() {
+  if (!secHelp.visible) return;
+  const h = canvas.clientHeight || 1;
+  const px = (2 * camera.position.distanceTo(secO) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / h;
+  secArrow.scale.setScalar(px * 90);   // 90 px long whatever the zoom
+  arrowMat.color.set(SEC.drag || SEC.hover ? 0xffffff : 0x6fd6bf);
+  secFill.material.opacity = SEC.drag ? 0.14 : 0.07;
+  // the box just past the arrow's tip, along the arrow on screen, so it
+  // never covers it; kept inside the view
+  const box = $("#secbox"), W = canvas.clientWidth, H = canvas.clientHeight;
+  const scr = (p) => { p.project(camera); return [(p.x + 1) / 2 * W, (1 - p.y) / 2 * H, p.z]; };
+  const [bx, by] = scr(_v.copy(secO)), [tx, ty, tz] = scr(_v.copy(secO).addScaledVector(secN, px * 90));
+  let dx = tx - bx, dy = ty - by, l = Math.hypot(dx, dy);
+  if (l < 3) { dx = 1; dy = 0; l = 1; }   // looking down the arrow
+  dx /= l; dy /= l;
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  const reach = 16 + (Math.abs(dx) * bw + Math.abs(dy) * bh) / 2;
+  let x = tx + dx * reach - bw / 2, y = ty + dy * reach - bh / 2;
+  if (tz > 1) { x = W / 2; y = H / 2; }   // tip behind the camera
+  box.style.left = THREE.MathUtils.clamp(x, 8, W - bw - 8) + "px";
+  const top = $("#topbar").offsetTop + $("#topbar").offsetHeight + 8;   // below the toolbars, however many rows
+  box.style.top = THREE.MathUtils.clamp(y, top, H - bh - 70) + "px";
+}
+
+// dragging: the plane follows the point of the axis line nearest to the
+// mouse ray; edge-on (axis along the view) it falls back to vertical motion
+function secRay(e) {
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  return ray.ray;
+}
+function secParam(e, origin) {
+  const rr = secRay(e), u = AXES[SEC.axis];
+  const b = u.dot(rr.direction), w = origin.clone().sub(rr.origin);
+  const den = 1 - b * b;
+  if (den < 1e-3) return null;
+  return (b * rr.direction.dot(w) - u.dot(w)) / den;
+}
+function secHit(e) {
+  if (!secHelp.visible) return false;
+  secRay(e);
+  return ray.intersectObject(secArrow, true).length > 0;
+}
+const view_ = $("#view");
+view_.addEventListener("pointerdown", (e) => {
+  if (e.target !== canvas || e.button !== 0 || e.altKey || e.ctrlKey || !secHit(e)) return;
+  // ours, not the camera's (this listener runs first: capture phase on #view)
+  e.stopPropagation(); e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  const origin = secO.clone();
+  SEC.drag = { origin, t0: secParam(e, origin), d0: SEC.d, y0: e.clientY };
+  canvas.style.cursor = "grabbing";
+  $("#secval").blur();
+}, true);
+view_.addEventListener("pointermove", (e) => {
+  if (!SEC.drag) {
+    if (e.target !== canvas || e.buttons || controls.active) return;
+    const h = secHit(e);
+    if (h !== SEC.hover) { SEC.hover = h; canvas.style.cursor = h ? "grab" : ""; }
+    return;
+  }
+  e.stopPropagation();
+  const g = SEC.drag;
+  const t = g.t0 == null ? null : secParam(e, g.origin);
+  if (t != null) SEC.d = g.d0 + (t - g.t0);
+  else {
+    const px = (2 * camera.position.distanceTo(g.origin) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / (canvas.clientHeight || 1);
+    SEC.d = g.d0 + (g.y0 - e.clientY) * px * (SEC.flip ? -1 : 1);
+  }
+  updateSection();
+  $("#secval").value = secFmt(SEC.d);
+}, true);
+const secUp = (e) => {
+  if (!SEC.drag) return;
+  e.stopPropagation();
+  SEC.drag = null;
+  try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  canvas.style.cursor = secHit(e) ? "grab" : "";
+};
+view_.addEventListener("pointerup", secUp, true);
+view_.addEventListener("pointercancel", secUp, true);
+
+// the value box
+function secApply() {
+  const v = parseFloat($("#secval").value.replace(",", "."));
+  if (Number.isFinite(v)) SEC.d = v;
+  updateSection();
+  $("#secval").value = secFmt(SEC.d);
+}
+$("#secval").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { secApply(); e.target.select(); }
+  else if (e.key === "Escape") { $("#secval").value = secFmt(SEC.d); e.target.blur(); }
+  else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+    e.preventDefault();
+    const step = (SEC.hi - SEC.lo) / 100 * (e.shiftKey ? 10 : 1) * (e.key === "ArrowUp" ? 1 : -1);
+    SEC.d += step;
+    updateSection();
+    $("#secval").value = secFmt(SEC.d);
+  }
+});
+$("#secval").addEventListener("change", secApply);
+$("#secval").addEventListener("focus", (e) => e.target.select());
+$("#secflip").addEventListener("click", flipSection);
+$("#secoff").addEventListener("click", () => setSection(null));
+
+// the one toolbar button and its menu
+function showSecMenu(on) { $("#secmenu").classList.toggle("show", on); }
+$("#secbtn").addEventListener("click", (e) => { e.stopPropagation(); showSecMenu(!$("#secmenu").classList.contains("show")); });
+$$("#secmenu button[data-axis]").forEach((b) => b.addEventListener("click", () => setSection(b.dataset.axis)));
+$("#secmflip").addEventListener("click", () => { flipSection(); showSecMenu(false); });
+$("#secmoff").addEventListener("click", () => setSection(null));
+document.addEventListener("pointerdown", (e) => {
+  if (!e.target.closest("#secmenu, #secbtn")) showSecMenu(false);
+}, true);
+updateSection();
+
 // ---------------------------------------------------------------- gizmo
 const gz = $("#gizmo").getContext("2d");
 function drawGizmo() {
@@ -754,6 +1083,7 @@ function drawGizmo() {
 
 function loop() {
   hoverTick();
+  secTick();
   renderer.render(scene, camera);
   drawGizmo();
   requestAnimationFrame(loop);
@@ -1087,6 +1417,7 @@ $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) { e.preventDefault(); openFile(); }
+  else if (e.key === "Escape") showSecMenu(false);
   else if (e.key === "f" || e.key === "F") fit(null, null);
   else if (e.key === "i" || e.key === "I") fit(null, "iso");
   else if (e.key === "o" || e.key === "O") setOrbit(!controls.free);
@@ -1121,6 +1452,8 @@ window.refitUI = {
   tab: (t) => loadTab(t),
   log: () => showLog(!$("#log").classList.contains("show")),
   orbit: () => setOrbit(!controls.free),
+  section: (axis) => setSection(axis),
+  flipSection,
 };
 window.addEventListener("pywebviewready", () => { document.body.classList.add("native"); setTitle(); });
 

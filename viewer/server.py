@@ -689,6 +689,13 @@ def run_window(url):
             MenuAction("Front", js("refitUI.view('front')")),
             MenuAction("Right", js("refitUI.view('right')")),
             MenuAction("Free / Z-up orbit (O)", js("refitUI.orbit()")),
+            Menu("Section", [
+                MenuAction("X", js("refitUI.section('x')")),
+                MenuAction("Y", js("refitUI.section('y')")),
+                MenuAction("Z", js("refitUI.section('z')")),
+                MenuAction("Flip", js("refitUI.flipSection()")),
+                MenuAction("Off", js("refitUI.section(null)")),
+            ]),
             MenuSeparator(),
             MenuAction("Input (1)", js("refitUI.tab('input')")),
             MenuAction("STEP (2)", js("refitUI.tab('output')")),

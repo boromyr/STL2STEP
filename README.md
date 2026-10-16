@@ -117,7 +117,14 @@ are reported but left in.
   no more notches at the ends of the chamfer bands, edges 137 → 126). Every facet is a chord of
   the surface under it: a region whose facets sag below its surface further than the mesh's own
   chords ever do (measured on the regions that fit exactly) has the wrong surface - a sphere
-  standing over a flat disc - and is rejected, or only the facets that don't belong are left out. A constant-radius fillet between two
+  standing over a flat disc - and is rejected, or only the facets that don't belong are left out.
+  Some exporters cap the angle between chords rather than their sag, and there a bigger radius sags
+  deeper: the sag per mm of radius is measured too, on the exact regions of the largest radii
+  (`test16`: 10° chords, its r 18 rounds sag 0.07 mm where its fillets sag 0.01; 1,581 → 1,170
+  faces), and a region may also sag 1.5 times what the exact regions of a similar radius do, cones
+  included (`test17`, from OpenSCAD, whose chords have a fixed length: 3,078 → 2,643 faces). A band swept along a direction checks its fit inside every big planar polygon it takes
+  in, not just at its centre (`test16`'s 25 mm handle underside came out a wavy B-spline, 0.4 mm
+  between its checks, and read back broken). A constant-radius fillet between two
   curved walls (a hole meeting another hole, whose width changes all along) is rebuilt from the
   two walls and the ball rolling between them, as one B-spline face whose edges follow the ball's
   contact lines; the straight and circular pieces of the same chain become the exact cylinders and
@@ -126,6 +133,34 @@ are reported but left in.
   vertices are on it and its middle sags no deeper than a chord of the ball does; a fillet that then
   fails to convert is converted without it (`test13` reproduces all 57 faces of its CAD one to one, and has no others; `test8` 468 → 463
   faces).
+  A thread is a profile swept by a screw motion, which no quadric and no extrusion describes: its
+  flanks used to come out as hundreds of small cylinders, spheres and loose triangles. The screw is
+  found from the facets' normals (a screw's velocity is tangent to every surface it sweeps onto
+  itself, so one least-squares eigenvector gives axis, point and pitch), refined on how the
+  vertices of every turn fall onto one profile, and each straight piece of that profile becomes
+  one face: a B-spline swept along the helix for a flank, cylinders cut into pieces of at most
+  300° for a crest or a root (`test15`: an internal thread of 4.4 turns, pitch 2.14 mm, two faces
+  where there were 190 regions and 3,400 triangles, 1,431 → 795 faces; `test17`: the lid's 1/8"
+  thread, 2,642 → 1,730 faces).
+  A tube that is no quadric - a loft narrowing along its axis, its sections ellipses on tilted
+  planes - used to come out as dozens of osculating cylinders and cones, each a strip of a few
+  degrees. Strips that touch, with nearly parallel axes and similar radii, going round a common
+  axis, are rebuilt as one B-spline in the tube's own coordinates (the angle around the axis and
+  the height along it), every facet it keeps held within its own threshold: refitted while the
+  facets it can't hold are let go, then grown over the ones around it it does hold (`test15`: the
+  sharpener's guide arm, 140 strips and 5,600 facets, one face; 795 → 545 faces, deviation from
+  the mesh 0.018 → 0.010 mm).
+  OpenSCAD writes circles as regular polygons, every corner exactly on the circle: the flat sides
+  are chords, and where another body cuts them its vertices lie on the chord, under the circle. A
+  flat facet whose plane holds two generators of a cylinder or cone, with its two extreme vertices
+  on it, none outside, at most 15° wide and none deeper than such a chord sags, belongs to it. A
+  region whose vertices are exact and whose widest facets are several and all as wide proves its
+  own sag, and may sag half as much again (tori too, around their axis and around the tube). An
+  ASCII STL is exact only to its digits - OpenSCAD writes six, 21.4919 - and that is the precision
+  the exact-vertex tests use there. A surface going (almost) all the way round whose boundary isn't
+  two rings, or whose seam finds no vertices in line on both rims, is converted in pieces around
+  its axis, and torus strips found only late are merged once more at the end (`test17`: the boss
+  wall, its rounded rim, the bore and the bowl; 1,730 → 940 faces).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
@@ -144,6 +179,21 @@ python refit.py part.stl                     # the default: A C A(0.005) C A(0.0
 python refit.py part.stl -a -c -a 0.005      # one Phase C only, faster
 python refit.py part.stl -a -b -c -a 0.005   # holes first, the previous recipe
 ```
+
+### Speed and `-j`
+
+`-j N` starts N worker processes at once (default: the machine's cores minus two, at most 22) and
+every phase that follows uses them: the seeds of the curved phases (both rounds), the type review,
+the exact consensus and the refits of the segmentation, the fits of the promoted merges and the
+checks of the arcs. Phase A and the in-solid replacements stay on one core: they change a shared
+OpenCascade structure and are checked one at a time. The result doesn't depend on `-j`: the workers
+compute against a snapshot and the main process replays their answers in the sequential order,
+taking one only where nothing it depended on has changed since, otherwise computing it again
+itself (the same regions with `-j 1` and `-j 22` on `test15`, `test16` and `test17`). On a
+24-core machine, against the previous version: `test16` 2,055 → 409 s, `test15` 1,414 → 900 s,
+`test17` 546 → 228 s, each with the very same file, and `test14` 1,971 → 1,486 s; the 13-part
+suite comes out identical, in about half the time. With `-v` the log lists where each segmentation spent its time
+(`Segmentation steps: ...`).
 
 ## Output file
 
