@@ -6201,7 +6201,7 @@ class Topo:
     after every accepted replacement.
     """
 
-    __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "v_edges", "vmap", "nV", "vpos", "adj", "planar")
+    __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "v_edges", "vmap", "nV", "vpos", "adj", "planar", "pverts", "_tol_v")
 
     def __init__(self, shape, prev: Optional["Topo"] = None):
         self.shape = shape
@@ -6218,6 +6218,9 @@ class Topo:
         self.vpos = np.array([vpos(vmap.FindKey(j)) for j in range(1, self.nV + 1)], dtype=float).reshape(-1, 3)
 
         self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar = {}, {}, {}, {}, {}, {}
+        self.pverts = {}
+        self._tol_v = None
+        fresh: Dict[int, list] = {}
         for i, f in enumerate(self.faces):
             # ⚠️ faces untouched by the last replacement are the same
             # (IsSame): their data is copied from the previous index
@@ -6225,6 +6228,7 @@ class Topo:
                 k = prev.fmap.FindIndex(f) - 1
                 if k >= 0 and prev.faces[k].Orientation() == f.Orientation():
                     self.verts[i] = prev.verts[k]
+                    self.pverts[i] = prev.pverts[k]
                     self.nverts[i] = prev.nverts[k]
                     self.cents[i] = prev.cents[k]
                     self.areas[i] = prev.areas[k]
@@ -6236,13 +6240,14 @@ class Topo:
             idx = [vmap.FindIndex(m.FindKey(k)) - 1 for k in range(1, _size(m) + 1)]
             idx = [j for j in idx if j >= 0]
             V = self.vpos[idx] if idx else np.zeros((0, 3))
-            self.verts[i] = V
+            self.verts[i] = self.pverts[i] = V
             self.nverts[i] = len(idx)
             self.cents[i] = V.mean(axis=0) if len(V) else np.zeros(3)
             self.areas[i] = face_area(f)
             n = face_plane_normal(f)
             self.planar[i] = n is not None
             self.norms[i] = n if n is not None else np.zeros(3)
+            fresh[i] = idx
 
         ef, _, e_faces = face_edges_map(shape)
         self.emap = ef
@@ -6272,6 +6277,154 @@ class Topo:
                 for b in range(a + 1, len(fs)):
                     self.adj[fs[a]].add(fs[b])
                     self.adj[fs[b]].add(fs[a])
+        for i, idx in fresh.items():
+            self.verts[i] = self._chord_verts(i, idx)
+
+    def _onward(self, a: int, v: int):
+        """The mesh's polyline at the chord's end a, coming from v: the
+        edge of a that goes on straightest, as (turning angle in radians,
+        unit direction), or None."""
+        pa = self.vpos[a]
+        d = pa - self.vpos[v]
+        n = float(np.linalg.norm(d))
+        if n <= 0.0:
+            return None
+        d /= n
+        best = None
+        for k in self.v_edges.get(a, ()):
+            x, y = self.e_verts[k]
+            w = y if x == a else x
+            if w == v:
+                continue
+            e = self.vpos[w] - pa
+            m = float(np.linalg.norm(e))
+            if m <= 0.0:
+                continue
+            e = e / m
+            ang = math.acos(max(-1.0, min(1.0, float(e @ d))))
+            if best is None or ang < best[0]:
+                best = (ang, e)
+        return best
+
+    def _chord_verts(self, i: int, idx: List[int]) -> np.ndarray:
+        """
+        The vertices a facet is CHECKED and FITTED with (verts): its own,
+        except the ones that only sit on a chord of the mesh. pverts keeps
+        the facet as it is.
+
+        ⚠️ A T-VERTEX IS NOT A SAMPLE OF THE SURFACE. Where two faces of the
+        CAD meet, some exporters tessellate the shared edge twice (each
+        face its own steps) and make the mesh conform by dropping one
+        side's points onto the other side's chords: test16's handle, a r4
+        round along its edge, has every one of its 55 mm strips ending on
+        such a point, 0.005-0.012 mm inside the round (the 9-degree chord's
+        sag) - a facet with a vertex there looked off its own cylinder by
+        six times the tolerance, and the seeds' least squares, on points
+        alternating between the round and its chords, found r 3.5 for r 4:
+        the round came out as 13 planes and 2 wrong cylinders. Such a
+        vertex is on the straight line from one of the facet's sides to
+        the next vertex of the mesh, within a float rounding (504 of them on
+        test16, all within half a float step, then a gap): here it is
+        replaced by that next vertex - the chord's far end, a true sample
+        of the edge; where the facet only touches the chord at that vertex
+        (the strips' other ends, on the round's border with the blend at
+        the handle's root), by the chord's two ends. A vertex on the line
+        between two of the facet's own vertices is left out (nothing in it
+        the other two don't say). Only planar facets: a surface face's
+        vertices are its own.
+        ⚠️ THE FACET'S SHAPE IS STILL ITS OWN. The side midpoints the growth
+        measures the sag on (face_tol, sag_points) run along the chords -
+        on test16's strips that is what lets the round grow (with the
+        facet's own polygon, 1,256 faces instead of 813) - but the regions'
+        last check (region_sag) measures a free-form patch on the facets as
+        they are: on the chords test15's thread patch, 5,700 facets, sagged
+        6.3e-3 its facets don't have and was refused (545 faces -> 809).
+        """
+        V = self.vpos[idx] if idx else np.zeros((0, 3))
+        if len(idx) < 3 or not self.planar.get(i, False):
+            return V
+        nb: Dict[int, List[int]] = defaultdict(list)
+        for k in self.f_edges[i]:
+            a, b = self.e_verts[k]
+            if a != b:
+                nb[a].append(b)
+                nb[b].append(a)
+        own = set(idx)
+        # (the tolerance the phases will use, as run_phase sets it)
+        if self._tol_v is None:
+            self._tol_v = max(2e-4, 1e-5 * float(np.linalg.norm(self.vpos.max(axis=0) - self.vpos.min(axis=0)))) if len(self.vpos) else 2e-4
+        tol_v = self._tol_v
+        rows: List[np.ndarray] = []
+        changed = False
+        for v in idx:
+            pv = self.vpos[v]
+            ends = [y if x == v else x for x, y in (self.e_verts[k] for k in self.v_edges.get(v, ()))]
+            ends = [a for a in dict.fromkeys(ends) if a != v]
+            hit = None
+            for qa in range(len(ends)):
+                for qb in range(qa + 1, len(ends)):
+                    a, b = ends[qa], ends[qb]
+                    pa, pb = self.vpos[a], self.vpos[b]
+                    ab = pa - pb
+                    L2 = float(ab @ ab)
+                    if L2 <= 0.0:
+                        continue
+                    t = float((pv - pb) @ ab) / L2
+                    if not 0.0 < t < 1.0:
+                        continue
+                    if float(np.linalg.norm(np.cross(pv - pb, ab))) > 4.0 * coord_eps(float(np.abs(np.stack((pa, pb, pv))).max())) * math.sqrt(L2):
+                        continue
+                    # (the pair along one of the facet's own sides first)
+                    if hit is None or (a in nb.get(v, ()) or b in nb.get(v, ())):
+                        hit = (a, b)
+                    if a in nb.get(v, ()) or b in nb.get(v, ()):
+                        break
+                if hit is not None and (hit[0] in nb.get(v, ()) or hit[1] in nb.get(v, ())):
+                    break
+            # ⚠️ ONLY ON A CHORD OF A CURVE: on a straight edge of the CAD
+            # (a plane's side, a cylinder's generator) the vertex is ON the
+            # surface like the others, and leaving it out only moved the
+            # fits - test11's 45-degree chamfer came out at 44.5. The edge's
+            # polyline has to bend at both ends of the chord as an arc's does
+            # (the same way, by alike angles, no wider than 30 degrees: a
+            # plane's corner bends any way at all) - and by enough: on a
+            # chord of an arc that turns phi at its ends the vertex is off
+            # the arc by about L*phi/8 * 4t(1-t) (t its place along the
+            # chord); within the tolerance it is as good a sample as the
+            # others, and replacing it only moved the fits again (test4: a
+            # B-spline corner in 20 little cylinders, 49 faces -> 87).
+            if hit is not None:
+                pa, pb = self.vpos[hit[0]], self.vpos[hit[1]]
+                L = float(np.linalg.norm(pa - pb))
+                t = float(np.linalg.norm(pv - pb)) / max(L, 1e-30)
+                oa, ob = self._onward(hit[0], v), self._onward(hit[1], v)
+                arc = oa is not None and ob is not None
+                if arc:
+                    u = (pa - pb) / max(L, 1e-30)
+                    lo, hi = sorted((oa[0], ob[0]))
+                    arc = math.radians(0.5) < lo and hi < math.radians(30.0) and hi < 3.0 * lo and float(np.cross(u, oa[1]) @ np.cross(-ob[1], u)) > 0.0
+                if not arc or 0.25 * L * (oa[0] + ob[0]) * t * (1.0 - t) <= tol_v:
+                    hit = None
+            if hit is None:
+                rows.append(pv)
+                continue
+            changed = True
+            a, b = hit
+            if b in nb.get(v, ()) or a in nb.get(v, ()):
+                far = a if b in nb.get(v, ()) else b
+                if far not in own:
+                    rows.append(self.vpos[far])
+                # (on the line between two of its own vertices: nothing to add)
+                continue
+            # the facet touches the chord at this vertex only: its two ends
+            prev = rows[-1] if rows else self.vpos[idx[-1]]
+            pa, pb = self.vpos[a], self.vpos[b]
+            if float(np.linalg.norm(pb - prev)) < float(np.linalg.norm(pa - prev)):
+                pa, pb = pb, pa
+            rows.extend((pa, pb))
+        if not changed or len(rows) < 3:
+            return V
+        return np.array(rows)
 
     # ⚠️ INCREMENTAL UPDATE. The rebuild above walks the WHOLE shape: on a
     # 108k-triangle part (77k faces after phase A) it's 3.5 s, and phase C
@@ -6343,13 +6496,14 @@ class Topo:
             te_MapShapes(f, TopAbs_VERTEX, m)
             idx = [j for j in (self.vmap.FindIndex(m.FindKey(q)) - 1 for q in range(1, _size(m) + 1)) if j >= 0]
             V = self.vpos[idx] if idx else np.zeros((0, 3))
-            self.verts[i] = V
+            self.pverts[i] = V
             self.nverts[i] = len(idx)
             self.cents[i] = V.mean(axis=0) if len(V) else np.zeros(3)
             self.areas[i] = face_area(f)
             n = face_plane_normal(f)
             self.planar[i] = n is not None
             self.norms[i] = n if n is not None else np.zeros(3)
+            self.verts[i] = self._chord_verts(i, idx)
             for k in self.f_edges[i]:
                 for j in self.e_faces[k]:
                     if j != i:
@@ -6384,7 +6538,7 @@ class Topo:
         last = self.nF - 1
         if i != last:
             self.faces[i] = self.faces[last]
-            for d in (self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar):
+            for d in (self.verts, self.pverts, self.cents, self.norms, self.areas, self.nverts, self.planar):
                 d[i] = d[last]
             for k in self.f_edges[last]:
                 self.e_faces[k] = sorted(i if x == last else x for x in self.e_faces[k])
@@ -6393,7 +6547,7 @@ class Topo:
                 self.adj[j].discard(last)
                 self.adj[j].add(i)
             self.adj[i] = self.adj[last]
-        for d in (self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar):
+        for d in (self.verts, self.pverts, self.cents, self.norms, self.areas, self.nverts, self.planar):
             d.pop(last, None)
         self.fmap.RemoveFromIndex(i + 1)
         self.faces.pop()
@@ -6661,10 +6815,22 @@ def chord_depth(prim: "Prim", V: np.ndarray, tol: float) -> Optional[float]:
 
 
 def region_sag(prim: "Prim", topo: Topo, faces: List[int]) -> float:
-    """Sag: max distance between the facets' INTERIOR points and the surface."""
+    """
+    Sag: max distance between the facets' INTERIOR points and the surface.
+
+    ⚠️ ON THE CHORDS FOR AN ANALYTIC SURFACE, ON THE FACET AS IT IS FOR A
+    FREE-FORM ONE (see Topo._chord_verts: verts / pverts). test16's r4
+    round strips, measured as they are, sag from their T-vertex 0.012
+    inside the round and were refused (1,136 faces instead of 813); test15's
+    thread patch, a 5,700-facet B-spline, measured on the chords sagged
+    6.3e-3 its facets don't have (809 faces instead of 545). Taking the
+    smaller of the two everywhere let test16 keep regions that then stood
+    in the way of better ones (1,136 again).
+    """
     pts = []
+    src = getattr(topo, "pverts", topo.verts) if prim.kind == FREE else topo.verts
     for i in faces:
-        V = topo.verts[i]
+        V = src[i]
         if len(V) < 3:
             continue
         pts.append(V.mean(axis=0))
@@ -11368,7 +11534,7 @@ class TopoLite:
     """Only the topology fields the segmentation needs: numpy and lists,
     so it can be shipped to another process."""
 
-    __slots__ = ("nF", "verts", "cents", "norms", "areas", "nverts", "planar", "adj")
+    __slots__ = ("nF", "verts", "pverts", "cents", "norms", "areas", "nverts", "planar", "adj")
     # ⚠️ cents too: face_tol and _concave read it. Without it face_tol fell
     # into its except and returned the bare tol_fit IN EVERY WORKER - the
     # multi-process runs (the default) judged coarse facets more strictly
@@ -11379,6 +11545,7 @@ class TopoLite:
         n = topo.nF
         self.nF = n
         self.verts = [topo.verts[i] for i in range(n)]
+        self.pverts = [topo.pverts[i] for i in range(n)]
         self.cents = [topo.cents[i] for i in range(n)]
         self.norms = [topo.norms[i] for i in range(n)]
         self.areas = [topo.areas[i] for i in range(n)]
@@ -11678,7 +11845,16 @@ class SurfParam:
             Z = np.asarray(pole_axis, float)
             Z = Z / np.linalg.norm(Z)
             if ref is not None:
-                X = np.asarray(ref, float) - float(np.asarray(ref, float) @ Z) * Z
+                # ⚠️ THE SEAM BEHIND THE FACE, NOT THROUGH IT. u = 0 is
+                # where Geom_SphericalSurface's seam runs: with X on the
+                # region's middle every sphere face sat across it. In memory
+                # our own pcurves unwrap it; a STEP written without pcurves
+                # has the reader project the wires again, in [0, 2pi), and a
+                # cap with an island across the seam read back with wires
+                # crossing (test16: a 1.6 mm2 r2 corner, the only invalid
+                # face of the part). X opposite the region: the face sits
+                # around u = pi, nowhere near the seam.
+                X = -(np.asarray(ref, float) - float(np.asarray(ref, float) @ Z) * Z)
             else:
                 X = ortho_frame(Z)[0]
             if np.linalg.norm(X) < 1e-9:
@@ -14191,6 +14367,92 @@ def _arc_chains(topo: "Topo"):
     return out
 
 
+def _cusp_crossing(F_new, E_new) -> bool:
+    """
+    On a PLANAR face: does the new edge cross one of the edges ending at
+    (or next to) its ends, away from the vertex itself?
+
+    ⚠️ A CUSP OF TWO ARCS. At a corner of test16's rim the top face's
+    boundary closes in a needle between two arcs (r 7.5 and r 9.1) leaving
+    the same point almost tangent: as polylines they only touched there; as
+    circles, fitted each on its own chain, they crossed 0.02 mm further on -
+    within the vertex's grown tolerance for the check in memory, a
+    "SelfIntersectingWire" once read back from STEP (the only invalid face
+    of the part). Sampled in the plane, outside a small disc around the
+    vertex.
+    """
+    try:
+        ad = BRepAdaptor_Surface(F_new)
+        if ad.GetType() != GeomAbs_Plane:
+            return False
+        pl = ad.Plane()
+        o, X, Y = pl.Location(), pl.XAxis().Direction(), pl.YAxis().Direction()
+        O = np.array([o.X(), o.Y(), o.Z()])
+        Xv = np.array([X.X(), X.Y(), X.Z()])
+        Yv = np.array([Y.X(), Y.Y(), Y.Z()])
+
+        def pts(e, n=64):
+            c = BRepAdaptor_Curve(e)
+            a, b = c.FirstParameter(), c.LastParameter()
+            if c.GetType() == GeomAbs_Line:
+                t = np.array([a, b])
+            else:
+                # (dense near the ends, where a cusp crosses: test16's arcs
+                # crossed 0.02 mm from their vertex, inside the first of 64
+                # even steps)
+                f = np.logspace(-6.0, -1.0, 30)
+                t = np.unique(np.concatenate((np.linspace(a, b, n), a + f * (b - a), b - f * (b - a))))
+            P = np.array([[p.X(), p.Y(), p.Z()] for p in (c.Value(float(x)) for x in t)])
+            return np.c_[(P - O) @ Xv, (P - O) @ Yv]
+
+        ends = [te_FirstVertex(E_new), te_LastVertex(E_new)]
+        A = pts(E_new)
+        for e in explore(F_new, TopAbs_EDGE):
+            e = td_Edge(e)
+            if e.IsSame(E_new):
+                continue
+            # (the edges ending at the new one's ends - or next to them: on
+            # test16 a 1.4 micron edge sat between the two arcs)
+            near = []
+            for v in ends:
+                pv_ = vpos(v)
+                dmin = min(float(np.linalg.norm(vpos(w) - pv_)) for w in (te_FirstVertex(e), te_LastVertex(e)))
+                if dmin <= max(0.05, 20.0 * float(bt_Tolerance(v))):
+                    near.append((v, dmin))
+            if not near:
+                continue
+            B = pts(e)
+            for v, dmin in near:
+                q = vpos(v)
+                q = np.array([(q - O) @ Xv, (q - O) @ Yv])
+                # (the disc is how far the curves' own ends stand from the
+                # vertex, NOT the vertex's tolerance: in memory test16's had
+                # grown to 1.1e-2 and hid the crossing at 2.2e-2 from the
+                # check as well as from BRepCheck; the reader gives it back
+                # 1.3e-3)
+                gap = max(float(np.linalg.norm(A[[0, -1]] - q, axis=1).min()), float(np.linalg.norm(B[[0, -1]] - q, axis=1).min()))
+                r = 2.0 * gap + dmin + 1e-5
+                a_ = A[np.linalg.norm(A - q, axis=1) > r]
+                b_ = B[np.linalg.norm(B - q, axis=1) > r]
+                if len(a_) < 2 or len(b_) < 2:
+                    continue
+                for p0, p1 in zip(a_[:-1], a_[1:]):
+                    rr = p1 - p0
+                    s_ = b_[1:] - b_[:-1]
+                    den = rr[0] * s_[:, 1] - rr[1] * s_[:, 0]
+                    ok = np.abs(den) > 1e-18
+                    if not ok.any():
+                        continue
+                    w = b_[:-1] - p0
+                    tt = (w[:, 0] * s_[:, 1] - w[:, 1] * s_[:, 0]) / np.where(ok, den, 1.0)
+                    uu = (w[:, 0] * rr[1] - w[:, 1] * rr[0]) / np.where(ok, den, 1.0)
+                    if np.any(ok & (tt > 0.0) & (tt < 1.0) & (uu > 0.0) & (uu < 1.0)):
+                        return True
+    except Exception:
+        return False
+    return False
+
+
 def _arc_wire_anchor(F_new, E_new):
     """
     ([(u_prev, v_prev), ...], traversed forward) for E_new in the face's
@@ -14986,6 +15248,11 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
                 if not ok_f or abs(a_new - topo.areas[fi]) > crescent or a_new < 0.5 * topo.areas[fi]:
                     if Log.level <= 10:
                         Log.debug(f"  arc: {where}: face {fi} " + (f"area {topo.areas[fi]:.4f} -> {a_new:.4f} (crescent {crescent:.1e})" if ok_f else "invalid: " + ", ".join(check_detail(F_new, 3))))
+                    buono = False
+                    break
+                # (nor cross its neighbor past their shared vertex: see _cusp_crossing)
+                if _cusp_crossing(F_new, E):
+                    Log.debug(f"  arc: {where}: crosses a neighboring edge of face {fi} past their vertex")
                     buono = False
                     break
         if not buono:

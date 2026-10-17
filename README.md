@@ -161,6 +161,18 @@ are reported but left in.
   two rings, or whose seam finds no vertices in line on both rims, is converted in pieces around
   its axis, and torus strips found only late are merged once more at the end (`test17`: the boss
   wall, its rounded rim, the bore and the bowl; 1,730 → 940 faces).
+  Some exporters tessellate an edge shared by two faces twice, each face with its own steps, and
+  make the mesh conform by dropping one side's points onto the other side's chords: those
+  T-vertices lie on a straight line between two neighbours, inside the curve by the chord's sag.
+  Where that line is the chord of an arc (the polyline bends the same way at both its ends) and the
+  vertex stands off the arc by more than the tolerance, the fits and the vertex checks take the
+  chord's far end in its place; the facet's own shape is still used to measure a free-form patch's
+  sag (`test16`: the r 4 round along the handle, 55 mm strips all ending on such points, was 13
+  planes and 2 cylinders of the wrong radius, now one face; 1,202 → 813 faces. `test15`: 545 → 390,
+  `test17`: 940 → 931). A sphere's seam is put behind the face rather than through its middle, and
+  an arc that would cross a neighbouring edge just past their shared vertex - a needle between two
+  nearly tangent arcs, hidden in memory by the vertex's tolerance - is left a polyline: both came
+  back invalid from the STEP file.
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
