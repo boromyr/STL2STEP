@@ -9361,6 +9361,7 @@ class Segmenter:
                 pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
             if pr is None:
                 Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)}: no B-spline holds on its {len(faces)} facets ({len(dentro)} regions, {len(dentro_f)} fragments)")
+                extra += self._loose_patches(m, owner, regions, extra)
                 continue
             drop |= set(dentro)
             busy = {i for k, R in enumerate(regions) if k not in drop for i in R.faces}
@@ -9371,6 +9372,45 @@ class Segmenter:
             return regions
         Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
         return [R for k, R in enumerate(regions) if k not in drop] + extra
+
+    def _loose_patches(self, m, owner, regions, extra) -> list:
+        """
+        ⚠️ WHEN THE SECTION IS TOO MUCH FOR ONE PATCH, ITS GAPS STILL CAN BE
+        PATCHED. Where test16's handle flares into the scoop, the smooth
+        section is 1,176 facets of 26 regions and 31 fragments - the r4
+        round along the outline in cylinders and tori, the flare's tori, the
+        r2 rounds on top - which no single B-spline holds, and everything
+        between the regions stayed loose triangles. Here each connected
+        group of the section's loose facets (the fragments the filters
+        dropped among them) gets a patch of its own, held to what the
+        regions around it sag, with the regions left as they are.
+        """
+        topo = self.topo
+        busy = {i for R in regions for i in R.faces} | {i for R in extra for i in R.faces}
+        loose = {int(i) for i in m if owner.get(int(i)) is None and int(i) not in busy and topo.verts[int(i)].size}
+        out = []
+        for G in _face_groups(loose, topo.adj):
+            if len(G) < 4 * self.min_faces:
+                Log.debug(f"  loose group at {np.round(np.mean([topo.cents[i] for i in G], axis=0), 2)}: {len(G)} facets, too few")
+                continue
+            G = sorted(G)
+            nbr = {owner[j] for i in G for j in topo.adj[i] if owner.get(j) is not None}
+            if not nbr:
+                continue
+            sag_ref = max(region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in nbr)
+            P = np.vstack([topo.verts[i] for i in G])
+            N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in G])
+            chk = sag_points(topo, G)
+            pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_ref + 2.0 * self.tol_fit, soft=chk)
+            if pr is None:
+                Log.debug(f"  loose group at {np.round(np.mean([topo.cents[i] for i in G], axis=0), 2)}: {len(G)} facets, no B-spline holds (sag ref {sag_ref:.1e})")
+                continue
+            busy |= set(G)
+            pr, G2 = self._grow_free(pr, G, busy, 2.0 * sag_ref + 2.0 * self.tol_fit)
+            busy |= set(G2)
+            Log.debug(f"  loose patch at {np.round(np.mean([topo.cents[i] for i in G2], axis=0), 2)}: {len(G2)} facets between {len(nbr)} regions")
+            out.append(describe_region(pr, topo, G2))
+        return out
 
     def _tube_patches(self, regions):
         """
