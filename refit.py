@@ -562,6 +562,7 @@ import os
 import sys
 import time
 import types
+import warnings
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -4396,6 +4397,191 @@ def fit_tube(
     return None
 
 
+def lscm_uv(P: np.ndarray, T: np.ndarray) -> Optional[np.ndarray]:
+    """
+    (u, v) for every point of a triangulated patch (P: points, T:
+    triangles as index triples), least-squares conformal (Levy et al.,
+    2002): every triangle mapped to the plane as close to a similarity as
+    the others let it, two far-apart points pinned at their distance - so
+    the lengths stay about lengths. Slivers (a fan over a T-vertex on a
+    chord) are left out. None if the system can't be solved.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import spsolve
+
+    n = len(P)
+    if n < 4 or len(T) < 2:
+        return None
+    c = P.mean(axis=0)
+    a = int(np.argmax(np.linalg.norm(P - c, axis=1)))
+    b = int(np.argmax(np.linalg.norm(P - P[a], axis=1)))
+    L = float(np.linalg.norm(P[b] - P[a]))
+    if a == b or L <= 0.0:
+        return None
+    rows, cols, vals = [], [], []
+    r = 0
+    for t in T:
+        p0, p1, p2 = P[t[0]], P[t[1]], P[t[2]]
+        e1 = p1 - p0
+        l1 = float(np.linalg.norm(e1))
+        nrm = np.cross(e1, p2 - p0)
+        A2 = float(np.linalg.norm(nrm))
+        if l1 <= 0.0 or A2 <= 1e-6 * l1 * l1:
+            continue
+        e1 /= l1
+        e2 = np.cross(nrm / A2, e1)
+        x = [0.0, l1, float((p2 - p0) @ e1)]
+        y = [0.0, 0.0, float((p2 - p0) @ e2)]
+        s_ = 1.0 / math.sqrt(A2)
+        for j in range(3):
+            k, l = (j + 1) % 3, (j + 2) % 3
+            wr, wi = (x[l] - x[k]) * s_, (y[l] - y[k]) * s_
+            # real part: wr*u - wi*v ; imaginary part: wi*u + wr*v
+            rows += [r, r, r + 1, r + 1]
+            cols += [t[j], n + t[j], t[j], n + t[j]]
+            vals += [wr, -wi, wi, wr]
+        r += 2
+    if r == 0:
+        return None
+    M = coo_matrix((vals, (rows, cols)), shape=(r, 2 * n)).tocsc()
+    pin = [a, n + a, b, n + b]
+    pv = np.array([0.0, 0.0, L, 0.0])
+    free = np.setdiff1d(np.arange(2 * n), pin)
+    Mf, Mp = M[:, free], M[:, pin]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sol = spsolve((Mf.T @ Mf).tocsc(), Mf.T @ (-(Mp @ pv)))
+    except Exception:
+        return None
+    if not np.all(np.isfinite(sol)):
+        return None
+    z = np.zeros(2 * n)
+    z[free] = sol
+    z[pin] = pv
+    UV = np.c_[z[:n], z[n:]]
+    # (a point no triangle holds goes anywhere: the map is no good then)
+    if float(np.ptp(UV, axis=0).max()) > 4.0 * float(np.ptp(P, axis=0).max()) + 1e-9:
+        return None
+    return UV
+
+
+def fit_fill(
+    P: np.ndarray,
+    T: np.ndarray,
+    Nrep: np.ndarray,
+    data: np.ndarray,
+    tol: float,
+    check: np.ndarray,
+    check_tol: float,
+    max_poles: int = 1600,
+) -> Optional[Prim]:
+    """
+    ⚠️ BETWEEN THE ROUNDS THERE ARE PATCHES NO QUADRIC AND NO HEIGHT FIELD
+    HOLDS. Where test16's handle flares into the scoop, the r4 rounds along
+    the handle and the r2 rounds along the rim meet, and the CAD fills the
+    corners between them with patches of its own - free-form, folding over
+    90 degrees, bounded by a dozen pieces of round. Their facets don't lie
+    on any neighbour (the best one misses by 2.5e-2 at the median) and one
+    B-spline over the whole group can't follow the curvature jumping from
+    1/2 to 1/4 to 0 across it. Here a piece of such a group (P: points, T:
+    triangles, data: which points are the CAD's - not a T-vertex on a
+    chord) is filled the way a plate is: flattened (onto its mean plane,
+    or conformally - lscm_uv - when it folds too much for that), a coarse
+    4x4 spline through the points, the rest a polyharmonic interpolation
+    (r^5, smooth enough at its centres for a cubic B-spline to follow;
+    r^2 log r - the thin plate - has a log singularity there and wants
+    40x40 poles for 60 facets), and that surface sampled densely near the
+    data and fitted by the sparsest B-spline that keeps the points within
+    tol, the facets' inner points (check) within check_tol and the normals
+    with the facets. None if no grid up to max_poles does.
+    """
+    from scipy.interpolate import RBFInterpolator
+    from scipy.spatial import cKDTree
+
+    if len(P) < 5 or int(np.count_nonzero(data)) < 5:
+        return None
+    n0 = Nrep.mean(axis=0)
+    nn = float(np.linalg.norm(n0))
+    UV = None
+    if nn > 1e-9:
+        n0 = n0 / nn
+        if float((Nrep @ n0).min()) > 0.3:
+            e1 = np.cross(n0, [1.0, 0.0, 0.0] if abs(n0[0]) < 0.9 else [0.0, 1.0, 0.0])
+            e1 /= np.linalg.norm(e1)
+            e2 = np.cross(n0, e1)
+            UV = np.c_[(P - P.mean(axis=0)) @ e1, (P - P.mean(axis=0)) @ e2]
+    if UV is None:
+        UV = lscm_uv(P, T)
+    if UV is None:
+        return None
+    uu, vv = UV[:, 0], UV[:, 1]
+    eu, ev = float(np.ptp(uu)), float(np.ptp(vv))
+    E = np.r_[T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]
+    el = float(np.median(np.linalg.norm(UV[E[:, 0]] - UV[E[:, 1]], axis=1)))
+    if min(eu, ev) <= 1e-9 or el <= 1e-9:
+        return None
+    mu, mv = 0.05 * eu + el, 0.05 * ev + el
+    u0, u1, v0, v1 = uu.min() - mu, uu.max() + mu, vv.min() - mv, vv.max() + mv
+    if (u1 - u0) * (v1 - v0) / (0.4 * el) ** 2 > 2e5:
+        return None
+    D = np.asarray(data, bool)
+    Pd, UVd = P[D], UV[D]
+
+    def lsq(nu, nv, lam, u_, v_, ku, kv, X):
+        Bu = _bs_basis(u_, ku, nu)
+        Bv = _bs_basis(v_, kv, nv)
+        A = (Bu[:, :, None] * Bv[:, None, :]).reshape(len(u_), -1)
+        Du = np.kron(_d2_matrix(nu), np.eye(nv))
+        Dv = np.kron(np.eye(nu), _d2_matrix(nv))
+        M = np.vstack([A, math.sqrt(lam) * Du, math.sqrt(lam) * Dv])
+        rhs = np.vstack([X, np.zeros((Du.shape[0] + Dv.shape[0], 3))])
+        return np.linalg.lstsq(M, rhs, rcond=None)[0].reshape(nu, nv, 3)
+
+    ku0, kv0 = _bs_knots(u0, u1, 4), _bs_knots(v0, v1, 4)
+    try:
+        S0 = SplineSurf(lsq(4, 4, 1e-4, UVd[:, 0], UVd[:, 1], ku0, kv0, Pd), ku0, kv0, local=True)
+        corr = RBFInterpolator(UVd, Pd - S0.point(UVd[:, 0], UVd[:, 1]), kernel="quintic", degree=2)
+    except Exception:
+        return None
+    h = 0.4 * el
+    GU, GV = np.meshgrid(np.arange(u0, u1 + h, h), np.arange(v0, v1 + h, h), indexing="ij")
+    GU, GV = GU.ravel(), GV.ravel()
+    dg, _ = cKDTree(UV).query(np.c_[GU, GV])
+    near = dg <= 1.5 * el
+    GU, GV = GU[near], GV[near]
+    X = S0.point(GU, GV) + corr(np.c_[GU, GV])
+    GU, GV, X = np.r_[GU, UVd[:, 0]], np.r_[GV, UVd[:, 1]], np.vstack([X, Pd])
+    Nd = Nrep[D]
+    for k in (3.0, 2.0, 1.5, 1.0, 0.7, 0.5, 0.35, 0.25):
+        nu = max(4, int(round(eu / (k * el))) + _BS_DEG)
+        nv = max(4, int(round(ev / (k * el))) + _BS_DEG)
+        if nu * nv > max_poles or nu * nv > len(X):
+            break
+        ku, kv = _bs_knots(u0, u1, nu), _bs_knots(v0, v1, nv)
+        try:
+            S = SplineSurf(lsq(nu, nv, 1e-6, GU, GV, ku, kv, X), ku, kv, local=True)
+            dv = np.abs(S.dist(Pd))
+        except Exception:
+            continue
+        if float(dv.max()) > tol:
+            continue
+        if len(check) and float(np.abs(S.dist(check)).max()) > check_tol:
+            continue
+        nd = np.einsum("ij,ij->i", S.normal_at(Pd), Nd)
+        if nd.sum() < 0.0:
+            # (the side the facets face: Su x Sv the other way round, the
+            # u and v of the poles swapped)
+            S = SplineSurf(np.transpose(S.poles, (1, 0, 2)).copy(), kv, ku, local=True)
+            nd = -nd
+        if float(nd.min()) < 0.5:
+            continue
+        pr = Prim(FREE, Pd.mean(axis=0), n0 if nn > 1e-9 else Nd.mean(axis=0), 0.0, 0.0, 0.0, float(np.sqrt(np.mean(dv**2))))
+        pr.free = S
+        return pr
+    return None
+
+
 def _pt_tri_dist(Q: np.ndarray, T: np.ndarray, J: np.ndarray) -> np.ndarray:
     """Distance of each point Q[i] from the nearest of the triangles T[J[i]]
     (exact point-to-triangle distance)."""
@@ -6951,6 +7137,35 @@ def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
     return R
 
 
+def _refill(eng, R: Region, min_faces: int, is_b: bool, out: List[Region], depth: int = 0) -> Tuple[int, int]:
+    """
+    A filled piece the engine refused, cut in two and each half filled
+    again (PatchFiller.pieces) on the engine's own facets, converted at once;
+    a half refused in turn is cut again, three times at most. The pieces go
+    to out. (pieces converted, pieces tried)
+    """
+    topo = eng.topo
+    rf = [topo.face_index(f) for f in R.fobjs]
+    if any(i < 0 for i in rf) or len(rf) < 2 * min_faces or depth > 2:
+        return 0, 0
+    ctol, cap = R.prim.fill
+    n_ok = n_try = 0
+    for pr, G in PatchFiller(topo, eng.tol_fit, min_faces).pieces(rf, ctol, cap, whole=False):
+        Q = describe_region(pr, topo, G)
+        Q.fobjs = [topo.faces[i] for i in G]
+        Q.repeated = R.repeated
+        Q.note = "piece of a refused filled patch"
+        n_try += 1
+        if eng.convert(Q, strict_hole=is_b)[0]:
+            n_ok += 1
+        else:
+            a, b = _refill(eng, Q, min_faces, is_b, out, depth + 1)
+            n_ok += a
+            n_try += b
+        out.append(Q)
+    return n_ok, n_try
+
+
 def angular_pieces(R: Region, topo: Topo, min_faces: int, n: int = 2) -> List[Region]:
     """
     ⚠️ ALMOST ROUND IS NOT A REASON TO STAY TESSELLATED. test17's bore
@@ -7008,6 +7223,153 @@ def prim_radius(p: "Prim") -> float:
     if p.kind == TORUS:
         return float(p.r0 + p.r1)
     return float(abs(p.r0))
+
+
+class PatchFiller:
+    """
+    The filled patches (fit_fill) of a group of facets: cut into pieces
+    until each holds, each piece's boundary checked as the engine will trim
+    it. Used by the segmentation on the loose groups (_fill_late) and by
+    run_phase on a filled piece the engine still refused.
+    """
+
+    def __init__(self, topo, tol_fit: float, min_faces: int):
+        self.topo = topo
+        self.tol_fit = tol_fit
+        self.min_faces = min_faces
+
+    def triangles(self, G):
+        """(points, triangles, one normal per point, mesh vertex ids) of a
+        group of facets, each polygon walked along its own edges and cut
+        into a fan turning the facet's way; None if a polygon doesn't
+        close."""
+        topo = self.topo
+        vid: Dict[int, int] = {}
+        T, N = [], {}
+        for i in G:
+            nb: Dict[int, List[int]] = defaultdict(list)
+            for k in topo.f_edges[i]:
+                a, b = topo.e_verts[k]
+                if a != b:
+                    nb[a].append(b)
+                    nb[b].append(a)
+            if not nb or any(len(x) != 2 for x in nb.values()):
+                return None
+            start = next(iter(nb))
+            loop, prev, cur = [start], None, start
+            while True:
+                nxt = nb[cur][0] if nb[cur][0] != prev else nb[cur][1]
+                if nxt == start:
+                    break
+                loop.append(nxt)
+                prev, cur = cur, nxt
+                if len(loop) > len(nb):
+                    return None
+            if len(loop) != len(nb) or len(loop) < 3:
+                return None
+            Q = topo.vpos[np.array(loop)]
+            if float(np.cross(Q[1:] - Q[0], np.roll(Q[1:], -1, axis=0) - Q[0])[:-1].sum(axis=0) @ topo.norms[i]) < 0.0:
+                loop = loop[::-1]
+            ids = [vid.setdefault(v, len(vid)) for v in loop]
+            for q in range(1, len(ids) - 1):
+                T.append((ids[0], ids[q], ids[q + 1]))
+            for v in loop:
+                N.setdefault(vid[v], []).append(topo.norms[i])
+        order = sorted(vid, key=lambda v: vid[v])
+        Pv = topo.vpos[np.array(order)]
+        Nv = np.array([np.mean(N[vid[v]], axis=0) for v in order])
+        Nv /= np.maximum(np.linalg.norm(Nv, axis=1), 1e-300)[:, None]
+        return Pv, np.array(T, int), Nv, order
+
+    def bounds_ok(self, G, S) -> bool:
+        """
+        ⚠️ A PIECE THE ENGINE CAN'T TRIM IS WORSE THAN NO PIECE. On test15
+        two small pieces came back from the engine touching themselves at a
+        vertex:
+        the facets stayed loose, and the second Phase C, seeing another
+        part, went another way. A piece is kept only if its boundary closes
+        in loops that don't touch, each a simple polygon on the surface and
+        none crossing another; otherwise it is cut again.
+        """
+        topo = self.topo
+        loops, _ = Engine.region_loops(types.SimpleNamespace(topo=topo), list(G))
+        if not loops:
+            return False
+        seqs, seen = [], set()
+        for L in loops:
+            vs = []
+            for ch in L.chains:
+                for v in ch.verts:
+                    if not vs or vs[-1] != v:
+                        vs.append(v)
+            if len(vs) > 1 and vs[0] == vs[-1]:
+                vs.pop()
+            if len(vs) < 3 or len(set(vs)) < len(vs) or seen & set(vs):
+                return False
+            seen |= set(vs)
+            u, v = S.uv(topo.vpos[np.array(vs)])
+            seqs.append(np.c_[u, v])
+        A = np.vstack([q for q in seqs])
+        B = np.vstack([np.roll(q, -1, axis=0) for q in seqs])
+        n = len(A)
+        lid = np.concatenate([np.full(len(q), k) for k, q in enumerate(seqs)])
+        pos = np.concatenate([np.arange(len(q)) for q in seqs])
+        ln = np.array([len(q) for q in seqs])[lid]
+
+        def orient(P, Q, R):
+            return (Q[..., 0] - P[..., 0]) * (R[..., 1] - P[..., 1]) - (Q[..., 1] - P[..., 1]) * (R[..., 0] - P[..., 0])
+
+        for i in range(n):
+            j = np.arange(i + 1, n)
+            # (the two sides of a vertex share it: not a crossing)
+            same = lid[j] == lid[i]
+            adj_ = same & ((pos[j] == (pos[i] + 1) % ln[i]) | ((pos[j] + 1) % ln[i] == pos[i]))
+            j = j[~adj_]
+            if not len(j):
+                continue
+            d1 = orient(A[i], B[i], A[j])
+            d2 = orient(A[i], B[i], B[j])
+            d3 = orient(A[j], B[j], A[i][None, :])
+            d4 = orient(A[j], B[j], B[i][None, :])
+            if np.any((d1 * d2 < 0.0) & (d3 * d4 < 0.0)):
+                return False
+        return True
+
+    def pieces(self, G, check_tol: float, sag_cap: Optional[float] = None, depth: int = 0, whole: bool = True) -> list:
+        """
+        [(prim, facets)] covering what fit_fill can of a group of facets:
+        the whole group if it holds (and whole), otherwise the group cut in
+        two across its longest direction (at the median of the facets'
+        centres) and each connected half tried again, down to pieces of
+        min_faces facets. Every prim keeps (check_tol, sag_cap) as .fill.
+        """
+        topo = self.topo
+        G = sorted(G)
+        if len(G) < self.min_faces:
+            return []
+        tri = self.triangles(G) if whole else None
+        if tri is not None:
+            Pv, Tv, Nv, order = tri
+            # (the CAD's points: not a T-vertex left on a chord - see Topo._chord_verts)
+            own = {tuple(np.round(q, 9)) for i in G for q in topo.verts[i]}
+            data = np.array([tuple(np.round(q, 9)) in own for q in Pv])
+            pr = fit_fill(Pv, Tv, Nv, data, self.tol_fit, sag_points(topo, G), check_tol)
+            if pr is not None and (sag_cap is None or region_sag(pr, topo, G) <= sag_cap) and self.bounds_ok(G, pr.free):
+                pr.fill = (check_tol, sag_cap)
+                return [(pr, G)]
+        if len(G) < 2 * self.min_faces or depth > 6:
+            return []
+        C = np.array([topo.cents[i] for i in G])
+        w = np.array([topo.areas[i] for i in G])
+        c = (C * w[:, None]).sum(axis=0) / max(float(w.sum()), 1e-300)
+        ax = np.linalg.svd((C - c) * np.sqrt(w)[:, None], full_matrices=False)[2][0]
+        x = (C - c) @ ax
+        m = float(np.median(x))
+        out = []
+        for half in ({i for i, t in zip(G, x) if t <= m}, {i for i, t in zip(G, x) if t > m}):
+            for g in _face_groups(half, topo.adj):
+                out += self.pieces(g, check_tol, sag_cap, depth + 1)
+        return out
 
 
 class Segmenter:
@@ -8467,6 +8829,7 @@ class Segmenter:
         if n_strip:
             Log.debug(f"Wide strips on curved regions: {n_strip} loose facets taken in")
         regions = self._helical_bands(regions)
+        regions = self._fill_late(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
@@ -9232,6 +9595,7 @@ class Segmenter:
         doesn't fit, nothing is touched.
         """
         frags = list(frags or [])
+        self._fill_todo = []
         if not self.allow_free or len(regions) + len(frags) < self.blend_min:
             return regions
         topo = self.topo
@@ -9367,7 +9731,15 @@ class Segmenter:
             busy = {i for k, R in enumerate(regions) if k not in drop for i in R.faces}
             busy |= {i for R in extra for i in R.faces}
             pr, faces = self._grow_free(pr, faces, busy, 2.0 * sag_old + 2.0 * self.tol_fit)
-            extra.append(describe_region(pr, topo, faces))
+            R_ = describe_region(pr, topo, faces)
+            # ⚠️ AND IF THE ENGINE REFUSES IT, WHAT IT REPLACED. On test17's
+            # second Phase C a 147-facet section patch took the place of 9
+            # tori and cylinders and came back SelfIntersectingWire: all 147
+            # facets stayed mesh, where the rounds alone convert (809 -> 913
+            # faces). Its regions are converted after all, as a rejected
+            # swept face's are.
+            R_.fallback = [regions[q] for q in dentro]
+            extra.append(R_)
         if not extra:
             return regions
         Log.debug(f"Free-form patches: {len(extra)} sections (in place of {len(drop)} fragments)")
@@ -9390,19 +9762,25 @@ class Segmenter:
         loose = {int(i) for i in m if owner.get(int(i)) is None and int(i) not in busy and topo.verts[int(i)].size}
         out = []
         for G in _face_groups(loose, topo.adj):
-            if len(G) < 4 * self.min_faces:
-                Log.debug(f"  loose group at {np.round(np.mean([topo.cents[i] for i in G], axis=0), 2)}: {len(G)} facets, too few")
-                continue
             G = sorted(G)
             nbr = {owner[j] for i in G for j in topo.adj[i] if owner.get(j) is not None}
             if not nbr:
                 continue
             sag_ref = max(region_sag(regions[q].prim, topo, list(regions[q].faces)) for q in nbr)
+            if len(G) < 4 * self.min_faces:
+                # (too few for a B-spline of its own, not for a filled piece)
+                if len(G) >= self.min_faces:
+                    self._fill_todo.append((G, 2.0 * sag_ref + 2.0 * self.tol_fit))
+                Log.debug(f"  loose group at {np.round(np.mean([topo.cents[i] for i in G], axis=0), 2)}: {len(G)} facets, too few")
+                continue
             P = np.vstack([topo.verts[i] for i in G])
             N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in G])
             chk = sag_points(topo, G)
             pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_ref + 2.0 * self.tol_fit, soft=chk)
             if pr is None:
+                # (the corners between the rounds: filled at the very end, on
+                # what nothing else takes - see _fill_late)
+                self._fill_todo.append((list(G), 2.0 * sag_ref + 2.0 * self.tol_fit))
                 Log.debug(f"  loose group at {np.round(np.mean([topo.cents[i] for i in G], axis=0), 2)}: {len(G)} facets, no B-spline holds (sag ref {sag_ref:.1e})")
                 continue
             busy |= set(G)
@@ -9411,6 +9789,47 @@ class Segmenter:
             Log.debug(f"  loose patch at {np.round(np.mean([topo.cents[i] for i in G2], axis=0), 2)}: {len(G2)} facets between {len(nbr)} regions")
             out.append(describe_region(pr, topo, G2))
         return out
+
+    def _fill_late(self, regions):
+        """
+        ⚠️ FILLED LAST, OR THE REST CHANGES. The loose groups no B-spline
+        holds (_loose_patches) are filled only here, once the extruded bands,
+        the merges and the strips have taken what they take: filled where
+        they are found, on test16 they took a facet an exact r 18 region
+        would have grown into, its sag (0.044, the largest of the exact
+        ones) dropped out of the mesh's chord sag, the engine's cap fell
+        from 0.092 to 0.071 - and the r 18 tori and the r 20 cylinder of
+        the scoop, sagging 0.08, were refused (788 faces -> 861). Each group
+        is filled on its facets that are still loose, piece by piece.
+        """
+        todo = getattr(self, "_fill_todo", None) or []
+        if not todo:
+            return regions
+        topo = self.topo
+        # ⚠️ AND WITHIN THE ENGINE'S CAP ON THE SAG. The engine leaves out of a
+        # region the facets sagging below it deeper than the mesh's chords
+        # do (Engine.convert): out of test15's 173-facet piece it took 13,
+        # the piece came back with a hole in it - two wires the same way
+        # round, InvalidImbricationOfWires - and the whole of it stayed
+        # mesh (388 -> 402 faces). The cap is the one the engine will use
+        # (run_phase: the exact regions' sag, measured once), the sag the
+        # engine's own (region_sag).
+        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, self.tol_fit)
+        cap = None if ms is None else 2.0 * ms + 2.0 * self.tol_fit
+        owned = {i for R in regions for i in R.faces}
+        filler = PatchFiller(topo, self.tol_fit, self.min_faces)
+        n_p = n_f = 0
+        for G, ctol in todo:
+            free = {i for i in G if i not in owned and topo.verts[i].size}
+            for g in _face_groups(free, topo.adj):
+                for pr, G2 in filler.pieces(g, ctol, cap):
+                    regions.append(describe_region(pr, topo, G2))
+                    owned |= set(G2)
+                    n_p += 1
+                    n_f += len(G2)
+        if n_p:
+            Log.debug(f"Filled corners between the rounds: {n_p} patches on {n_f} loose facets")
+        return regions
 
     def _tube_patches(self, regions):
         """
@@ -15654,6 +16073,13 @@ def run_phase(
             # rims cut in 40 and 47 sides with no vertex in line: in two
             # pieces around the axis, see angular_pieces)
             split_now = "ambiguous angular coverage" in why or "region closed 360 degrees" in why or (round_ == 1 and R.closed_u and "seam" in why)
+            # (a filled piece the engine refused - a wire crossing itself once
+            # trimmed, test17's 147-facet corner - in two halves, each filled
+            # again and converted at once, down to min_faces facets)
+            if not ok and getattr(R.prim, "fill", None) is not None:
+                n_p, n_q = _refill(eng, R, min_faces, is_b, split_parts)
+                if n_q:
+                    Log.debug(f"  {R.label()} filled again in {n_q} pieces: {n_p} converted")
             if not ok and not is_b and split_now:
                 parts = angular_pieces(R, topo, min_faces)
                 if parts:
@@ -15676,7 +16102,7 @@ def run_phase(
             break
         pending = again
         Log.info(f"Second pass on {len(pending)} regions rejected for polygonal boundaries")
-    # a rejected swept face: what it had replaced, as it was
+    # a rejected swept face or free-form patch: what it had replaced, as it was
     backs = []
     for R in regions:
         if R.fallback and R.status.startswith("rejected"):

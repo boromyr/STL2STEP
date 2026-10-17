@@ -173,6 +173,18 @@ are reported but left in.
   an arc that would cross a neighbouring edge just past their shared vertex - a needle between two
   nearly tangent arcs, hidden in memory by the vertex's tolerance - is left a polyline: both came
   back invalid from the STEP file.
+  Where rounds of different radii meet (`test16`'s r 4 along the handle running into the r 2 along
+  the scoop's rim), the CAD fills the corners between them with patches of its own: free-form,
+  folding over 90°, bounded by a dozen pieces of round, their facets on none of their neighbours. A
+  group of loose facets no single B-spline holds is filled the way a plate is, once everything
+  else has taken its facets: flattened (onto its mean plane, or conformally when it folds), a
+  coarse spline through its vertices, the rest a polyharmonic interpolation (r⁵), sampled densely
+  and fitted by the sparsest B-spline keeping the vertices within the tolerance, the facets within
+  what the rounds around them sag and the engine's cap on the sag, and the normals with the
+  facets; a group that doesn't hold is cut in two across its length and each half tried again,
+  and a piece the engine still refuses is cut again there. A free-form patch over a whole smooth
+  section that the engine refuses gives way to the regions it had replaced (`test16`: 788 → 660
+  faces; `test17`: 866 → 733; `test15`: 388 → 390 faces, deviation from the mesh 0.014 → 0.010 mm).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
