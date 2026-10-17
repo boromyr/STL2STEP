@@ -68,6 +68,7 @@ button, input, select { font: inherit; color: inherit; }
 #gizmo { position: absolute; left: 14px; bottom: 14px; width: 96px; height: 96px; pointer-events: none; }
 
 #tip { position: absolute; pointer-events: none; background: rgba(15,17,21,.94); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 12.5px; display: none; white-space: nowrap; z-index: 5; }
+#pivot { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: #6fd65c; border: 2px solid #0f1115; pointer-events: none; display: none; z-index: 3; }
 #tip .k { color: var(--muted); }
 #tip .t { font-weight: 600; }
 #overlay { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--muted); background: rgba(18,20,24,.55); z-index: 4; }
@@ -217,6 +218,7 @@ table.stats tr.gap td { padding-top: 10px; }
     <div class="seg" id="logtoggle"><button id="logbtn" title="Log (L)">Log</button></div>
     <canvas id="gizmo" width="192" height="192"></canvas>
     <div id="tip"></div>
+    <div id="pivot"></div>
     <div id="overlay"><div class="spin"></div><div id="overlaytext">Loading…</div></div>
     <div id="drop">Drop an .stl or .step file</div>
     <section id="log">
@@ -354,7 +356,10 @@ cameraLight(0.5, 0.8, -0.4, 0.5);   // fill: lower right
 //    "right" side, so e.code === "ControlRight" never saw it;
 //  * free orbit (trackball: the part turns any way) or Z-up (turntable);
 //  * zoom toward the point under the cursor with no practical floor: the
-//    near plane follows the distance, so zooming in never clips the part.
+//    near plane follows the distance, so zooming in never clips the part;
+//  * rotate around the point of the part under the cursor when the rotation
+//    starts (as in Fusion 360): that point stays still on screen. Off the
+//    part, around the target as before.
 // Left = rotate, middle / right = pan, wheel = zoom.
 class CadControls {
   constructor(camera, el) {
@@ -368,6 +373,9 @@ class CadControls {
     this.keys = { alt: false, ctrl: false };
     this.last = null;                       // last pointer position
     this.pickPoint = null;                  // (clientX, clientY) -> Vector3 on the part, or null
+    this.onPivot = null;                    // (Vector3 | null) when a rotation starts / ends
+    this.pivot = new THREE.Vector3();
+    this._mode = null;                      // mode of the last move: a new "rotate" picks the pivot
     this._ray = new THREE.Raycaster();
     el.addEventListener("pointerdown", (e) => this._down(e));
     el.addEventListener("pointermove", (e) => this._move(e));
@@ -390,7 +398,28 @@ class CadControls {
     // ⚠️ preventDefault on Alt: in the desktop window a lone Alt would
     // otherwise activate the File / View / Help menu bar
     if (e.key === "Alt") { this.keys.alt = down; e.preventDefault(); }
-    else if (e.key === "Control") this.keys.ctrl = down;
+    else if (e.key === "Control") {
+      this.keys.ctrl = down;
+      if (!down && !this.drag) this._setMode(null);
+    }
+  }
+  _setMode(mode, x, y) {
+    if (mode === this._mode) return;
+    this._mode = mode;
+    if (mode === "rotate") this._startRotate(x, y);
+    else if (this.onPivot) this.onPivot(null);
+  }
+  _startRotate(x, y) {
+    const cam = this.camera;
+    const p = this.pickPoint ? this.pickPoint(x, y) : null;
+    if (!p) { this.pivot.copy(this.target); if (this.onPivot) this.onPivot(null); return; }
+    this.pivot.copy(p);
+    // bring the target to the pivot's depth on the same line of sight: the view
+    // doesn't move, and pan / zoom then go at the speed of the point under the cursor
+    const dir = cam.getWorldDirection(new THREE.Vector3());
+    const depth = p.clone().sub(cam.position).dot(dir);
+    if (depth > this.minDist) { this.target.copy(cam.position).addScaledVector(dir, depth); this.update(); }
+    if (this.onPivot) this.onPivot(p);
   }
   _down(e) {
     if (e.button === 0) this.drag = e.altKey ? "pan" : "rotate";
@@ -404,6 +433,7 @@ class CadControls {
   _up(e) {
     if (!this.drag) return;
     this.drag = null;
+    this._setMode(null);
     try { this.el.releasePointerCapture(e.pointerId); } catch {}
   }
   _move(e) {
@@ -417,6 +447,7 @@ class CadControls {
     const dx = p[0] - last[0], dy = p[1] - last[1];
     if (!dx && !dy) return;
     const mode = this.drag || (e.altKey ? "pan" : e.ctrlKey ? "rotate" : null);
+    this._setMode(mode, last[0], last[1]);   // the pivot is where the rotation started
     if (mode === "pan") this.pan(dx, dy);
     else if (mode === "rotate") this.rotate(dx, dy);
   }
@@ -428,24 +459,31 @@ class CadControls {
 
   rotate(dx, dy) {
     const cam = this.camera, h = this.el.clientHeight || 1;
-    const a = (2 * Math.PI * dx) / h, b = (2 * Math.PI * dy) / h;   // a full turn per view height
-    const off = cam.position.clone().sub(this.target);
+    const a = (2 * Math.PI * dx) / h;   // a full turn per view height
+    let b = (2 * Math.PI * dy) / h;
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
+    let q;
     if (this.free) {
       // trackball: around the SCREEN's vertical and horizontal axes
-      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
-      const right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
-      const q = new THREE.Quaternion().setFromAxisAngle(up, -a)
+      q = new THREE.Quaternion().setFromAxisAngle(up, -a)
         .multiply(new THREE.Quaternion().setFromAxisAngle(right, -b));
-      off.applyQuaternion(q);
       cam.up.copy(up.applyQuaternion(q));
     } else {
-      // turntable around world Z, never past the poles
-      const r = off.length();
-      const theta = Math.atan2(off.y, off.x) - a;
-      const phi = THREE.MathUtils.clamp(Math.acos(THREE.MathUtils.clamp(off.z / r, -1, 1)) - b, 1e-4, Math.PI - 1e-4);
-      off.set(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi));
+      // turntable: around world Z and the (horizontal) screen axis, never past the poles
+      const off = cam.position.clone().sub(this.target), r = off.length();
+      const phi = Math.acos(THREE.MathUtils.clamp(off.z / r, -1, 1));
+      // ⚠️ stop at 2e-3 rad from the poles, outside update()'s nudge (cos > 0.999999,
+      // ~1.4e-3 rad): inside it the nudge is as large as the camera's offset from
+      // the axis, the heading jumps and the pivot slides across the screen
+      b = phi - THREE.MathUtils.clamp(phi - b, 2e-3, Math.PI - 2e-3);
+      q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -a)
+        .multiply(new THREE.Quaternion().setFromAxisAngle(right, -b));
     }
-    cam.position.copy(this.target).add(off);
+    // camera and target turn together around the pivot, which stays put on screen
+    const P = this.pivot;
+    cam.position.sub(P).applyQuaternion(q).add(P);
+    this.target.sub(P).applyQuaternion(q).add(P);
     this.update();
   }
   pan(dx, dy) {
@@ -808,6 +846,15 @@ function hoverTick() {
   tip.style.top = Math.min(y, r.height - tip.offsetHeight - 8) + "px";
 }
 controls.pickPoint = (x, y) => pick({ clientX: x, clientY: y })?.point || null;
+let pivotAt = null;                       // the rotation's pivot, while one is on
+controls.onPivot = (p) => { pivotAt = p && p.clone(); if (!p) $("#pivot").style.display = "none"; };
+function pivotTick() {
+  if (!pivotAt) return;
+  const v = pivotAt.clone().project(camera), el = $("#pivot");
+  el.style.left = Math.round(((v.x + 1) / 2) * canvas.clientWidth) + "px";
+  el.style.top = Math.round(((1 - v.y) / 2) * canvas.clientHeight) + "px";
+  el.style.display = "block";
+}
 canvas.addEventListener("dblclick", (e) => {
   const hit = pick(e);
   if (hit) { controls.target.copy(hit.point); controls.update(); }
@@ -1082,8 +1129,13 @@ function drawGizmo() {
 }
 
 function loop() {
+  // ⚠️ the controls moved the camera since the last frame, but its matrices
+  // only refresh inside render(): without this, everything projected to the
+  // screen before it (pivot dot, section box) trails one frame and shakes
+  camera.updateMatrixWorld();
   hoverTick();
   secTick();
+  pivotTick();
   renderer.render(scene, camera);
   drawGizmo();
   requestAnimationFrame(loop);
