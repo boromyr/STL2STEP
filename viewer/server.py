@@ -4,7 +4,7 @@ viewer/server.py — local viewer for refit.py
 =============================================================================
 A small web app (Python standard library + three.js in the page) that:
 
-  * lists the .stl / .step files next to refit.py (or opens any other one),
+  * lists the .stl / .step files in test/ and next to refit.py (or opens any other one),
   * shows the input mesh and the converted STEP side by side (and the
     <name>_original.step CAD, when there is one), with the faces coloured by
     surface type, the B-Rep edges, the triangles still left from the mesh,
@@ -47,6 +47,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 REFIT = os.path.join(ROOT, "refit.py")
+TESTS = os.path.join(ROOT, "test")
 UPLOADS = os.path.join(ROOT, "viewer_uploads")
 EXTS = (".stl", ".step", ".stp")
 
@@ -444,7 +445,7 @@ def resolve(p):
 
 def list_files():
     out = []
-    for d in (ROOT, UPLOADS):
+    for d in (ROOT, TESTS, UPLOADS):
         if not os.path.isdir(d):
             continue
         for n in sorted(os.listdir(d), key=lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]):
@@ -600,7 +601,7 @@ class NativeApi:
         import webview
 
         kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
-        res = self._window.create_file_dialog(kind, directory=ROOT, allow_multiple=False,
+        res = self._window.create_file_dialog(kind, directory=TESTS if os.path.isdir(TESTS) else ROOT, allow_multiple=False,
                                              file_types=("Mesh / STEP (*.stl;*.step;*.stp)", "All files (*.*)"))
         if not res:
             return None

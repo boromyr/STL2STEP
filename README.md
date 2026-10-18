@@ -39,20 +39,20 @@ This runs the default phase sequence (`A C A(0.005) C A(0.005)`, see below) and 
 next to the input. A few of the bundled test meshes are a good first try:
 
 ```bash
-python refit.py test0.stl
+python refit.py test/test0.stl
 ```
 
 Then check the result against the input mesh:
 
 ```bash
-python tools/qa.py test0.stl test0.step
+python tools/qa.py test/test0.stl test/test0.step
 ```
 
 and, for the test files that ship with their original CAD (`test0`, `test4`, `test10`, `test12`,
 `test13`), compare face-by-face against the ground truth:
 
 ```bash
-python tools/cadcmp.py test0_original.step test0.step -v
+python tools/cadcmp.py test/test0_original.step test/test0.step -v
 ```
 
 See the docstring at the top of [`refit.py`](refit.py) for the full guide (every flag, how to read
@@ -62,7 +62,7 @@ the report, the final arc-snapping step).
 
 ```bash
 pip install pywebview
-python viewer/server.py              # or double-click viewer/Refit Viewer.pyw
+python viewer/server.py              # or double-click "Refit Viewer.pyw" in the repo root
 python viewer/server.py part.stl     # with part.stl already open
 ```
 
@@ -272,6 +272,7 @@ dropped before writing: the reader made a wire of its own out of one, and a 0.33
 ## Repository layout
 
 - [`refit.py`](refit.py) — the main tool, run directly from the repo root.
+- [`Refit Viewer.pyw`](Refit%20Viewer.pyw) — double-click launcher for the viewer (no console).
 - [`viewer/`](viewer) — the local viewer (`python viewer/server.py`, see above).
 - [`tools/`](tools) — QA, analysis and debug scripts, all run from the repo root
   (e.g. `python tools/qa.py ...`); each imports `refit.py` by locating it relative to its own path,
@@ -287,11 +288,11 @@ dropped before writing: the reader made a wire of its own out of one, and a 0.33
     in the output.
   - [`tools/cadcmp.py`](tools/cadcmp.py) — compares an output face by face with the CAD file the mesh
     came from: faces reproduced one to one, split or of the wrong type, radii and angles, mesh left
-    over, polylines where the CAD has a curve. `python tools/cadcmp.py test10_original.step test10.step -v`
+    over, polylines where the CAD has a curve. `python tools/cadcmp.py test/test10_original.step test/test10.step -v`
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
     used during development.
-- `test0.stl` … `test14.stl` — test meshes (`test0` the simplest). `test0`, `test4`, `test10`,
+- [`test/`](test) — `test0.stl` … `test18.stl`, the test meshes (`test0` the simplest). `test0`, `test4`, `test10`,
   `test12`, `test13` and `test14` come with the CAD file they were exported from
   (`testN_original.step`): the reference for `tools/cadcmp.py`. `test12` is the hardest one: 1,328
   CAD faces (169 free-form), six internal cavities. `test13` has rolling-ball fillets between two
