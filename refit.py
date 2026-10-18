@@ -1886,7 +1886,99 @@ def _read_back_check(shape, ri, base_bad: Set[int], defl: float, mended: bool = 
         _, _, ef = face_edges_map(ri)
         return (0, nfree - nfree0, 0), f"free edges {nfree0} -> {nfree}", {f for fs in ef if len(fs) == 1 for f in fs}
     bad = set(unmeshable_faces(ri, defl)) - base_bad
-    return (0, 0, len(bad)), (f"{len(bad)} faces that don't triangulate" if bad else ""), bad
+    # ⚠️ AND THE FACES THE READER WINDS ROUND TWICE. test17's boss rim, a
+    # torus all the way round with its seam slanting 0.29 radians from one
+    # rim's vertex to the other's (valid: a seam needn't be a parameter
+    # line), came back from the pcurve-less file with a strip covered
+    # twice, the reader's pcurves taking the long way round - triangles
+    # 2.5 mm off the torus, 0.47 mm off the part. A face going round its
+    # surface whose span passes the period (the slanted seam) is
+    # tessellated as read back: off its own surface, it gets its pcurves.
+    wrap = set()
+    for i, (fr, fs) in enumerate(zip(faces, explore(shape, TopAbs_FACE))):
+        fr = td_Face(fr)
+        try:
+            if face_surface_type(fr) == face_surface_type(fs) and _wide_periodic(fr) and _face_strays(fr, defl):
+                wrap.add(i)
+        except Exception:
+            continue
+    bad |= wrap
+    why = ", ".join(x for x in ((f"{len(bad - wrap)} faces that don't triangulate" if bad - wrap else ""), (f"{len(wrap)} covering part of their surface twice" if wrap else "")) if x)
+    return (0, 0, len(bad)), why, bad
+
+
+def _shift_to_vertices(f, e, ua: float, ub: float) -> Optional[int]:
+    """Whole periods k to add to a new edge's pcurve (from ua to ub in u) so
+    its ends land where the edges face f already has at the same vertices
+    have theirs (see Engine._pcurve_on_neighbor); None if no edge of f
+    reaches either vertex."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve2d
+
+    ends = []
+    for v, u in ((te_FirstVertex(e), ua), (te_LastVertex(e), ub)):
+        pv = _st(BRep_Tool, "Pnt")(v)
+        cands = []
+        for g in explore(f, TopAbs_EDGE):
+            g = td_Edge(g)
+            if not (te_FirstVertex(g).IsSame(v) or te_LastVertex(g).IsSame(v)):
+                continue
+            try:
+                c = BRepAdaptor_Curve2d(g, f)
+                cg = BRepAdaptor_Curve(g)
+                for t in (c.FirstParameter(), c.LastParameter()):
+                    if cg.Value(t).Distance(pv) <= max(10.0 * float(bt_Tolerance(v)), 1e-4):
+                        cands.append(c.Value(t).X())
+            except Exception:
+                continue
+        if cands:
+            ends.append((u, cands))
+    if not ends:
+        return None
+    best = None
+    for k in range(-2, 3):
+        d = sum(min(abs(u + 2.0 * math.pi * k - c) for c in cs) for u, cs in ends)
+        if best is None or d < best[0]:
+            best = (d, k)
+    return best[1] if best[0] < 0.5 else None
+
+
+def _wide_periodic(F) -> bool:
+    """F on a periodic surface, spanning more than its period in u (a seam
+    that isn't a parameter line: see _face_strays)."""
+    try:
+        ad = BRepAdaptor_Surface(F)
+        if not ad.IsUPeriodic():
+            return False
+        b = _BRepTools.BRepTools.UVBounds_s(F)
+        return b[1] - b[0] > ad.UPeriod() + 1e-3
+    except Exception:
+        return False
+
+
+def _face_strays(F, defl: float) -> bool:
+    """A copy of F tessellated at defl: a triangle whose centre is off F's
+    surface by more than ten times defl (the face covers a strip of its
+    surface twice and the tessellation bridges it - see _read_back_check)."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+
+    G = td_Face(copy_shape(F))
+    _st(_m("BRepTools").BRepTools, "Clean")(G)
+    _BRepMesh.BRepMesh_IncrementalMesh(G, float(defl), False, 0.5, True)
+    loc = TopLoc_Location()
+    t = bt_Triangulation(G, loc)
+    if t is None or t.NbTriangles() == 0:
+        return False
+    P = np.array([[t.Node(i).X(), t.Node(i).Y(), t.Node(i).Z()] for i in range(1, t.NbNodes() + 1)])
+    T = np.array([t.Triangle(i).Get() for i in range(1, t.NbTriangles() + 1)]) - 1
+    C = P[T].mean(axis=1)
+    surf = _st(BRep_Tool, "Surface")(G)
+    # (the triangles with the longest sides first: a bridge is long)
+    L = np.max(np.linalg.norm(P[T] - P[np.roll(T, 1, axis=1)], axis=2), axis=1)
+    for k in np.argsort(-L)[:200]:
+        pr = GeomAPI_ProjectPointOnSurf(_mk_pnt(C[k]), surf)
+        if pr.NbPoints() and pr.LowerDistance() > 10.0 * defl:
+            return True
+    return False
 
 
 def _lost_faces(shape, ri, tol: float) -> Set[int]:
@@ -4529,14 +4621,30 @@ def fit_fill(
     Pd, UVd = P[D], UV[D]
 
     def lsq(nu, nv, lam, u_, v_, ku, kv, X):
-        Bu = _bs_basis(u_, ku, nu)
-        Bv = _bs_basis(v_, kv, nv)
-        A = (Bu[:, :, None] * Bv[:, None, :]).reshape(len(u_), -1)
-        Du = np.kron(_d2_matrix(nu), np.eye(nv))
-        Dv = np.kron(np.eye(nu), _d2_matrix(nv))
-        M = np.vstack([A, math.sqrt(lam) * Du, math.sqrt(lam) * Dv])
-        rhs = np.vstack([X, np.zeros((Du.shape[0] + Dv.shape[0], 3))])
-        return np.linalg.lstsq(M, rhs, rcond=None)[0].reshape(nu, nv, 3)
+        # (sparse: 16 basis functions per sample, and with 20,000 samples
+        # and 1,600 poles a dense least squares took minutes a fit)
+        from scipy.sparse import csr_matrix, eye as speye, kron as spkron
+        from scipy.sparse.linalg import spsolve
+
+        iu, Bu, _ = _bs_local_d1(u_, ku, nu)
+        iv, Bv, _ = _bs_local_d1(v_, kv, nv)
+        d = _BS_DEG + 1
+        r_ = np.arange(d)
+        cols = ((iu[:, None, None] + r_[None, :, None]) * nv + (iv[:, None, None] + r_[None, None, :])).reshape(-1)
+        rows = np.repeat(np.arange(len(u_)), d * d)
+        A = csr_matrix(((Bu[:, :, None] * Bv[:, None, :]).reshape(-1), (rows, cols)), shape=(len(u_), nu * nv))
+        Du = spkron(csr_matrix(_d2_matrix(nu)), speye(nv))
+        Dv = spkron(speye(nu), csr_matrix(_d2_matrix(nv)))
+        M = (A.T @ A + lam * (Du.T @ Du + Dv.T @ Dv)).tocsc()
+        # (poles no sample reaches: a whisker of ridge keeps them put)
+        M = M + 1e-12 * max(float(M.diagonal().max()), 1e-300) * speye(nu * nv, format="csc")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sol = spsolve(M, np.asarray(A.T @ X))
+        sol = np.asarray(sol, float).reshape(nu * nv, 3)
+        if not np.all(np.isfinite(sol)):
+            raise ValueError("singular fit")
+        return sol.reshape(nu, nv, 3)
 
     ku0, kv0 = _bs_knots(u0, u1, 4), _bs_knots(v0, v1, 4)
     try:
@@ -7137,6 +7245,40 @@ def describe_region(prim: "Prim", topo: Topo, faces: List[int]) -> Region:
     return R
 
 
+def _left_out_walls(eng, R: Region, min_faces: int, is_b: bool, out: List[Region]) -> int:
+    """The facets R left out (Engine.convert: not chords of its surface),
+    each connected group of them refitted as a cylinder or cone and
+    converted if it holds their vertices and sags no deeper than the mesh's
+    chords. The regions go to out; how many converted."""
+    topo = eng.topo
+    ix = [topo.face_index(f) for f in R.left_fobjs]
+    ix = [i for i in ix if i >= 0]
+    n_ok = 0
+    for g in _face_groups(set(ix), topo.adj):
+        g = sorted(g)
+        if len(g) < max(3, min_faces):
+            continue
+        try:
+            q = refit_exact(g, topo.verts, topo.norms, topo.areas, AXIAL)
+        except Exception:
+            q = None
+        if q is None:
+            continue
+        P = np.vstack([topo.verts[i] for i in g])
+        if float(np.abs(q.dist(P)).max()) > eng.tol_fit:
+            continue
+        if eng.sag_cap is not None and region_sag(q, topo, g) > eng.sag_cap:
+            continue
+        Q = describe_region(q, topo, g)
+        Q.fobjs = [topo.faces[i] for i in g]
+        Q.repeated = R.repeated
+        Q.note = "the facets a torus left out"
+        if eng.convert(Q, strict_hole=is_b)[0]:
+            n_ok += 1
+        out.append(Q)
+    return n_ok
+
+
 def _refill(eng, R: Region, min_faces: int, is_b: bool, out: List[Region], depth: int = 0) -> Tuple[int, int]:
     """
     A filled piece the engine refused, cut in two and each half filled
@@ -8829,6 +8971,7 @@ class Segmenter:
         if n_strip:
             Log.debug(f"Wide strips on curved regions: {n_strip} loose facets taken in")
         regions = self._helical_bands(regions)
+        regions = self._merge_free(regions)
         regions = self._fill_late(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
@@ -8940,6 +9083,56 @@ class Segmenter:
                         stack.append(y)
             nc += 1
         return lab, nc
+
+    def _width_split(self, m) -> list:
+        """
+        The facets of a section, cut where their width jumps (see sections:
+        a tessellator that follows the faces' parameter lines leaves a round
+        between two lofted faces as a band of slivers as long as the faces'
+        own triangles and many times narrower - same size, different width,
+        and the section-maker can't tell). Width = twice the area over the
+        facet's longest extent; cut where it jumps past threefold between
+        facets not quite coplanar (0.2 degrees). Pieces as index arrays,
+        biggest first; [] if nothing is cut.
+        """
+        topo = self.topo
+        mset = set(int(i) for i in m)
+        wid = {}
+        for i in mset:
+            V = topo.verts[i]
+            if len(V) >= 3:
+                ext = float(np.max(np.linalg.norm(V[:, None, :] - V[None, :, :], axis=2)))
+                wid[i] = 2.0 * float(topo.areas[i]) / max(ext, 1e-12)
+            else:
+                wid[i] = 0.0
+        cflat = math.cos(math.radians(0.2))
+        adj = {i: [] for i in mset}
+        for i in mset:
+            for j in topo.adj[i]:
+                if j not in mset or j <= i:
+                    continue
+                if float(topo.norms[i] @ topo.norms[j]) < cflat and abs(math.log2(max(wid[i], 1e-12) / max(wid[j], 1e-12))) > 1.5:
+                    continue
+                adj[i].append(j)
+                adj[j].append(i)
+        out, seen = [], set()
+        for s0 in sorted(mset):
+            if s0 in seen:
+                continue
+            comp, st = [s0], [s0]
+            seen.add(s0)
+            while st:
+                x = st.pop()
+                for y in adj[x]:
+                    if y not in seen:
+                        seen.add(y)
+                        comp.append(y)
+                        st.append(y)
+            out.append(np.array(sorted(comp)))
+        if len(out) < 2:
+            return []
+        out.sort(key=lambda x: (-len(x), int(x[0])))
+        return out
 
     def _snap_cylinder(self, p, rf):
         """
@@ -9612,16 +9805,18 @@ class Segmenter:
         # long triangles in the finished part. They are what the patch
         # replaces: they qualify the section and give the sag reference,
         # exactly like the fragments that survived.
-        f_sec = []
-        for R in frags:
-            cf = Counter(int(lab[i]) for i in R.faces)
-            c0, k0 = cf.most_common(1)[0]
-            f_sec.append((c0, k0 >= 0.8 * len(R.faces)))
         drop, extra = set(), []
-        for c in range(nc):
-            m = np.where(lab == c)[0]
+        # (a section no surface holds is cut again where the facets' width
+        # jumps, and its pieces tried as sections of their own: see
+        # _width_split)
+        work = [(np.where(lab == c)[0], True) for c in range(nc)]
+        w_k = 0
+        while w_k < len(work):
+            m, may_split = work[w_k]
+            w_k += 1
             if len(m) < 4 * self.min_faces:
                 continue
+            mset = set(int(i) for i in m)
             # regions that lie ALMOST ENTIRELY inside this section: only
             # those can be dissolved. A straddling region is left alone,
             # otherwise a hole would open up in it.
@@ -9668,7 +9863,7 @@ class Segmenter:
             if owned:
                 Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)} left alone: a plane owns it")
                 continue
-            dentro_f = [q for q, (c0, ok) in enumerate(f_sec) if ok and c0 == c]
+            dentro_f = [q for q, R in enumerate(frags) if sum(1 for i in R.faces if i in mset) >= 0.8 * len(R.faces)]
             # ⚠️ TWO PIECES ARE ENOUGH. How many quadrics a band breaks into
             # is scheduling noise: on test0's R3 corner the sequential seeds
             # give a cone and four fragments, the parallel ones a 20-facet
@@ -9725,6 +9920,11 @@ class Segmenter:
                 pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=2.0 * sag_old + 2.0 * self.tol_fit, soft=chk)
             if pr is None:
                 Log.debug(f"  free-form section at {np.round(np.mean([topo.cents[i] for i in m], axis=0), 2)}: no B-spline holds on its {len(faces)} facets ({len(dentro)} regions, {len(dentro_f)} fragments)")
+                subs = self._width_split(m) if may_split else []
+                if len(subs) > 1:
+                    Log.debug(f"    cut where the facets' width jumps: {len(subs)} pieces ({', '.join(str(len(x)) for x in subs[:12])}{', ...' if len(subs) > 12 else ''})")
+                    work += [(x, False) for x in subs]
+                    continue
                 extra += self._loose_patches(m, owner, regions, extra)
                 continue
             drop |= set(dentro)
@@ -9788,6 +9988,107 @@ class Segmenter:
             busy |= set(G2)
             Log.debug(f"  loose patch at {np.round(np.mean([topo.cents[i] for i in G2], axis=0), 2)}: {len(G2)} facets between {len(nbr)} regions")
             out.append(describe_region(pr, topo, G2))
+        return out
+
+    def _merge_free(self, regions):
+        """
+        ⚠️ A LOFT IS ONE FACE, NOT A STACK OF OSCULATING STRIPS. test18's legs
+        are lofts from a quarter ring at the foot to a rounded rectangle at
+        the top, the r 1.2 rounds along their curved edges rolling-ball
+        fillets between two lofts: no quadric holds any of them, and the
+        seeds cover each with strips of cylinders (r 1.2, 3.8, 5.5), cones
+        and little B-splines, each right to the tolerance on its few degrees
+        - a leg in forty faces. The CAD has a handful of B-splines there. So
+        adjacent weak regions (not exact: a cylinder exported exactly sits
+        on its vertices to a few hundredths of the tolerance; or a free-form
+        patch) across a smooth edge are merged when ONE filled B-spline
+        (PatchFiller) holds the union - vertices within the tolerance, the
+        facets within what the pieces themselves sag, the engine's cap on
+        the sag - biggest first, each merged cluster trying its neighbours
+        again. A junction where the curvature jumps (a round against a flat
+        loft) is no B-spline's and stays as it was; a merged patch the
+        engine refuses gives way to its pieces (fallback).
+        """
+        if not self.allow_free or len(regions) < 2:
+            return regions
+        topo = self.topo
+        tol = self.tol_fit
+
+        def weak(R):
+            p = R.prim
+            if getattr(p, "ball", None) is not None or getattr(p, "helix", None) is not None or getattr(p, "tube", None) is not None:
+                return False
+            if p.kind == FREE:
+                return True
+            if p.kind not in (AXIAL, TORUS, SPHERE):
+                return False
+            if R.rms <= 0.05 * tol and len(R.faces) >= 8:
+                return False
+            return len(R.faces) < 60 or R.coverage * 360.0 < 45.0
+
+        cand = [k for k, R in enumerate(regions) if weak(R)]
+        if len(cand) < 2:
+            return regions
+        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, tol)
+        cap = None if ms is None else 2.0 * ms + 2.0 * tol
+        filler = PatchFiller(topo, tol, self.min_faces)
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        rep_of = {k: k for k in cand}
+        groups = {k: set(regions[k].faces) for k in cand}
+        members = {k: [k] for k in cand}
+        sag_r = {k: float(regions[k].sag) for k in cand}
+        prims = {}
+        cos_s = math.cos(math.radians(15.0))
+        tried, n_try = set(), 0
+        for k in sorted(cand, key=lambda q: (-len(regions[q].faces), q)):
+            if k not in groups:
+                continue
+            while n_try < 300:
+                nb = Counter()
+                for i in groups[k]:
+                    for j in topo.adj[i]:
+                        q = owner.get(j)
+                        if q is None or q not in rep_of or j in groups[k]:
+                            continue
+                        if float(topo.norms[i] @ topo.norms[j]) > cos_s:
+                            nb[rep_of[q]] += 1
+                merged = False
+                for r, _ in sorted(nb.items(), key=lambda x: (-len(groups[x[0]]), x[0])):
+                    key = (frozenset(members[k]), frozenset(members[r]))
+                    if r == k or key in tried:
+                        continue
+                    tried.add(key)
+                    union = groups[k] | groups[r]
+                    if len(union) > 1200:
+                        continue
+                    n_try += 1
+                    ctol = 2.0 * max(sag_r[k], sag_r[r]) + 2.0 * tol
+                    got = filler.pieces(sorted(union), ctol, cap, depth=7)
+                    if not got:
+                        continue
+                    pr = got[0][0]
+                    pr.fill = None
+                    groups[k] = union
+                    members[k] += members[r]
+                    sag_r[k] = max(sag_r[k], sag_r[r])
+                    prims[k] = pr
+                    for q in members[r]:
+                        rep_of[q] = k
+                    del groups[r]
+                    merged = True
+                    break
+                if not merged:
+                    break
+        if not prims:
+            return regions
+        out = [R for q, R in enumerate(regions) if q not in rep_of or (rep_of[q] == q and q not in prims)]
+        n_in = 0
+        for k, pr in prims.items():
+            R_ = describe_region(pr, topo, sorted(groups[k]))
+            R_.fallback = [regions[q] for q in members[k]]
+            out.append(R_)
+            n_in += len(members[k])
+        Log.debug(f"Free-form merges: {n_in} weak regions in {len(prims)} B-spline faces ({n_try} fits tried)")
         return out
 
     def _fill_late(self, regions):
@@ -13178,7 +13479,8 @@ class Engine:
         cap = self.sag_cap
         # (an exporter that limits the ANGLE between chords sags deeper on a
         # bigger radius: see _measure_mesh_turn)
-        if cap is not None and self.sag_turn is not None:
+        uneven = _tube_rows_uneven(R, self.topo)
+        if cap is not None and self.sag_turn is not None and not uneven:
             rho = _region_radius(R)
             if rho is not None:
                 k_, r_max, pairs = self.sag_turn
@@ -13192,7 +13494,7 @@ class Engine:
         # test17's root, r 12.6 at OpenSCAD's 9-degree steps, sags 0.04)
         if cap is not None and getattr(R.prim, "chord_ok", None) is not None:
             cap = max(cap, float(R.prim.chord_ok))
-        if cap is not None and R.sag > cap and R.prim.kind in (AXIAL, TORUS):
+        if cap is not None and R.sag > cap and R.prim.kind in (AXIAL, TORUS) and not uneven:
             cc = self._chord_cap(R)
             if cc is not None:
                 cap = max(cap, cc)
@@ -13212,6 +13514,8 @@ class Engine:
                 Log.debug(f"  {R.label()} -> {R.status}")
                 return False, R.status[10:]
             R.left_out = f"{len(ix) - len(good)} facets that aren't chords of it left out"
+            gs_ = set(good)
+            R.left_fobjs = [R.fobjs[j] for j in range(len(ix)) if j not in gs_]
             R.faces = [R.faces[j] for j in good]
             R.fobjs = [R.fobjs[j] for j in good]
             R.sag = region_sag(R.prim, self.topo, [ix[j] for j in good])
@@ -14436,6 +14740,15 @@ class Engine:
                     Log.debug(f"    invalid neighbor: type {face_surface_type(f)} area {face_area(f):.4f} -> {det}")
                     self._dump_face(td_Face(f))
                 return False, "invalid neighboring face: " + ", ".join(det)
+            # ⚠️ AND STILL ONCE ROUND. test17's boss rim, a torus all the way
+            # round with its seam a path of mesh edges slanting 0.29 rad, was
+            # built sound; a fillet converted next to it rebuilt its notched
+            # lower edge, the torus' pcurves were laid again and took the long
+            # way round - a strip covered twice, valid to BRepCheck, its
+            # tessellation 0.47 mm inside the part. A neighbour going round its
+            # surface past the period is tessellated: off its surface, no.
+            if _wide_periodic(td_Face(f)) and _face_strays(td_Face(f), max(2e-5 * self.diag, 1e-4)):
+                return False, "a neighboring face would cover part of its surface twice"
         # the neighbors of reused polygonal chains also share edges with an
         # updated tolerance: the new face itself has already been validated
         # direction of the new face (also works without new edges)
@@ -14468,6 +14781,16 @@ class Engine:
             det = check_detail(fo_in)
             if det:
                 return False, "new face invalid as oriented in the solid: " + ", ".join(det)
+            # ⚠️ ONCE ROUND, NOT MORE. test17's boss rim, a torus R19 r2.5 all the
+            # way round, its seam a path of mesh edges slanting 0.29 rad past
+            # a window's notch, was sound on its own and, put in the solid with
+            # its neighbours' edges, covered a strip of itself twice: valid to
+            # BRepCheck, its tessellation 2.5 mm off the torus and 0.47 mm
+            # inside the part. A face spanning more than its period is
+            # tessellated as it sits: off its surface, it's built in pieces
+            # round the axis (run_phase, angular_pieces).
+            if _wide_periodic(td_Face(fo_in)) and _face_strays(td_Face(fo_in), max(2e-5 * self.diag, 1e-4)):
+                return False, "region closed 360 degrees: the face covers part of its surface twice"
         old_f = [self.topo.faces[i] for i in rf] + [self.topo.faces[j] for j in {ch.nb for ch, _, _ in replaced}]
         new_f = [self.registry.FindKey(k) for k in touched] + [fo_in if fo_in is not None else Fo]
         defl = max(0.1 * dev, 1e-5)
@@ -14553,8 +14876,20 @@ class Engine:
                 try:
                     u_lo, u_hi, _, _ = _st(_BRepTools.BRepTools, "UVBounds")(f)
                     a_, b_ = c2d.FirstParameter(), c2d.LastParameter()
-                    um = 0.5 * (c2d.Value(a_).X() + c2d.Value(b_).X())
+                    ua, ub = c2d.Value(a_).X(), c2d.Value(b_).X()
+                    um = 0.5 * (ua + ub)
                     k_ = round((0.5 * (u_lo + u_hi) - um) / (2.0 * math.pi))
+                    # ⚠️ ...BUT A SLANTED SEAM HAS A STRIP ON BOTH SIDES. A face
+                    # whose seam is a path of mesh edges (test17's boss rim, its
+                    # seam 0.29 rad aslant) spans more than a period: a strip of
+                    # it has two u's, and an edge there put by the middle of the
+                    # domain took the far one - its wire went the long way round,
+                    # a strip covered twice. There the edge's own ends say: the
+                    # u the face's edges already have at its two vertices.
+                    if u_hi - u_lo > 2.0 * math.pi + 1e-3:
+                        k_v = _shift_to_vertices(f, e, ua, ub)
+                        if k_v is not None:
+                            k_ = k_v
                     if k_ != 0 and u_hi - u_lo < 4.0 * math.pi:
                         c2d.Translate(gp_Vec2d(2.0 * math.pi * k_, 0.0))
                 except Exception:
@@ -15908,6 +16243,43 @@ def _measure_mesh_sag(regions: List[Region], tol_fit: float) -> Optional[float]:
     return max(x for x in s if x <= 3.0 * p90)
 
 
+def _tube_rows_uneven(R: Region, topo) -> bool:
+    """
+    ⚠️ A BARREL WHERE THE MESH HAS A WALL. test16's hanging hole came out a
+    torus R105.7 r99 through the rows of its two end rounds at 6e-6, and
+    nothing in between: a barrel standing 0.39 mm proud of the wall halfway
+    down, let through by the cap a tube of r 99 may sag to (an exporter
+    capping the angle chords r 99 in steps of 9 degrees). But such an
+    exporter steps evenly round the tube; here two pairs of rows a degree
+    apart stand at the ends of one 9-degree gap - two features, not one
+    round. A torus whose vertex rows round the tube have a gap past three
+    times the median of the others gets the plain cap (nor does it prove its own
+    sag by its widest facets: _chord_cap).
+    """
+    p = R.prim
+    if p.kind != TORUS:
+        return False
+    try:
+        ix = [topo.face_index(f) for f in R.fobjs] if R.fobjs else list(R.faces)
+        if any(i < 0 for i in ix):
+            return False
+        P = np.vstack([topo.verts[i] for i in ix]) - p.center
+        h = P @ p.axis
+        rho = np.linalg.norm(P - np.outer(h, p.axis), axis=1)
+        a = np.arctan2(h, rho - p.r0)
+        # (round the tube from the rows' mean direction: no wrap at +-pi)
+        a0 = math.atan2(float(np.sin(a).mean()), float(np.cos(a).mean()))
+        v = np.unique(np.round(np.angle(np.exp(1j * (a - a0))), 3))
+        if len(v) < 3:
+            return False
+        g = np.sort(np.diff(v))
+        # (against the OTHER gaps: of three rows, two gaps, the median is
+        # half the big one)
+        return float(g[-1]) > 3.0 * float(np.median(g[:-1]))
+    except Exception:
+        return False
+
+
 def _region_radius(R: Region) -> Optional[float]:
     """The radius a region's facets are chords of: a sphere's, a torus'
     tube, a cylinder's, a cone's at the middle of the region, a thread
@@ -16058,6 +16430,7 @@ def run_phase(
         for k in pending:
             R = regions[k]
             ok, why = eng.convert(R, strict_hole=is_b)
+
             # (a fillet rejected with the leftover facets it took at its
             # corners: as it was without them, at once, before its neighbours
             # are converted against a boundary still tessellated)
@@ -16073,6 +16446,13 @@ def run_phase(
             # rims cut in 40 and 47 sides with no vertex in line: in two
             # pieces around the axis, see angular_pieces)
             split_now = "ambiguous angular coverage" in why or "region closed 360 degrees" in why or (round_ == 1 and R.closed_u and "seam" in why)
+            # (the facets a torus left out for not being its chords - test16's
+            # hanging hole, whose wall the barrel through its end rounds had
+            # taken - as the cylinder or cone they lie on, at once)
+            if ok and getattr(R, "left_fobjs", None):
+                n_w = _left_out_walls(eng, R, min_faces, is_b, split_parts)
+                if n_w:
+                    Log.debug(f"  {R.label()}: the facets it left out converted as {n_w} axial faces")
             # (a filled piece the engine refused - a wire crossing itself once
             # trimmed, test17's 147-facet corner - in two halves, each filled
             # again and converted at once, down to min_faces facets)
