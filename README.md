@@ -8,6 +8,10 @@ and is discarded if it doesn't pass the check. Whatever can't be converted stays
 was: the output file is always consistent with the input one, at worst it's just less "clean". There
 is no global Sewing and nothing is rebuilt globally.
 
+| Before: input mesh (2,064 triangles) | After: analytic B-Rep (72 faces) |
+| :---: | :---: |
+| ![Input mesh of test0.stl](docs/before.webp) | ![STEP output of test0.stl](docs/after.webp) |
+
 ## Getting started
 
 ### Requirements
@@ -185,6 +189,21 @@ are reported but left in.
   and a piece the engine still refuses is cut again there. A free-form patch over a whole smooth
   section that the engine refuses gives way to the regions it had replaced (`test16`: 788 → 660
   faces; `test17`: 866 → 733; `test15`: 388 → 390 faces, deviation from the mesh 0.014 → 0.010 mm).
+  Weak regions - not exact (a surface exported exactly sits on its vertices to a few hundredths of
+  the tolerance), small or a few degrees wide, or free-form already - that meet across a smooth
+  edge are merged when one such filled B-spline holds them all: the strips of osculating
+  cylinders, cones and little B-splines a loft, a variable-radius round or a round rolling between
+  two lofts break into become one face, and a junction where the curvature jumps stays as it was
+  (a merged face the engine refuses gives way to its pieces). A face going all the way round whose
+  seam is a path of mesh edges, slanting, can cover a strip of its surface twice once its
+  neighbours' edges are in: valid to BRepCheck, its tessellation inside the part; it is tessellated
+  as it sits and, if it strays, built in pieces round the axis; a neighbour's new edge gets its
+  pcurve on such a face by the face's own u at the edge's two vertices. A torus whose vertex rows
+  round its tube have one gap far wider than the others (two rounds at the ends of a wall, read as
+  one barrel through both) gets no allowance for a big radius's sag, and the facets it isn't the
+  chord surface of are converted as the cylinder or cone they lie on (`test16`, Autodesk exporter:
+  995 → 874 faces, deviation 0.39 → 0.058 mm; `test17`, TurboCAD: 1,195 → 1,131 faces, 0.54 →
+  0.095 mm; `test18`: 1,307 → 1,212; `test9` 931 → 896, `test15` 390 → 381).
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
