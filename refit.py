@@ -4603,20 +4603,54 @@ def fit_fill(
             e1 /= np.linalg.norm(e1)
             e2 = np.cross(n0, e1)
             UV = np.c_[(P - P.mean(axis=0)) @ e1, (P - P.mean(axis=0)) @ e2]
+    flat = UV is not None
     if UV is None:
         UV = lscm_uv(P, T)
     if UV is None:
         return None
+    pr, thin = _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn)
+    # ⚠️ A STRIP FLATTENED ONTO ITS MEAN PLANE IS BENT IN IT. test18's leg
+    # rounds come out of the seeds as strips of osculating cylinders (r 1.2
+    # to 6, 20-80 degrees each) whose facets run 1.6 mm along the leg and
+    # 0.07 across: on the mean plane each strip is a curved band, and no
+    # grid followed it (3e-3 off at 7.7e-4); laid out conformally it's
+    # straight, and holds at 2.8e-4.
+    if pr is None and flat and thin:
+        UV = lscm_uv(P, T)
+        if UV is not None:
+            pr, _ = _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn)
+    return pr
+
+
+def _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn):
+    """fit_fill on one flattening UV: (prim or None, whether the facets
+    are thin strips there)."""
+    from scipy.interpolate import RBFInterpolator
+    from scipy.spatial import cKDTree
+
     uu, vv = UV[:, 0], UV[:, 1]
     eu, ev = float(np.ptp(uu)), float(np.ptp(vv))
     E = np.r_[T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]
-    el = float(np.median(np.linalg.norm(UV[E[:, 0]] - UV[E[:, 1]], axis=1)))
+    dE = UV[E[:, 0]] - UV[E[:, 1]]
+    el = float(np.median(np.linalg.norm(dE, axis=1)))
     if min(eu, ev) <= 1e-9 or el <= 1e-9:
-        return None
-    mu, mv = 0.05 * eu + el, 0.05 * ev + el
+        return None, False
+    # ⚠️ THE GRID FOLLOWS THE FACETS' SPACING IN EACH DIRECTION. Long thin
+    # facets (a round's rows: 1.6 mm along, 0.07 across) sized by their
+    # median edge got a margin and a sampling step of 1.6 mm across a band
+    # 0.86 wide - the samples off the band, where the interpolation runs
+    # wild, outweighed the data (3e-2 off). Only past a 3:1 spread: on an
+    # even mesh the grid stays what it was.
+    elu, elv = float(np.median(np.abs(dE[:, 0]))), float(np.median(np.abs(dE[:, 1])))
+    thin = max(elu, elv) > 3.0 * max(min(elu, elv), 1e-12)
+    if thin:
+        elu, elv = max(elu, 0.02 * el), max(elv, 0.02 * el)
+    else:
+        elu = elv = el
+    mu, mv = 0.05 * eu + elu, 0.05 * ev + elv
     u0, u1, v0, v1 = uu.min() - mu, uu.max() + mu, vv.min() - mv, vv.max() + mv
-    if (u1 - u0) * (v1 - v0) / (0.4 * el) ** 2 > 2e5:
-        return None
+    if (u1 - u0) * (v1 - v0) / (0.16 * elu * elv) > 2e5:
+        return None, thin
     D = np.asarray(data, bool)
     Pd, UVd = P[D], UV[D]
 
@@ -4651,19 +4685,18 @@ def fit_fill(
         S0 = SplineSurf(lsq(4, 4, 1e-4, UVd[:, 0], UVd[:, 1], ku0, kv0, Pd), ku0, kv0, local=True)
         corr = RBFInterpolator(UVd, Pd - S0.point(UVd[:, 0], UVd[:, 1]), kernel="quintic", degree=2)
     except Exception:
-        return None
-    h = 0.4 * el
-    GU, GV = np.meshgrid(np.arange(u0, u1 + h, h), np.arange(v0, v1 + h, h), indexing="ij")
+        return None, thin
+    GU, GV = np.meshgrid(np.arange(u0, u1 + 0.4 * elu, 0.4 * elu), np.arange(v0, v1 + 0.4 * elv, 0.4 * elv), indexing="ij")
     GU, GV = GU.ravel(), GV.ravel()
-    dg, _ = cKDTree(UV).query(np.c_[GU, GV])
-    near = dg <= 1.5 * el
+    dg, _ = cKDTree(UV / [elu, elv]).query(np.c_[GU / elu, GV / elv])
+    near = dg <= 1.5
     GU, GV = GU[near], GV[near]
     X = S0.point(GU, GV) + corr(np.c_[GU, GV])
     GU, GV, X = np.r_[GU, UVd[:, 0]], np.r_[GV, UVd[:, 1]], np.vstack([X, Pd])
     Nd = Nrep[D]
     for k in (3.0, 2.0, 1.5, 1.0, 0.7, 0.5, 0.35, 0.25):
-        nu = max(4, int(round(eu / (k * el))) + _BS_DEG)
-        nv = max(4, int(round(ev / (k * el))) + _BS_DEG)
+        nu = max(4, int(round(eu / (k * elu))) + _BS_DEG)
+        nv = max(4, int(round(ev / (k * elv))) + _BS_DEG)
         if nu * nv > max_poles or nu * nv > len(X):
             break
         ku, kv = _bs_knots(u0, u1, nu), _bs_knots(v0, v1, nv)
@@ -4686,8 +4719,8 @@ def fit_fill(
             continue
         pr = Prim(FREE, Pd.mean(axis=0), n0 if nn > 1e-9 else Nd.mean(axis=0), 0.0, 0.0, 0.0, float(np.sqrt(np.mean(dv**2))))
         pr.free = S
-        return pr
-    return None
+        return pr, thin
+    return None, thin
 
 
 def _pt_tri_dist(Q: np.ndarray, T: np.ndarray, J: np.ndarray) -> np.ndarray:
@@ -6972,7 +7005,9 @@ def _ring(seed: int, adj, taken, rings: int = 2, cap: int = 80, norms=None, cos_
     return out
 
 
-def grow_region(seed_faces, prim, adj, taken, verts, norms, areas, tol: float, cos_ang: float, max_faces: int = 200000, refit: bool = True):
+def grow_region(seed_faces, prim, adj, taken, verts, norms, areas, tol: float, cos_ang: float, max_faces: int = 200000, refit: bool = True, chord_in: float = 0.0):
+    """chord_in: how much deeper than tol a vertex may lie INSIDE the
+    surface (a chord's - see _partial_chord); the caller judges them."""
     region = set(seed_faces)
     frontier = list(seed_faces)
     next_refit = max(12, 2 * len(seed_faces)) if refit else 10**9
@@ -6984,7 +7019,11 @@ def grow_region(seed_faces, prim, adj, taken, verts, norms, areas, tol: float, c
             V = verts[nb]
             if V.size == 0:
                 continue
-            if float(np.abs(prim.dist(V)).max()) > tol:
+            if chord_in > 0.0:
+                d_ = prim.dist(V)
+                if float(d_.max()) > tol or float(d_.min()) < -(tol + chord_in):
+                    continue
+            elif float(np.abs(prim.dist(V)).max()) > tol:
                 continue
             nrm = norms[nb]
             if np.dot(nrm, nrm) < 0.5:
@@ -7087,9 +7126,9 @@ def chord_depth(prim: "Prim", V: np.ndarray, tol: float) -> Optional[float]:
     th = np.arctan2(D @ v, D @ u)
     th = np.angle(np.exp(1j * (th - th[0])))
     ext = float(th.max() - th.min())
-    if ext > math.radians(CHORD_MAX_DEG) or abs(d[int(np.argmin(th))]) > tol or abs(d[int(np.argmax(th))]) > tol:
-        return None
     r = float(np.max(np.abs(prim.r0 + prim.slope * t)))
+    if ext > math.radians(CHORD_MAX_DEG) or abs(d[int(np.argmin(th))]) > tol or abs(d[int(np.argmax(th))]) > tol:
+        return _partial_chord(prim, V, d, r, tol)
     # ⚠️ AND ITS PLANE HOLDS TWO GENERATORS. A polygon's side is parallel to
     # the axis (through the apex, on a cone); a triangle of the fillet
     # tangent to a cylinder also has two vertices on it and the third a
@@ -7099,13 +7138,53 @@ def chord_depth(prim: "Prim", V: np.ndarray, tol: float) -> Optional[float]:
     n = np.linalg.svd(V - c0, full_matrices=False)[2][-1]
     if abs(prim.slope) < 1e-9:
         if abs(float(n @ prim.axis)) > 1e-3:
-            return None
+            return _partial_chord(prim, V, d, r, tol)
     else:
         apex = prim.center - (prim.r0 / prim.slope) * prim.axis
         if abs(float((apex - c0) @ n)) > max(tol, 1e-3 * r):
             return None
     depth = r * (1.0 - math.cos(0.5 * ext)) / math.hypot(1.0, prim.slope)
     return depth if float(-d.min()) <= depth + tol else None
+
+
+def _partial_chord(prim: "Prim", V: np.ndarray, d: np.ndarray, r: float, tol: float) -> Optional[float]:
+    """
+    ⚠️ A PIECE OF A CHORD IS STILL UNDER THE CIRCLE. test17's 47-gon wall
+    meets the flange in a ring that the window blends' feet break up: its
+    points lie on the polygon's sides and on the blends' traces, 0.02-0.045
+    inside the circle, and the wall's strips run from the circle at the
+    top (or at a blend's tangent line) down to them. Their last vertex in
+    angle is one of those points, or the strip leans 0.5-1 degree to reach
+    two of them at different depths: no longer a whole chord, and the
+    wall's windowed half, 185 facets, was left to weak bands (tilted
+    cylinders r 16-31 across three strips each) and a B-spline.
+    On a cylinder, a flat facet with two vertices on it whose others are
+    inside it, each no deeper than a quarter of what the cylinder itself
+    drops over its distance to the nearest vertex on it (L^2 / 4r): a
+    chord's T-point at depth 0.02 lies 2.5 mm from the generator it
+    starts on (0.07 allowed); a round tangent to the cylinder drops as
+    L^2 / 2 r_f from its tangent line - an r2 round ten times too deep
+    already - and keeps its rows. None deeper than the widest chord
+    (CHORD_MAX_DEG).
+    """
+    if abs(prim.slope) >= 1e-9 or V.shape[0] < 3:
+        return None
+    on = np.abs(d) <= tol
+    if int(on.sum()) < 2 or on.all():
+        return None
+    dep = -d[~on]
+    # (a coarse mesh's chord, not a fine one's noise: test13's CAD mesh
+    # has hundreds of facets a few tolerances under its r1-r2 rounds, and
+    # each taken in widened the rounds' threshold by that much)
+    if float(dep.max()) < 10.0 * tol or float(dep.max()) > r * (1.0 - math.cos(0.5 * math.radians(CHORD_MAX_DEG))) + tol:
+        return None
+    L = np.linalg.norm(V[~on][:, None, :] - V[on][None, :, :], axis=2).min(axis=1)
+    # (with no tolerance on top: a facet a few tenths across would pass
+    # anything a hair past tol - test13's r4 rounds took the rolling
+    # fillet's first rows)
+    if np.any(dep > L * L / (4.0 * r)):
+        return None
+    return float(dep.max())
 
 
 def region_sag(prim: "Prim", topo: Topo, faces: List[int]) -> float:
@@ -7627,7 +7706,23 @@ class Segmenter:
 
     def within(self, p, i) -> bool:
         V = self.topo.verts[i]
-        return bool(V.size) and float(np.abs(p.dist(V)).max()) <= self.face_tol(p, i)
+        if not V.size or float(np.abs(p.dist(V)).max()) > self.face_tol(p, i):
+            return False
+        # ⚠️ A BIG POLYGON HAS ALL ITS VERTICES ON ITS RIM. test17's flange
+        # foot, one 7,844 mm2 face from Phase A, has every vertex on the
+        # circle its outer wall stands on - and on the r 50 sphere through
+        # that wall's two rings: the sphere took it in, sagged 49 mm below
+        # it, was refused, and the wall stayed 72 planar strips. A chord of a
+        # surface turns from it by half the arc it spans; a polygon whose
+        # normal is 45 degrees off the surface's at its vertices is no chord.
+        if len(V) >= 5:
+            try:
+                c_ = np.abs(p.normal_at(V) @ self.topo.norms[i])
+                if float(c_.min()) < 0.7071:
+                    return False
+            except Exception:
+                pass
+        return True
 
     def _use(self, faces) -> None:
         """
@@ -7841,6 +7936,163 @@ class Segmenter:
         out.sort(key=lambda t: (-len(t[1]), _rank(t[0])))
         return out[:3]
 
+    def _reclaim_chords(self, found):
+        """
+        ⚠️ A COARSE WALL'S CHORDS ARE THE WALL'S, WHOEVER GOT THERE FIRST.
+        test17's 47-gon wall (r 21.5, sides 7.66 degrees) ends at the flange
+        in fans of long strips from the circle down to the window blends'
+        feet, a few hundredths inside it: too shallow for a partial chord
+        (_partial_chord), so the seeds covered them with three- and
+        four-facet cylinders r 10-27 and tori that happen to pass through
+        them, or left them loose - grey and yellow slivers between the
+        windows, a dozen per window. On a cylinder that is a coarse polygon
+        (_deep_chords on its own facets) and goes half round at least, a
+        neighbouring facet - loose, or of a small region (under 16 facets)
+        - with no vertex outside, none deeper than the widest chord, two on
+        it and its normal the wall's at its middle within half the widest
+        chord's turn, goes over to it, ring after
+        ring. Without a refit: the facets are chords, not samples. A region
+        left under min_faces is dissolved.
+        """
+        topo = self.topo
+        tol = self.tol_fit
+        owner = {i: k for k, (_, rf) in enumerate(found) for i in rf}
+        sizes = [len(rf) for _, rf in found]
+        faces = [set(rf) for _, rf in found]
+        n_take = 0
+        for w, (p, rf) in enumerate(found):
+            if p is None or p.kind != AXIAL or abs(p.slope) >= 1e-9 or len(rf) < 50:
+                continue
+            C = np.array([topo.cents[i] for i in rf]) - p.center
+            ex, ey = ortho_frame(p.axis)
+            th = np.floor((np.arctan2(C @ ey, C @ ex) + math.pi) / (2.0 * math.pi) * 36.0).astype(int)
+            if len(set(th.tolist())) < 18 or not self._deep_chords(rf, p, ring=False):
+                continue
+            deep = p.r0 * (1.0 - math.cos(0.5 * math.radians(CHORD_MAX_DEG))) + tol
+            sn = math.sin(math.radians(0.5 * CHORD_MAX_DEG))
+            for _ in range(50):
+                add = []
+                for j in {j for i in faces[w] for j in topo.adj[i]} - faces[w]:
+                    k = owner.get(j)
+                    if k is not None and sizes[k] >= 16:
+                        continue
+                    V = topo.verts[j]
+                    if len(V) < 3 or not topo.planar[j]:
+                        continue
+                    d = p.dist(V)
+                    if float(d.max()) > tol or float(d.min()) < -deep or int((np.abs(d) <= tol).sum()) < 2:
+                        continue
+                    if abs(float(topo.norms[j] @ p.axis)) > sn:
+                        continue
+                    # (and facing out of the wall, as a chord does at its
+                    # middle: a window's side has two corners on the circle
+                    # too, 25 degrees off it)
+                    if abs(float(p.normal_at(topo.cents[j][None, :])[0] @ topo.norms[j])) < math.cos(math.radians(0.5 * CHORD_MAX_DEG)):
+                        continue
+                    add.append(j)
+                if not add:
+                    break
+                for j in add:
+                    k = owner.get(j)
+                    if k is not None:
+                        faces[k].discard(j)
+                    owner[j] = w
+                    faces[w].add(j)
+                n_take += len(add)
+        if not n_take:
+            return found
+        out = []
+        for k, (p, _) in enumerate(found):
+            if len(faces[k]) == sizes[k] and set(found[k][1]) == faces[k]:
+                out.append(found[k])
+            elif len(faces[k]) >= self.min_faces:
+                out.append((p, sorted(faces[k])))
+        Log.debug(f"Chords of coarse walls taken back: {n_take} facets ({len(found) - len(out)} regions dissolved)")
+        return out
+
+    def _deep_chords(self, reg, p, ring: bool = True) -> bool:
+        """A cylinder region with three flat chords - its own or neighbor
+        facets the growth stopped at - whose vertices lie ten tolerances or
+        more inside it: a coarse polygon (see _partial_chord)."""
+        if p is None or p.kind != AXIAL or abs(p.slope) >= 1e-9:
+            return False
+        topo = self.topo
+        tol = self.tol_fit
+        rs = set(reg)
+        deep = p.r0 * (1.0 - math.cos(0.5 * math.radians(CHORD_MAX_DEG))) + tol
+        n_deep = 0
+        for i in list(rs) + (sorted({j for i in rs for j in topo.adj[i]} - rs) if ring else []):
+            V = topo.verts[i]
+            if not topo.planar[i] or len(V) < 3:
+                continue
+            # (judged loosely: the fit it is asked about is still off by a
+            # tolerance or two, and against it the chords' corners stand
+            # just outside - test17's wall at r 21.4993)
+            d = p.dist(V)
+            if float(d.max()) > 3.0 * tol or not -deep <= float(d.min()) < -10.0 * tol:
+                continue
+            on = np.abs(d) <= 3.0 * tol
+            if int(on.sum()) < 2 or abs(float(topo.norms[i] @ p.axis)) > 0.05:
+                continue
+            # (and as shallow as a chord of this circle can be that far from
+            # its ends - see _partial_chord: test13's 0.18 mm2 r1 round,
+            # gated on the rolling fillet's facets beside it, came out a
+            # torus with them)
+            L = np.linalg.norm(V[~on][:, None, :] - V[on][None, :, :], axis=2).min(axis=1)
+            if np.all(-d[~on] <= L * L / (4.0 * abs(p.r0))):
+                n_deep += 1
+                # (three of them, not one facet that happens to lean in:
+                # test18's r1.2 rounds along its lofts have dozens)
+                if n_deep >= 3:
+                    return True
+        return False
+
+    def _chord_refit(self, reg, p):
+        """
+        ⚠️ A CHORD'S INNER POINTS AREN'T SAMPLES OF THE CIRCLE. Fitted with
+        every vertex, test17's r 21.5 wall - its sides and their pieces
+        (_partial_chord) carry points down to 0.045 inside - came out
+        r 21.4989-21.4997 from one pass to the next: the corners, exact to
+        the float on r 21.5, stood a tolerance outside, the chords stopped
+        being chords, and the region swung between 67 and 258 facets. On a
+        coarse polygon only (_deep_chords), it is refitted with only the
+        vertices ON it of the flat facets that are its chords (chord_depth).
+        (Tried: every flat facet's on-vertices, in two bands - test17 607,
+        test18 797 instead of 623; ungated, test13's r 20.5 bore split in
+        two.) p itself when there's none, or the refit fails.
+        """
+        if not self._deep_chords(reg, p):
+            return p
+        topo = self.topo
+        tol = self.tol_fit
+        sub = {}
+        for i in reg:
+            V = topo.verts[i]
+            if not topo.planar[i] or len(V) < 3:
+                continue
+            d = p.dist(V)
+            if float(d.min()) >= -tol:
+                continue
+            on = np.abs(d) <= tol
+            if int(on.sum()) >= 2 and chord_depth(p, V, tol) is not None:
+                sub[i] = V[on]
+        if not sub:
+            return p
+
+        class _Verts:
+            def __getitem__(self_, i):
+                return sub[i] if i in sub else topo.verts[i]
+
+        try:
+            q = refit_exact(reg, _Verts(), topo.norms, topo.areas, AXIAL, init=p)
+        except Exception:
+            q = None
+        if q is None or q.kind != AXIAL or prim_radius(q) > self.max_radius:
+            return p
+        if abs(q.slope) < 1e-9:
+            q.slope = 0.0
+        return q
+
     # --- consolidation -------------------------------------------------------------
     def settle(self, reg, prim):
         """refine -> regrow -> tight purge, until the region is stable."""
@@ -7870,7 +8122,7 @@ class Segmenter:
                     p2 = self.choose_prim(reg)
             if not self.kind_ok(p2):
                 return None, "no primitive holds up"
-            p = p2
+            p = self._chord_refit(reg, p2)
             # ⚠️ CONTAMINATED REGION: growth from the wrong seed also
             # picked up facets from neighboring surfaces and the fit is a
             # compromise. The better half is kept, refitted, and restarted
@@ -7880,11 +8132,26 @@ class Segmenter:
                 cut = max(1.0, float(np.median(res)))
                 trimmed = largest_component([i for i, r_ in zip(reg, res) if r_ <= cut], topo.adj)
                 if len(trimmed) >= 3:
-                    p3 = refit_exact(trimmed, topo.verts, topo.norms, topo.areas, p.kind, init=p)
+                    p3 = self._chord_refit(trimmed, refit_exact(trimmed, topo.verts, topo.norms, topo.areas, p.kind, init=p))
                     if p3 is not None and prim_radius(p3) <= self.max_radius:
                         p = p3
                         reg = trimmed
-            reg2, _ = grow_region(reg, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False)
+            # (a cylinder's chords may hold vertices deeper than tol_grow:
+            # within() judges them - see _partial_chord. Only where the
+            # growth that lets them through finds such chords: on test13's
+            # CAD mesh the hole's facets sag a few microns, and letting it
+            # through anyway split its r 20.5 bore in two)
+            reg2 = None
+            if p.kind == AXIAL and abs(p.slope) < 1e-9:
+                ci = p.r0 * (1.0 - math.cos(0.5 * math.radians(CHORD_MAX_DEG)))
+                rc, _ = grow_region(reg, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False, chord_in=ci)
+                # (found next to the region - test18's r1.2 rounds - or only
+                # past facets deeper than tol_grow - test17's wall, its sides'
+                # pieces beyond the whole sides)
+                if self._deep_chords(reg, p) or self._deep_chords(rc, p, ring=False):
+                    reg2 = rc
+            if reg2 is None:
+                reg2, _ = grow_region(reg, p, topo.adj, self.taken, topo.verts, topo.norms, topo.areas, self.tol_grow, self.cos_ang, refit=False)
             self._use(reg2)
             keep = largest_component([i for i in reg2 if self.within(p, i)], topo.adj)
             if len(keep) < self.min_faces:
@@ -7895,6 +8162,7 @@ class Segmenter:
         p = refit_exact(reg, topo.verts, topo.norms, topo.areas, p.kind, init=p)
         if not self.kind_ok(p) or prim_radius(p) > self.max_radius:
             return None, "final fit invalid"
+        p = self._chord_refit(reg, p)
         if abs(p.slope) < 1e-9:
             p.slope = 0.0
         if not all(self.within(p, i) for i in reg):
@@ -8779,6 +9047,7 @@ class Segmenter:
         found = [(q, rf) for q, (_, rf) in zip(cons, found)]
         found = self._absorb_exact(found, changed)
         found = [(self._snap_cone_angle(pp, rf), rf) for pp, rf in found]
+        found = self._reclaim_chords(found)
         regions = [describe_region(pp, topo, rf) for pp, rf in found]
         regions = self._rolling_fillets(regions)
         regions = self._blend_patches(regions, frags)
@@ -10040,10 +10309,11 @@ class Segmenter:
         prims = {}
         cos_s = math.cos(math.radians(15.0))
         tried, n_try = set(), 0
+        budget = min(1500, 300 + 2 * len(cand))
         for k in sorted(cand, key=lambda q: (-len(regions[q].faces), q)):
             if k not in groups:
                 continue
-            while n_try < 300:
+            while n_try < budget:
                 nb = Counter()
                 for i in groups[k]:
                     for j in topo.adj[i]:
@@ -10075,6 +10345,7 @@ class Segmenter:
                     for q in members[r]:
                         rep_of[q] = k
                     del groups[r]
+                    prims.pop(r, None)
                     merged = True
                     break
                 if not merged:
@@ -10104,7 +10375,7 @@ class Segmenter:
         is filled on its facets that are still loose, piece by piece.
         """
         todo = getattr(self, "_fill_todo", None) or []
-        if not todo:
+        if not self.allow_free:
             return regions
         topo = self.topo
         # ⚠️ AND WITHIN THE ENGINE'S CAP ON THE SAG. The engine leaves out of a
@@ -10124,6 +10395,34 @@ class Segmenter:
             free = {i for i in G if i not in owned and topo.verts[i].size}
             for g in _face_groups(free, topo.adj):
                 for pr, G2 in filler.pieces(g, ctol, cap):
+                    regions.append(describe_region(pr, topo, G2))
+                    owned |= set(G2)
+                    n_p += 1
+                    n_f += len(G2)
+        # ⚠️ AND THE LOOSE CURVED FACETS NO SECTION ASKED FOR. test17's eight
+        # windows run down into the bore's floor round, and where each meets
+        # it the CAD blends the window's rounds into the floor's: 40-odd
+        # loose triangles a window, 200 at the bottom of the bore, in a
+        # section a plane owns - never a todo group, though a filled piece
+        # holds every one of them to the tolerance. Every group of loose
+        # facets that are curved - small polygons (Phase A's big ones are the
+        # part's planes) whose vertices are off one plane - is filled too,
+        # its facets held to the mesh's own chord sag (test9: held to the
+        # engine's cap, twice that, two pieces stood 0.086 mm off their
+        # chords where the part's exact surfaces sag 0.054).
+        if cap is not None:
+            small = {i for i in range(topo.nF) if i not in owned and topo.planar[i] and 3 <= len(topo.verts[i]) <= 4}
+            for g in sorted(_face_groups(small, topo.adj), key=lambda x: min(x)):
+                if len(g) < self.min_faces:
+                    continue
+                # (curved: its vertices off one plane - coplanar ones Phase A
+                # would have merged; a neighbour's normal can't tell, a
+                # converted face has none in the facets' table)
+                Pg = np.vstack([topo.verts[i] for i in g])
+                pl_ = fit_plane(Pg)
+                if pl_ is not None and float(np.abs(pl_.dist(Pg)).max()) <= 3.0 * self.tol_fit:
+                    continue
+                for pr, G2 in filler.pieces(g, ms, cap):
                     regions.append(describe_region(pr, topo, G2))
                     owned |= set(G2)
                     n_p += 1
@@ -13475,6 +13774,43 @@ class Engine:
             return None
         return 1.5 * deep + 2.0 * self.tol_fit
 
+    def _rescue_axial(self, R: Region, ix: List[int], good: List[int], cap: float):
+        """(cylinder or cone, positions in ix of the facets it holds) for a
+        region whose surface misses the facets that are its chords (see
+        convert): fitted on them, the facets off it let go, the largest
+        connected part kept and fitted again, three times. (None, None) if
+        it ends up holding fewer than the engine's minimum."""
+        topo = self.topo
+        cur = [ix[j] for j in good]
+        pos = {i: j for j, i in enumerate(ix)}
+        q = None
+        for _ in range(3):
+            try:
+                q = refit_exact(cur, topo.verts, topo.norms, topo.areas, AXIAL)
+            except Exception:
+                q = None
+            if q is None:
+                return None, None
+            keep = []
+            for j in good:
+                i = ix[j]
+                V = topo.verts[i]
+                if float(np.abs(q.dist(V)).max()) <= self.tol_fit and float(np.abs(q.normal_at(V) @ topo.norms[i]).min()) > 0.9:
+                    keep.append(i)
+            if len(keep) < max(3, self.min_faces_hint):
+                return None, None
+            comps = sorted(_face_groups(set(keep), topo.adj), key=lambda g: (-len(g), min(g)))
+            nxt = sorted(comps[0])
+            if nxt == sorted(cur):
+                break
+            cur = nxt
+        if len(cur) < max(3, self.min_faces_hint) or region_sag(q, topo, cur) > cap:
+            return None, None
+        P = np.vstack([topo.verts[i] for i in cur])
+        if float(np.abs(q.dist(P)).max()) > self.tol_fit:
+            return None, None
+        return q, sorted(pos[i] for i in cur)
+
     def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
         cap = self.sag_cap
         # (an exporter that limits the ANGLE between chords sags deeper on a
@@ -13508,6 +13844,23 @@ class Engine:
             ix = [self.topo.face_index(f) for f in R.fobjs]
             good = [j for j, i in enumerate(ix) if i >= 0 and region_sag(R.prim, self.topo, [i]) <= cap]
             dev = float(np.abs(R.prim.dist(np.vstack([self.topo.verts[ix[j]] for j in good]))).max()) if good else math.inf
+            # ⚠️ THE WRONG SURFACE THROUGH THE RIGHT FACETS. test17's flange
+            # wall, a cylinder r 50 two millimetres tall, came out of the
+            # seeds as an r 50 sphere through its two rings (two coaxial
+            # circles lie on a sphere as well), with the foot's whole flat face
+            # and two rows of the round above it: past the foot it still
+            # missed the round's rows, and the wall stayed 72 planar strips.
+            # On what's left the simplest surface is fitted again, the facets
+            # it doesn't hold let go, and again: the wall is a cylinder.
+            if len(good) >= max(3, self.min_faces_hint) and dev > self.tol_fit:
+                q_, good_ = self._rescue_axial(R, ix, good, cap)
+                if q_ is not None:
+                    Log.debug(f"  {R.label()} sags {R.sag:.1e} and misses {dev:.1e}: {q_.label()} on {len(good_)} of its {len(ix)} facets instead")
+                    R2_ = describe_region(q_, self.topo, [ix[j] for j in good_])
+                    R.prim, R.rms, R.max_res = q_, R2_.rms, R2_.max_res
+                    R.coverage, R.closed_u, R.concave, R.t_lo, R.t_hi = R2_.coverage, R2_.closed_u, R2_.concave, R2_.t_lo, R2_.t_hi
+                    good = good_
+                    dev = float(np.abs(q_.dist(np.vstack([self.topo.verts[ix[j]] for j in good]))).max())
             if len(good) < max(3, self.min_faces_hint) or dev > self.tol_fit:
                 self.n_fail += 1
                 R.status = f"rejected: the facets sag {R.sag:.1e} below it, the mesh's chords at most {cap:.1e}"
@@ -13648,7 +14001,18 @@ class Engine:
                     return False, "the hole doesn't end on planar faces"
                 if abs(abs(float(topo.norms[nb] @ prim.axis)) - 1.0) > 1e-4:
                     return False, "opening face not orthogonal to the axis"
-        if R.closed_u and len(loops) != 2:
+        # ⚠️ A FACE GOING ROUND CAN HAVE HOLES TOO. Besides its two rings
+        # (each going once round the axis) test17's 47-gon wall, once its
+        # chords were all its own (_reclaim_chords), closed round the window
+        # blends' feet and a few loose facets: four to ten loops, refused,
+        # the wall cut in three pieces around the axis. The loops that go
+        # round are the rings, the others holes - their own wires, the seam
+        # kept clear of them (_seam_clearance looks at every loop).
+        if R.closed_u and len(loops) > 2:
+            rings = [L for L in loops if abs(self._loop_turns(L, prim)) > 0.5]
+            if len(rings) == 2:
+                loops = rings + [L for L in loops if all(L is not q for q in rings)]
+        if R.closed_u and (len(loops) < 2 or sum(abs(self._loop_turns(L, prim)) > 0.5 for L in loops[:2]) != 2 or any(abs(self._loop_turns(L, prim)) > 0.5 for L in loops[2:])):
             return False, f"region closed 360 degrees with {len(loops)} rings (expected 2)"
         if not R.closed_u and prim.kind in (AXIAL, TORUS) and R.coverage > 0.97:
             return False, "ambiguous angular coverage"
@@ -13961,6 +14325,16 @@ class Engine:
         # millimeter-sized, and without a hard ceiling the region would
         # pass through, deforming the part.
         tol_cap = max(self.max_edge_tol, min(2.0 * R.sag, 5.0 * self.max_edge_tol))
+        # ⚠️ ...AND A FREE-FORM PATCH'S SAG IS MEASURED ON ITS FACETS, NOT ITS
+        # RIM. Fitted to the facets as they are (region_sag on pverts), a
+        # filled patch shows a sag of a few thousandths while its rim, left
+        # as the mesh's polyline, runs along chords of the true curve:
+        # test17's window blends (150-180 facets each) stood 0.036-0.069 off
+        # their rims against a ceiling of 0.035 and fell back to forty
+        # strips of tori and cylinders apiece. Its ceiling is the mesh's own
+        # chord sag (the engine's cap), within the same hard limit.
+        if prim.kind == FREE and getattr(self, "sag_cap", None):
+            tol_cap = max(tol_cap, min(float(self.sag_cap), 5.0 * self.max_edge_tol))
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
             self._restore_all(vtol_backup)
@@ -14271,7 +14645,7 @@ class Engine:
                 out.extend(ch.verts[:-1] if ch.closed else [ch.verts[0], ch.verts[-1]])
             return sorted(set(out))
 
-        L1, L2 = loops
+        L1, L2 = loops[:2]
         # A: if the first ring is a closed chain, any of its vertices will
         # do: the one that aligns best with the second ring is picked
         c1, c2 = candidates(L1), candidates(L2)
@@ -14361,6 +14735,16 @@ class Engine:
             set_tolerance(td_Vertex(self.topo.vmap.FindKey(j + 1)), t)
 
     # --- seam ----------------------------------------------------------------------
+    def _loop_turns(self, L: "Loop", prim) -> float:
+        """how many times a loop goes round the prim's axis (signed)"""
+        vs = [v for ch in L.chains for v in ch.verts]
+        if len(vs) < 3:
+            return 0.0
+        d = self.topo.vpos[np.array(vs)] - prim.center
+        ex, ey = ortho_frame(prim.axis)
+        th = np.arctan2(d @ ey, d @ ex)
+        return float(np.sum(np.angle(np.exp(1j * np.diff(np.append(th, th[0])))))) / (2.0 * math.pi)
+
     def _make_seam(self, R: Region, sp: SurfParam, loops, new_edges, bump_vertex):
         """
         Region closed 360 degrees: needs a seam edge from vertex A of the
@@ -14377,7 +14761,7 @@ class Engine:
                     out.extend(ch.verts[:-1])
             return out
 
-        L1, L2 = loops
+        L1, L2 = loops[:2]
         path = getattr(self, "_seam_path", None)
         if path is not None:
             A, B, edges = path
@@ -14470,7 +14854,7 @@ class Engine:
                 sequences.append(it)
         else:
             seam_edges, A, B, _ = seam
-            L1, L2 = loops
+            L1, L2 = loops[:2]
             it1 = loop_items(L1, A)
             it2 = loop_items(L2, B)
             if it1 is None or it2 is None:
@@ -14480,9 +14864,14 @@ class Engine:
             down = [(e, not f, ("seam", k)) for k, (e, f) in reversed(list(enumerate(seam_edges)))]
             seq = up + it2 + down + it1
             sequences.append(seq)
+            for L in loops[2:]:
+                sequences.append(loop_items(L))
 
         out = []
-        for seq in sequences:
+        outer_u = None
+        for n_seq, seq in enumerate(sequences):
+            if seq is None:
+                return "hole's loop can't be walked"
             if flip:
                 seq = [(e, not f, tag) for e, f, tag in reversed(seq)]
             # ⚠️ NEVER START A WIRE WITH A CLOSED EDGE. A 360-degree region's
@@ -14503,7 +14892,20 @@ class Engine:
             w = TopoDS_Wire()
             bb.MakeWire(w)
             u_prev = v_prev = None
+            # (a hole in a face going round: its u inside the period the
+            # rings' wire spans, or its pcurve lands a turn away -
+            # InvalidImbricationOfWires)
+            if seam is not None and n_seq > 0 and outer_u is not None and sp.periodic_u:
+                e0, f0, _ = seq[0]
+                c0, a0, b0 = edge_curve(td_Edge(e0))
+                if c0 is not None:
+                    q0 = c0.Value(a0 if f0 else b0)
+                    uu0, vv0 = sp.uv(np.array([[q0.X(), q0.Y(), q0.Z()]]))
+                    u0 = float(uu0[0])
+                    u0 += 2.0 * math.pi * round((0.5 * (outer_u[0] + outer_u[1]) - u0) / (2.0 * math.pi))
+                    u_prev, v_prev = u0, float(vv0[0])
             u_start = v_start = None
+            us_ = []
             worst = worst_own = 0.0
             seam_pc = {}
             for e, fwd, tag in seq:
@@ -14518,6 +14920,7 @@ class Engine:
                     uu, vv = sp.uv(np.array([[curve.Value(t0 if fwd else t1).X(), curve.Value(t0 if fwd else t1).Y(), curve.Value(t0 if fwd else t1).Z()]]))
                     u_start, v_start = float(c2d.Value(t0 if fwd else t1).X()), float(c2d.Value(t0 if fwd else t1).Y())
                 u_prev, v_prev = u_end, v_end
+                us_.append(u_end)
                 t_old = float(bt_Tolerance(e))
                 tol_e = max(t_old, 1.2 * dev + 1e-7)
                 key = self.topo.emap.FindIndex(e)
@@ -14578,6 +14981,8 @@ class Engine:
                     glen = math.hypot(du * max(abs(rv), 1e-3), dv)
                 if glen > 4.0 * self.max_edge_tol:
                     return f"wire not closed in parameter space (deviation {gap:.1e}, du {u_prev - u_start:+.3f} dv {v_prev - v_start:+.3f})"
+            if n_seq == 0 and us_:
+                outer_u = (min(us_), max(us_))
             out.append((w, worst, worst_own))
         return out
 
@@ -16240,7 +16645,21 @@ def _measure_mesh_sag(regions: List[Region], tol_fit: float) -> Optional[float]:
     if len(s) < 5:
         return None
     p90 = float(np.quantile(s, 0.9))
-    return max(x for x in s if x <= 3.0 * p90)
+    # ⚠️ AN OUTLIER STANDS ALONE. test17's two big rounds, R47 r3 and R19
+    # r2.5 (1,314 and 465 facets), sag 0.050 and 0.063 - OpenSCAD's fixed
+    # steps, the r 21.5 wall's sides 0.048 - among forty small rounds at
+    # 0.002-0.028: the 90th percentile sat at 0.022, the R19 round just
+    # under three times it, and two of the window blends' spheres more or
+    # less put it on either side: the reference fell to 0.023, the wall's
+    # regions were refused and the part came out with 989 faces instead of
+    # 657. Past three times the percentile a sag is left out only if it is
+    # also half again the next one down (test14's 0.46 among sags of
+    # hundredths; test8's 0.045 over 0.029).
+    v = sorted(s, reverse=True)
+    for k, x in enumerate(v):
+        if x <= 3.0 * p90 or (k + 1 < len(v) and x <= 1.5 * v[k + 1]):
+            return x
+    return v[-1]
 
 
 def _tube_rows_uneven(R: Region, topo) -> bool:

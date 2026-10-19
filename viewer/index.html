@@ -1484,7 +1484,9 @@ const native = () => window.pywebview?.api || null;
 async function openFile() {
   const api = native();
   if (!api) { $("#fileinput").click(); return; }
-  const path = await api.open_file();
+  let path;
+  try { path = await api.open_file(); }
+  catch (ex) { toast(`Open failed: ${ex?.message || ex}`); return; }   // never fail in silence
   if (!path) return;
   await loadFiles(path);
   pickInput(path);

@@ -601,8 +601,10 @@ class NativeApi:
         import webview
 
         kind = getattr(getattr(webview, "FileDialog", None), "OPEN", None) or webview.OPEN_DIALOG
+        # ⚠️ only letters, digits and spaces before the parenthesis: with "Mesh / STEP"
+        # pywebview raised ValueError and the dialog never opened
         res = self._window.create_file_dialog(kind, directory=TESTS if os.path.isdir(TESTS) else ROOT, allow_multiple=False,
-                                             file_types=("Mesh / STEP (*.stl;*.step;*.stp)", "All files (*.*)"))
+                                             file_types=("Mesh and STEP (*.stl;*.step;*.stp)", "All files (*.*)"))
         if not res:
             return None
         return res[0] if isinstance(res, (list, tuple)) else res
