@@ -3626,7 +3626,11 @@ def fit_torus(P: np.ndarray, N: np.ndarray, W: np.ndarray) -> Optional[Prim]:
     In the meridian plane (rho, z) the torus's profile is a CIRCLE: axis
     from the SVD, then a Taubin circle on the profile.
     """
-    q = revolution_axis(P, N, W)
+    return _torus_on_axis(P, revolution_axis(P, N, W))
+
+
+def _torus_on_axis(P: np.ndarray, q) -> Optional[Prim]:
+    """the torus around the axis q = (a, c) through P: its profile circle"""
     if q is None:
         return None
     a, c = q
@@ -7979,6 +7983,12 @@ class Segmenter:
                     V = topo.verts[j]
                     if len(V) < 3 or not topo.planar[j]:
                         continue
+                    # (only into a notch of the wall, two sides or more on
+                    # it: taken one side at a time, the facets ran up the
+                    # window blends' rims and the wall's boundary there went
+                    # from its arcs to a staircase of chords)
+                    if sum(1 for q in topo.adj[j] if q in faces[w]) < 2:
+                        continue
                     d = p.dist(V)
                     if float(d.max()) > tol or float(d.min()) < -deep or int((np.abs(d) <= tol).sum()) < 2:
                         continue
@@ -8644,12 +8654,24 @@ class Segmenter:
                 return False
             return abs(pt_line(b.center, a.center, unit(a.axis)) - b.r0) <= 0.1 * b.r0 + 0.2 * b.r1 + tol
         if a.kind == SPHERE and b.kind == SPHERE:
-            return close(a.r0, b.r0, 0.05) and float(np.linalg.norm(a.center - b.center)) <= 0.05 * a.r0 + tol
+            if close(a.r0, b.r0, 0.05) and float(np.linalg.norm(a.center - b.center)) <= 0.05 * a.r0 + tol:
+                return True
+            # (or two latitude bands of one torus: test17's bore floor round,
+            # R8.5 r2 in 47 sectors, came out as four spheres r 10.5-14,
+            # each exact through its two rings - their centres on the axis)
+            return self.allow_torus and float(np.linalg.norm(a.center - b.center)) > 0.05 * min(a.r0, b.r0)
         if a.kind == SPHERE and b.kind == TORUS:
             return close(a.r0, b.r1, 0.2)
         if a.kind == TORUS and b.kind == TORUS:
             return close(a.r1, b.r1, 0.05) and abs(float(unit(a.axis) @ unit(b.axis))) >= math.cos(math.radians(5.0))
         return True
+
+    def _bands(self, pa, pb) -> bool:
+        """two spheres with different centres: perhaps latitude bands of one
+        torus, which a coarse round's steps (test17's bore floor, 18
+        degrees) keep from meeting tangentially - the torus is then taken
+        only if exact (_promote_fit)"""
+        return self.allow_torus and pa.kind == SPHERE and pb.kind == SPHERE and float(np.linalg.norm(pa.center - pb.center)) > 0.05 * min(pa.r0, pb.r0)
 
     def _promote_fit(self, pa, ra, pb, rb, union) -> Optional["Prim"]:
         """
@@ -8719,6 +8741,10 @@ class Segmenter:
             cands.append(c0)
         if self.allow_torus:
             seeds = [x for x, rf in sorted(((pa, ra), (pb, rb)), key=lambda t: -len(t[1])) if x.kind == TORUS]
+            if not seeds and pa.kind == SPHERE and pb.kind == SPHERE:
+                dc = pb.center - pa.center
+                if float(np.linalg.norm(dc)) > 1e-9:
+                    seeds = [_torus_on_axis(P, (dc / float(np.linalg.norm(dc)), pa.center))]
             if not seeds:
                 seeds = [self._torus_from_strips(pa, ra, pb, rb)]
             for t0 in seeds:
@@ -8742,6 +8768,12 @@ class Segmenter:
             if not (np.isfinite(d) and np.isfinite(nd)) or nd > 15.0 or not fits_pieces(c):
                 continue
             if not all(self.within(c, i) for i in union):
+                continue
+            # (two different spheres make a torus only exactly: on the
+            # top of test17's bore, spheres r 29 and r 40 osculating a
+            # free-form blend made tori R11 r4.8 within the tolerance and
+            # 0.09 off the part between the vertices)
+            if pa.kind == SPHERE and pb.kind == SPHERE and c.kind == TORUS and d > 0.1 * self.tol_fit:
                 continue
             key = (_rank(c), d)
             if best is None or key < best[0]:
@@ -8804,7 +8836,7 @@ class Segmenter:
                 if not alive[k]:
                     continue
                 for q in {owner[j] for i in faces[k] for j in topo.adj[i] if j in owner and owner[j] != k}:
-                    if alive[q] and pos[q] > pos[k] and self._promote_plausible(prims[k], prims[q]) and self._tangent_join(prims[k], faces[k], prims[q], faces[q], cos_max):
+                    if alive[q] and pos[q] > pos[k] and self._promote_plausible(prims[k], prims[q]) and (self._bands(prims[k], prims[q]) or self._tangent_join(prims[k], faces[k], prims[q], faces[q], cos_max)):
                         pairs.append((k, q))
             if len(pairs) >= 16:
                 m = min(len(pairs), 3 * max(1, _POOL_N or self.threads))
@@ -8827,7 +8859,7 @@ class Segmenter:
                     failed[key] = n_u
                     if not self._promote_plausible(prims[k], prims[q]):
                         continue
-                    if not self._tangent_join(prims[k], faces[k], prims[q], faces[q], cos_max):
+                    if not self._bands(prims[k], prims[q]) and not self._tangent_join(prims[k], faces[k], prims[q], faces[q], cos_max):
                         continue
                     union = sorted(faces[k] | faces[q])
                     if (k, q) in spec and not changed[k] and not changed[q]:
@@ -9242,6 +9274,7 @@ class Segmenter:
         regions = self._helical_bands(regions)
         regions = self._merge_free(regions)
         regions = self._fill_late(regions)
+        regions = self._close_free(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
         return regions
@@ -12160,6 +12193,148 @@ class Segmenter:
             kept.append(R)
         return kept + new_regions
 
+    def _close_free(self, regions):
+        """
+        ⚠️ A PATCH WITH SLITS IN IT IS A BROKEN CONTOUR. A free-form patch
+        is grown and fitted on the facets its stage hands it; the loose ones
+        it didn't get stay single triangles - a slit cut into its edge, a
+        ring of one or two facets inside it. On test17 the window bottoms'
+        B-splines had 13 such holes (planar triangles of 0.01-0.1 mm2) and
+        their edges were notched all along. Here a patch takes the loose
+        facets with two sides on it and the loose islands it encloses, if
+        its surface AS FITTED already holds them: every vertex within
+        tol_fit, the normal within 20 degrees, the sag no deeper than the
+        patch's own or the mesh's chords (as close as the patch's own worst vertex was tried:
+        test15's thread patches came 0.0089 off the mesh, 0.008 before,
+        and no hole on test17 closed). Nothing is
+        refitted, nothing moves; if the engine refuses the closed patch,
+        the patch as it was is tried (bare).
+        ⚠️ AND THE TEETH OF THE PATCH NEXT TO IT. Where two free-form
+        patches meet, the line between them zigzags facet by facet (on
+        test17 two B-splines shared a window bottom along a saw-tooth): a
+        facet of the neighbour with two sides on this patch, held by this
+        surface, changes hands, if the neighbour stays in one piece.
+        """
+        if not self.allow_free:
+            return regions
+        topo = self.topo
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        cmin = math.cos(math.radians(20.0))
+        # (the sag as deep as the mesh's own chords, as _fill_late holds its
+        # pieces: the patch's own, on test17's fine remeshed window bottoms,
+        # left out a quad two triangles wide whose vertices sit on it to 6e-4)
+        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, self.tol_fit)
+        n_add = n_reg = n_moved = 0
+        gone_regs = set()  # patches taken whole
+        for k, R in enumerate(regions):
+            p = R.prim
+            ff = getattr(p, "free", None)
+            if p.kind != FREE or ff is None:
+                continue
+            fs = set(R.faces)
+            sag0 = max(region_sag(p, topo, R.faces), self.tol_fit, ms or 0.0)
+            memo = {}
+
+            def holds(j):
+                if j in memo:
+                    return memo[j]
+                ok = False
+                V = topo.verts[j]
+                try:
+                    if V.size and float(np.abs(ff.dist(V)).max()) <= self.tol_fit and float(np.min(ff.normal_at(V) @ topo.norms[j])) >= cmin:
+                        ku, kv = getattr(ff, "ku", None), getattr(ff, "kv", None)
+                        if ku is not None and kv is not None:
+                            u, v = ff.uv(V)
+                            ok = not (u.min() < ku[0] or u.max() > ku[-1] or v.min() < kv[0] or v.max() > kv[-1])
+                        else:
+                            ok = True
+                        ok = ok and region_sag(p, topo, [j]) <= sag0
+                except Exception:
+                    ok = False
+                memo[j] = ok
+                return ok
+
+            add = set()
+            took = {}  # neighbour patch -> the facets it gives
+            free_nb = lambda j: j not in owner or (owner[j] != k and regions[owner[j]].prim.kind == FREE)
+            for _ in range(20):
+                cur = fs | add
+                cand = {j for i in cur for j in topo.adj[i] if j not in cur and free_nb(j)}
+                new = {j for j in cand if sum(1 for q in topo.adj[j] if q in cur) >= 2 and holds(j)}
+                by = {}
+                for j in new:
+                    if j in owner:
+                        by.setdefault(owner[j], set()).add(j)
+                for kb, G in by.items():
+                    gone = took.get(kb, set()) | G
+                    rest = [i for i in regions[kb].faces if i not in gone]
+                    if len(rest) < max(3, self.min_faces) or len(largest_component(rest, topo.adj)) != len(rest):
+                        new -= G
+                    else:
+                        took[kb] = gone
+                if not new:
+                    break
+                add |= new
+            cur = fs | add
+            ring = {j for i in cur for j in topo.adj[i] if j not in cur and j not in owner}
+            seen = set()
+            for s0 in sorted(ring):
+                if s0 in seen:
+                    continue
+                comp, st, closed = [], [s0], True
+                seen.add(s0)
+                while st:
+                    x = st.pop()
+                    comp.append(x)
+                    if len(comp) > 12 or len(topo.adj[x]) < 3:
+                        closed = False
+                        break
+                    for y in topo.adj[x]:
+                        if y in cur:
+                            continue
+                        if y in owner:
+                            closed = False
+                            continue
+                        if y not in seen:
+                            seen.add(y)
+                            st.append(y)
+                if closed and all(holds(j) for j in comp):
+                    add |= set(comp)
+            # (a small patch of its own enclosed by this one: test17's window
+            # bottoms had B-splines of 0.3 mm2 inside them, rings in the face)
+            cur = fs | add
+            for kb in sorted({owner[j] for i in cur for j in topo.adj[i] if j in owner and owner[j] != k}):
+                B = regions[kb]
+                if kb in gone_regs or B.prim.kind != FREE or len(B.faces) > 40 or kb in took:
+                    continue
+                bs = set(B.faces)
+                if all(q in cur or q in bs for i in bs for q in topo.adj[i]) and all(holds(j) for j in bs):
+                    add |= bs
+                    gone_regs.add(kb)
+            if not add:
+                continue
+            R2 = describe_region(p, topo, sorted(fs | add))
+            R2.note, R2.repeated, R2.fallback = R.note, R.repeated, R.fallback
+            R2.bare = R.bare if R.bare is not None else R
+            regions[k] = R2
+            for kb in gone_regs:
+                if regions[kb].faces and all(i in add for i in regions[kb].faces):
+                    regions[kb] = Region(prim=regions[kb].prim, faces=[])
+            for kb, G in took.items():
+                B = regions[kb]
+                B2 = describe_region(B.prim, topo, [i for i in B.faces if i not in G])
+                B2.note, B2.repeated, B2.fallback = B.note, B.repeated, B.fallback
+                B2.bare = B.bare if B.bare is not None else B
+                regions[kb] = B2
+                n_moved += len(G)
+            for j in add:
+                owner[j] = k
+            n_add += len(add)
+            n_reg += 1
+        if n_add:
+            Log.debug(f"Free-form patches closed: {n_add} facets in slits and holes taken by {n_reg} patches ({n_moved} of them from the patch next to it, {len(gone_regs)} small patches taken whole)")
+        return [R for R in regions if R.faces]
+
     def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
         """
         A free-form patch takes the loose facets next to it that lie near its
@@ -13949,20 +14124,34 @@ class Engine:
         # file, the whole part with them). Same remedy: the facets at the
         # shared vertex go.
         # (a ring meeting the same vertex twice, a figure eight, reads back
-        # fine: test14's two r6 cones do)
+        # fine: test14's two r6 cones do - but not on a torus: test17's
+        # bore floor round, R8.5 r2, went round a window blend's island
+        # that way, and the file split the ring at the vertex into an outer
+        # wire and a hole touching it - InvalidImbricationOfWires, the part
+        # invalid. Off the axial surfaces a figure eight counts as touching.)
         def rings_touch(loops_):
-            if loops_ is None or len(loops_) < 2:
+            if loops_ is None or (len(loops_) < 2 and prim.kind in (PLANE, AXIAL, FREE)):
                 return False
             pinch_ = self._pinch_vertices(rf)
             if not pinch_:
                 return False
             seen_ = defaultdict(set)
+            twice = False
             for n_, L in enumerate(loops_):
+                seq = []
                 for ch in L.chains:
                     for v in ch.verts:
-                        if v in pinch_:
-                            seen_[v].add(n_)
-            return any(len(x) > 1 for x in seen_.values())
+                        if not seq or seq[-1] != v:
+                            seq.append(v)
+                if len(seq) > 1 and seq[0] == seq[-1]:
+                    seq.pop()
+                for v in seq:
+                    if v in pinch_:
+                        seen_[v].add(n_)
+                if prim.kind not in (PLANE, AXIAL, FREE):
+                    cnt = Counter(v for v in seq if v in pinch_)
+                    twice = twice or any(c > 1 for c in cnt.values())
+            return twice or any(len(x) > 1 for x in seen_.values())
 
         for _ in range(3):
             if loops is not None and not rings_touch(loops):
@@ -14325,16 +14514,6 @@ class Engine:
         # millimeter-sized, and without a hard ceiling the region would
         # pass through, deforming the part.
         tol_cap = max(self.max_edge_tol, min(2.0 * R.sag, 5.0 * self.max_edge_tol))
-        # ⚠️ ...AND A FREE-FORM PATCH'S SAG IS MEASURED ON ITS FACETS, NOT ITS
-        # RIM. Fitted to the facets as they are (region_sag on pverts), a
-        # filled patch shows a sag of a few thousandths while its rim, left
-        # as the mesh's polyline, runs along chords of the true curve:
-        # test17's window blends (150-180 facets each) stood 0.036-0.069 off
-        # their rims against a ceiling of 0.035 and fell back to forty
-        # strips of tori and cylinders apiece. Its ceiling is the mesh's own
-        # chord sag (the engine's cap), within the same hard limit.
-        if prim.kind == FREE and getattr(self, "sag_cap", None):
-            tol_cap = max(tol_cap, min(float(self.sag_cap), 5.0 * self.max_edge_tol))
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
             self._restore_all(vtol_backup)

@@ -237,20 +237,49 @@ are reported but left in.
   hold on its mean plane, where it lies bent, is laid out conformally and tried again (2.8e-4).
   `test18`: 623 → 549 faces; `test17`: 619 → 589 (deviation 0.095 → 0.057 mm); `test16` 863 → 855;
   `test15` 391 → 383; `test9` 896 → 891; the rest and the CAD comparisons unchanged.
-- **A coarse wall's chords, its holes, its rims.** At the flange, `test17`'s 47-gon wall ends in
-  fans of long strips running down to the window blends' feet a few hundredths inside the circle,
-  too shallow for a partial chord: the seeds covered them with three- and four-facet cylinders r 10
-  to 27 and tori, or left them loose. On a cylinder that is a coarse polygon and goes half round at
+- **A coarse wall's notches, its holes.** At the flange, `test17`'s 47-gon wall ends in fans of
+  long strips running down to the window blends' feet a few hundredths inside the circle, too
+  shallow for a partial chord: the seeds covered them with three- and four-facet cylinders r 10 to
+  27 and tori, or left them loose. On a cylinder that is a coarse polygon and goes half round at
   least, a neighbouring facet, loose or of a region under 16 facets, with no vertex outside, none
-  deeper than the widest chord, two on it and its normal the wall's at its middle, goes over to it,
-  without a refit. The wall then closed round the blends' feet and a few loose facets: a face going
-  round can now have holes besides its two rings (the loops that go once round the axis are the
-  rings, the others holes, their pcurves unwrapped into the rings' period), and the wall is one face
-  instead of three. And a free-form patch's rim, left as the mesh's polyline, runs along chords of
-  the true curve that its fit to the facets doesn't see: its edge ceiling is the mesh's own chord sag
-  (the engine's cap), within the same hard limit, and the window blends stopped falling back to forty
-  strips each. `test17`: 589 → 491 faces (deviation 0.057 → 0.061 mm, edge tolerances unchanged);
-  `test9` 891 → 889; the rest unchanged.
+  deeper than the widest chord, two on it, its normal the wall's at its middle, and two sides or
+  more on the wall already (a notch), goes over to it, without a refit. Taken one side at a time,
+  the facets ran up the window blends' rims: 50 faces fewer, but some forty circles and ellipses of
+  the wall's boundary became staircases of chords, and the boundary matters more than the count. A
+  face going round can also have holes besides its two rings (the loops that go once round the axis
+  are the rings, the others holes, their pcurves unwrapped into the rings' period). (Tried: a
+  free-form patch's rim ceiling raised to the mesh's chord sag - 33 faces fewer, 9 circles fewer.)
+  `test17`: 589 → 571 faces, the most circles and the fewest polyline edges between curved faces of
+  any version; the rest unchanged.
+- **Latitude bands of a coarse round.** `test17`'s bore floor round (R8.5 r2, OpenSCAD's
+  rotate_extrude in 47 sectors) came out as four spheres r 10.5-14, each exact through its two
+  rings, and the strips between them: with 18 degrees between bands they don't meet tangentially,
+  and two spheres were only merged when they were the same sphere. Two spheres with different
+  centres are now tried as one torus, its axis the line through the centres, and kept only if the
+  torus holds every vertex to a tenth of the tolerance (spheres r 29 and 40 osculating a free-form
+  blend made tori within the tolerance and 0.09 off the part between the vertices). The torus then
+  went round a window blend's island in a figure eight, and the file split the ring at the vertex
+  into an outer wire and a hole touching it (InvalidImbricationOfWires): off the planes, axial
+  surfaces and free-form patches a figure eight counts as rings touching, and the facets at the
+  vertex go. `test17` 571 → 537, `test18` 549 → 517, `test16` 855 → 809 (deviation 0.053 → 0.024),
+  `test15` 383 → 360 (0.012 → 0.008), `test6` 90 → 88; fewer polyline edges between curved faces
+  everywhere, the CAD comparisons unchanged.
+- **Slits and holes in free-form patches.** `test17`'s window bottoms came out as B-splines with
+  thirteen holes in them (planar triangles of 0.01-0.1 mm2, and two B-splines of 0.3 mm2) and
+  edges notched facet by facet, two patches meeting along a saw-tooth: loose facets their stage
+  never handed them. Last of all, each free-form patch takes the loose facets with two sides on it,
+  the loose islands and the small patches (40 facets at most) it encloses, and the facets of the
+  free-form patch next to it with two sides on it, if that one stays in one piece; only where its
+  surface as fitted already holds them (every vertex within tol_fit, the normal within 20 degrees,
+  the sag no deeper than the patch's own or the mesh's chords). Nothing is refitted; if the engine
+  refuses the patch, the patch as it was is tried. `test17` 537 → 489 faces (holes in B-splines 13
+  → 1, polyline edges between curved faces and planes 528 → 419), `test18` 517 → 489 (8 → 2, 460 →
+  382), `test15` 360 → 354, `test16` 809 → 808, the rest unchanged. (Tried: the vertices as close
+  as the patch's own worst one - `test15`'s thread patches 0.0089 off the mesh, 0.008 before, and no
+  hole closed; the wall below the windows taking facets one side at a time where no other exact
+  curved region touches them - 90 polyline edges more, 5 circles and 4 ellipses fewer; the strips
+  under the windows are the circle's, finer than the 47-gon's sides, with one corner on the window
+  bottom's rim 0.04 inside it.)
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
