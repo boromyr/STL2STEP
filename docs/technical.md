@@ -274,7 +274,10 @@ are reported but left in.
   thirteen holes in them (planar triangles of 0.01-0.1 mm2, and two B-splines of 0.3 mm2) and
   edges notched facet by facet, two patches meeting along a saw-tooth: loose facets their stage
   never handed them. Last of all, each free-form patch takes the loose facets with two sides on it,
-  the loose islands and the small patches (40 facets at most) it encloses, and the facets of the
+  the loose islands beside it (bounded otherwise by big quadrics only: three rim facets between a
+  window bottom and the wall, one side on each, stayed a grey triangle; bounded by any region, a
+  bore-floor plane came out unmeshable) and the small patches (40 facets at most) it encloses,
+  and the facets of the
   free-form patch next to it with two sides on it, if that one stays in one piece; only where its
   surface as fitted already holds them (every vertex within tol_fit, the normal within 20 degrees,
   the sag no deeper than the patch's own or the mesh's chords). Nothing is refitted; if the engine
@@ -301,8 +304,18 @@ are reported but left in.
   walls have taken their fans back; two free-form patches only if the union needs no more than half
   again their poles (`test15`'s 6-facet corner made a 5x11 thread patch 18x48, and four faces more
   after it), a quadric's piece always (held to it, a torus r 23 osculating one of `test16`'s blends
-  stayed, 0.032 off between its vertices). A rejected merge gives way to its pieces, and a rejected
-  piece to its own.
+  stayed, 0.032 off between its vertices). The small pieces the first merges left (40 facets at
+  most, free-form or a quadric off its facets - an exact one stays) and what the walls cut get that
+  pass too, each union with the loose facets in its notches: a merge is tried against the patch as
+  it is at that moment, and a 23-facet strip along a slot edge that failed against the half-bottom
+  it met first fits the whole bottom. A rejected merge gives way to its pieces, and a rejected
+  piece to its own - except where the engine refused it for an edge left polygonal beyond the
+  ceiling: `test17`'s bore-floor corners meet the floor's exact circle along facets 3.7 mm long,
+  the circle a chord's sag (0.13) off the patch between their vertices, and each came back as the
+  twenty tori, cylinders and loose facets it was made of. On the last pass such a patch (a merge or
+  a section's) is cut in halves first and each filled again; if one goes in, the halves stay, and a
+  half refused in turn stays mesh. (The halves were filled on facet indices that converting the
+  first one renumbered: each is now held by its faces.)
 - **Under a window the coarse wall is a fan.** Below each window bottom the 47-gon wall runs in a
   fan of thirty-odd slivers, from the polygon's sides at the flange (down to 0.047 inside) up to the
   round's foot on the true circle: twisted up to 17 degrees, one corner on the circle or two, never
@@ -310,16 +323,26 @@ are reported but left in.
   Once every stage has had its go, a coarse polygon cylinder takes the groups beside it that lie in
   its chords' band - no vertex outside, none deeper than its own deepest chord, one on it, the normal
   within 30 degrees, each facet as long along the axis as half the polygon's side (a round's rim
-  facets at an arch are 0.3-0.6 mm) - loose or small regions taken whole, two facets or more. The
+  facets at an arch are 0.3-0.6 mm; at half the side the pair of slivers where an arch's slope meets
+  its knee came apart and stayed two grey triangles, at 0.35 it goes) - loose, or the part of a
+  small region in the band if the rest holds together (taken only whole, a sliver beside a window
+  stayed between the wall and a torus r 11 of four fan facets and four of the side round's), two
+  facets or more. The
   wall then met the flange along the cutters' points, between the polygon and the circle: the exact
   circle stood off them and 105 segments stayed polylines. Last of all, on three segments or more,
   an exact curve may stand off the vertices as far as the edges it replaces stand off the faces
   (tried first, or on two segments, it took the place of the circles beside the arches and failed
   their pcurves).
-  The two together: `test17` 480 → 367 faces (each window bottom one B-spline and a few slivers,
-  the skirts under them gone; polyline edges between curved faces 765 → 549, between curved faces
-  and planes 405 → 316), `test18` 489 → 337 (1337 → 1059, 382 → 272; deviation 0.025 → 0.024),
-  `test16` 808 → 801, `test9` 890 → 886, the rest and the CAD comparisons unchanged.
+  The two together: `test17` 480 → 329 faces (each window bottom one B-spline, the skirts under
+  them and the slivers beside the arches gone, the bore floor's corners in a few pieces; polyline
+  edges between curved faces 765 → 495, between curved faces and planes 405 → 266, between planes
+  129 → 78), `test18` 489 → 316 (382 → 254 between curved faces and planes, 196 → 158 between
+  planes; deviation 0.025 → 0.024), `test16` 808 → 801, `test9` 890 → 884, the rest and the CAD
+  comparisons unchanged. (Tried: a patch taking the teeth of a quadric next to it, as it takes a
+  free-form one's - the steps where a window's side round meets its bottom - 25 polyline edges
+  fewer between curved faces, but the bore floor's last merges then left a plane bounded by two
+  lines on top of each other, a face no reader meshes; a big patch taking a cylinder's teeth only,
+  `test16` 801 → 833.)
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all

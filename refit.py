@@ -7424,9 +7424,16 @@ def _refill(eng, R: Region, min_faces: int, is_b: bool, out: List[Region], depth
         return 0, 0
     ctol, cap = R.prim.fill
     n_ok = n_try = 0
-    for pr, G in PatchFiller(topo, eng.tol_fit, min_faces).pieces(rf, ctol, cap, whole=False):
+    # (each piece held by its facets' faces, not their indices: converting
+    # one renumbers the topology under the next)
+    got = [(pr, [topo.faces[i] for i in G]) for pr, G in PatchFiller(topo, eng.tol_fit, min_faces).pieces(rf, ctol, cap, whole=False)]
+    for pr, fo in got:
+        topo = eng.topo
+        G = [topo.face_index(f) for f in fo]
+        if any(i < 0 for i in G):
+            continue
         Q = describe_region(pr, topo, G)
-        Q.fobjs = [topo.faces[i] for i in G]
+        Q.fobjs = fo
         Q.repeated = R.repeated
         Q.note = "piece of a refused filled patch"
         n_try += 1
@@ -9344,9 +9351,18 @@ class Segmenter:
         # with the patches next to it - after the walls have taken their fans
         # back (merged first, two fan pieces and a rim piece made one patch
         # the wall could no longer take whole).
-        late = {id(R) for R in getattr(self, "_late_fills", [])}
-        if late:
-            regions = self._merge_free(regions, only={k for k, R in enumerate(regions) if id(R) in late})
+        # ⚠️ AND THE SMALL PIECES THE FIRST MERGES LEFT. A merge is tried
+        # against the patch as it is at that moment: a 23-facet strip along a
+        # test17 window bottom's slot edge failed against the half-bottom it
+        # met first and fits the whole bottom (44x23 poles). So the small
+        # pieces (40 facets at most, free-form or a quadric off its facets -
+        # an exact one stays) and what the walls cut (_close_walls) get their
+        # turn too.
+        late = {id(R) for R in getattr(self, "_late_fills", []) + getattr(self, "_walls_cut", [])}
+        tol_ex = 0.05 * self.tol_fit
+        only = {k for k, R in enumerate(regions) if id(R) in late or (len(R.faces) <= 40 and (R.prim.kind == FREE or (R.prim.kind in (AXIAL, TORUS, SPHERE) and R.rms > tol_ex)))}
+        if only:
+            regions = self._merge_free(regions, only=only)
         regions = self._close_free(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
@@ -10167,6 +10183,7 @@ class Segmenter:
         if not self.allow_free or len(regions) + len(frags) < self.blend_min:
             return regions
         topo = self.topo
+        ms_box = []  # the mesh's chord sag, measured once (see below)
         owner = {}
         for k, R in enumerate(regions):
             for i in R.faces:
@@ -10314,6 +10331,12 @@ class Segmenter:
             # faces). Its regions are converted after all, as a rejected
             # swept face's are.
             R_.fallback = [regions[q] for q in dentro]
+            # (and in halves, filled again, before them, when its edge is what
+            # the engine refused: see run_phase)
+            if not ms_box:
+                ms_box.append(MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, self.tol_fit))
+            ms_ = ms_box[0]
+            pr.merged = (2.0 * sag_old + 2.0 * self.tol_fit, None if ms_ is None else 2.0 * ms_ + 2.0 * self.tol_fit)
             extra.append(R_)
         if not extra:
             return regions
@@ -10474,6 +10497,16 @@ class Segmenter:
                     tried.add(key)
                     union = groups[k] | groups[r]
                     union |= holes(union)
+                    # (late, the loose facets in its notches too - two sides
+                    # on it: a test17 window bottom and the strip along its
+                    # slot edge held at 44x23 with them, at no grid without)
+                    if only is not None:
+                        for _ in range(3):
+                            nt = {j for i in union for j in topo.adj[i] if j not in union and j not in owner and j not in absorbed
+                                  and topo.planar[j] and 3 <= len(topo.verts[j]) <= 4 and sum(1 for q in topo.adj[j] if q in union) >= 2}
+                            if not nt:
+                                break
+                            union |= nt
                     if len(union) > 1200:
                         continue
                     n_try += 1
@@ -10499,6 +10532,7 @@ class Segmenter:
                             if n_poles(pr.free) > 1.5 * (n_poles(fa_) + n_poles(fb_)):
                                 continue
                     pr.fill = None
+                    pr.merged = (ctol, cap)
                     absorbed |= union - groups[k] - groups[r]
                     groups[k] = union
                     members[k] += members[r]
@@ -12331,7 +12365,8 @@ class Segmenter:
         ring of one or two facets inside it. On test17 the window bottoms'
         B-splines had 13 such holes (planar triangles of 0.01-0.1 mm2) and
         their edges were notched all along. Here a patch takes the loose
-        facets with two sides on it and the loose islands it encloses, if
+        facets with two sides on it and the loose islands beside it (12
+        facets at most, every other neighbour a big quadric's), if
         its surface AS FITTED already holds them: every vertex within
         tol_fit, the normal within 20 degrees, the sag no deeper than the
         patch's own or the mesh's chords (as close as the patch's own worst vertex was tried:
@@ -12422,8 +12457,15 @@ class Segmenter:
                     for y in topo.adj[x]:
                         if y in cur:
                             continue
+                        # (bounded by a big quadric too: test17's window bottom
+                        # had three rim facets in a row between it and the
+                        # wall, one side on each, left a grey triangle; by any
+                        # region, a bore floor corner's plane came out a face
+                        # the readers can't mesh)
                         if y in owner:
-                            closed = False
+                            Q_ = regions[owner[y]]
+                            if Q_.prim.kind == FREE or len(Q_.faces) < 50:
+                                closed = False
                             continue
                         if y not in seen:
                             seen.add(y)
@@ -12481,18 +12523,20 @@ class Segmenter:
         groups of facets beside it that lie in its chords' band - no vertex
         outside, none deeper than its own deepest chord, one on it, the
         normal within 30 degrees of its own - each as long along the axis
-        as half the polygon's side (a round's rim facets at a window's arch
-        are 0.3-0.6 mm: _reclaim_chords), loose or a small region (under 16
-        facets) taken whole, in groups of two facets or more (a single
-        facet beside a window's arch is a round's rim, not a fan). Without
-        a refit; if the engine refuses the wall, the wall as it was is
-        tried (bare).
+        as 0.35 of the polygon's side (a round's rim facets at a window's
+        arch are 0.3-0.6 mm: _reclaim_chords; at half the side, the pair of
+        slivers where an arch's slope meets its knee, 1.34 and 2.46 mm,
+        came apart and stayed two grey triangles), loose or of a small
+        region (under 16 facets: below), in groups of two facets or more.
+        Without a refit; if the engine refuses the wall, the wall as it was
+        is tried (bare).
         """
         topo = self.topo
         tol = self.tol_fit
         owner = {i: k for k, R in enumerate(regions) for i in R.faces}
         cmin = math.cos(math.radians(30.0))
         n_take = n_regs = 0
+        self._walls_cut = []  # the regions left with the rest of their facets
         for w, R in enumerate(regions):
             p = R.prim
             if p is None or p.kind != AXIAL or abs(p.slope) >= 1e-9 or len(R.faces) < 50:
@@ -12528,7 +12572,7 @@ class Segmenter:
                         float(d.max()) <= tol
                         and float(d.min()) >= -(sag_w + tol)
                         and int((np.abs(d) <= tol).sum()) >= 1
-                        and float(za.max() - za.min()) >= 0.5 * side
+                        and float(za.max() - za.min()) >= 0.35 * side
                         and abs(float(p.normal_at(topo.cents[j][None, :])[0] @ topo.norms[j])) >= cmin
                     )
                 memo[j] = ok
@@ -12543,13 +12587,29 @@ class Segmenter:
                     if y not in cand and y not in wf and band(y):
                         cand.add(y)
                         st.append(y)
-            # (a region only whole, and still reached from the wall through
-            # the others)
+            # ⚠️ A REGION'S PART IN THE BAND, IF THE REST HOLDS TOGETHER. Taken
+            # only whole, test17's walls left the fans' end facets: a 5 mm2
+            # sliver beside a window, held between the wall and a torus r 11
+            # made of four fan facets and four of the side round's, stayed a
+            # face of its own, and a cylinder r 22 of three fan facets and ten
+            # of a bottom's rim ran down under another. A small region gives
+            # the facets it has in the band if what's left stays in one piece -
+            # keeping its surface, or loose under min_faces (the late merges
+            # and _close_free have it next) - and the group is still reached
+            # from the wall through the others.
             while True:
-                part = {owner[j] for j in cand if j in owner and not all(i in cand for i in regions[owner[j]].faces)}
-                if not part:
+                part = {}
+                for j in cand:
+                    if j in owner:
+                        part.setdefault(owner[j], set()).add(j)
+                bad = set()
+                for k, G in part.items():
+                    rest = [i for i in regions[k].faces if i not in G]
+                    if len(rest) >= self.min_faces and len(largest_component(rest, topo.adj)) != len(rest):
+                        bad.add(k)
+                if not bad:
                     break
-                cand = {j for j in cand if owner.get(j) not in part}
+                cand = {j for j in cand if owner.get(j) not in bad}
                 reach = {j for j in cand if any(q in wf for q in topo.adj[j])}
                 st = list(reach)
                 while st:
@@ -12565,19 +12625,27 @@ class Segmenter:
                     add |= set(g)
             if not add:
                 continue
-            gone = {owner[j] for j in add if j in owner}
+            hit = {owner[j] for j in add if j in owner}
             R2 = describe_region(p, topo, sorted(wf | add))
             R2.note, R2.repeated, R2.fallback = R.note, R.repeated, R.fallback
             R2.bare = R.bare if R.bare is not None else R
             regions[w] = R2
-            for kb in gone:
-                regions[kb] = Region(prim=regions[kb].prim, faces=[])
+            for kb in hit:
+                B = regions[kb]
+                rest = [i for i in B.faces if i not in add]
+                if len(rest) >= self.min_faces:
+                    B2 = describe_region(B.prim, topo, rest)
+                    B2.note, B2.repeated, B2.fallback = B.note, B.repeated, B.fallback
+                    regions[kb] = B2
+                    self._walls_cut.append(B2)
+                else:
+                    regions[kb] = Region(prim=B.prim, faces=[])
+                    n_regs += 1
             for j in add:
                 owner[j] = w
             n_take += len(add)
-            n_regs += len(gone)
         if n_take:
-            Log.debug(f"Coarse walls closed: {n_take} facets of their fans taken back ({n_regs} small regions on them dissolved)")
+            Log.debug(f"Coarse walls closed: {n_take} facets of their fans taken back ({n_regs} small regions on them dissolved, {len(self._walls_cut)} cut)")
         return [R for R in regions if R.faces]
 
     def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
@@ -17322,6 +17390,22 @@ def run_phase(
                 n_p, n_q = _refill(eng, R, min_faces, is_b, split_parts)
                 if n_q:
                     Log.debug(f"  {R.label()} filled again in {n_q} pieces: {n_p} converted")
+            # ⚠️ A MERGED PATCH REFUSED AT ITS COARSE EDGE: HALVES BEFORE PIECES.
+            # test17's bore-floor corners meet the floor's exact circle along
+            # facets 3.7 mm long, the circle a chord's sag (0.13) off the patch
+            # between their vertices: refused, each came back as the twenty
+            # pieces it was merged from, tori and cylinders of 4-30 facets and
+            # the loose facets between them. On the last pass such a patch is
+            # cut in halves first and each filled again (_refill); if one goes
+            # in, the halves stay - a half refused in turn stays mesh, as the
+            # strip along that edge does.
+            if not ok and round_ == 1 and getattr(R.prim, "merged", None) is not None and R.fallback and "polygonal edge tolerance" in why:
+                R.prim.fill = R.prim.merged
+                n_p, n_q = _refill(eng, R, min_faces, is_b, split_parts)
+                R.prim.fill = None
+                if n_p:
+                    R.fallback = []
+                    Log.debug(f"  {R.label()} filled again in {n_q} pieces instead of its own: {n_p} converted")
             if not ok and not is_b and split_now:
                 parts = angular_pieces(R, topo, min_faces)
                 if parts:
