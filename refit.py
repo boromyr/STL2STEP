@@ -4623,12 +4623,61 @@ def fit_fill(
         UV = lscm_uv(P, T)
         if UV is not None:
             pr, _ = _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn)
+            flat = False
+    # ⚠️ A CONFORMAL MAP JITTERS WHERE THE FACETS ARE SLIVERS. test17's
+    # window bottoms are one round wrapped 180 degrees round the slot's end,
+    # its corners and middle exported as separate pieces whose seams carry
+    # vertex pairs 0.01 mm apart: laid out by lscm_uv, each pair's offset
+    # comes out a few percent off its 3D one, and the interpolation through
+    # the points (exact at them) swung 2.2 mm off the facets between them -
+    # the union of the bottom's two halves held by no grid (3e-2 off at
+    # 42x23). On its mean plane the same patch interpolates within its
+    # chords (4e-2), but a 180-degree bend has no mean plane. So the
+    # conformal map is smoothed - least squares of (u, v) on a quadratic in
+    # the points' coordinates, a map as smooth as the surface - and tried
+    # again, if it turns every triangle the way it faces in 3D
+    # (_smooth_uv): the whole bottom in one B-spline, 54x27 poles.
+    if pr is None and not flat:
+        UVs = _smooth_uv(P, T, Nrep, UV)
+        if UVs is not None:
+            # (0.42 between 0.5 and 0.35: test17's window bottom held at 54x27,
+            # over the cap at 63x32; tried everywhere, a strip under another
+            # window came out a face the file's readers can't mesh)
+            pr, _ = _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UVs, n0, nn, steps=(3.0, 2.0, 1.5, 1.0, 0.7, 0.5, 0.42, 0.35, 0.25))
     return pr
 
 
-def _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn):
+def _smooth_uv(P: np.ndarray, T: np.ndarray, Nrep: np.ndarray, UV: np.ndarray) -> Optional[np.ndarray]:
+    """UV (a conformal layout of the triangles T over the points P, Nrep
+    their normals) fitted by least squares with a quadratic in the points'
+    coordinates (see fit_fill); None if that leaves a triangle turned
+    against the way it faces in 3D - a fan's triangle over a polygon
+    that isn't convex faces backwards there, and turned backwards in the
+    layout it is no fold (the conformal one turns it forwards)."""
+    if len(P) < 20:
+        return None
+    X = P - P.mean(axis=0)
+    X = X / max(float(np.abs(X).max()), 1e-300)
+    cols = [np.ones(len(X))] + [X[:, a] for a in range(3)] + [X[:, a] * X[:, b] for a in range(3) for b in range(a, 3)]
+    Phi = np.array(cols).T
+    try:
+        UVs = Phi @ np.linalg.lstsq(Phi, UV, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    n3 = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
+    face = np.einsum("ij,ij->i", n3, Nrep[T].sum(axis=1))
+    a, b = UVs[T[:, 1]] - UVs[T[:, 0]], UVs[T[:, 2]] - UVs[T[:, 0]]
+    turn = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+    real = np.linalg.norm(n3, axis=1) > 1e-12 * max(float(np.max(np.linalg.norm(n3, axis=1))), 1e-300)
+    sense = np.sign(float(np.sum(np.sign(turn[real]) * np.sign(face[real]))))
+    if sense == 0.0 or np.any(np.sign(turn[real]) * np.sign(face[real]) != sense):
+        return None
+    return UVs
+
+
+def _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn, steps=(3.0, 2.0, 1.5, 1.0, 0.7, 0.5, 0.35, 0.25)):
     """fit_fill on one flattening UV: (prim or None, whether the facets
-    are thin strips there)."""
+    are thin strips there). steps: the grids tried, as facets per knot span."""
     from scipy.interpolate import RBFInterpolator
     from scipy.spatial import cKDTree
 
@@ -4698,7 +4747,7 @@ def _fill_on(P, T, Nrep, data, tol, check, check_tol, max_poles, UV, n0, nn):
     X = S0.point(GU, GV) + corr(np.c_[GU, GV])
     GU, GV, X = np.r_[GU, UVd[:, 0]], np.r_[GV, UVd[:, 1]], np.vstack([X, Pd])
     Nd = Nrep[D]
-    for k in (3.0, 2.0, 1.5, 1.0, 0.7, 0.5, 0.35, 0.25):
+    for k in steps:
         nu = max(4, int(round(eu / (k * elu))) + _BS_DEG)
         nv = max(4, int(round(ev / (k * elv))) + _BS_DEG)
         if nu * nv > max_poles or nu * nv > len(X):
@@ -7983,6 +8032,18 @@ class Segmenter:
                     V = topo.verts[j]
                     if len(V) < 3 or not topo.planar[j]:
                         continue
+                    # ⚠️ A CHORD RUNS ALONG THE WALL, A ROUND'S FACET DOESN'T. A
+                    # round leaving the wall tangentially has facets a few
+                    # hundredths inside it with the wall's normal: the top of
+                    # a test17 window arch lost two of its blend's (0.27 and
+                    # 0.56 mm long) to the wall, a knee of another one a
+                    # third - notches in the arches' contours, which came in
+                    # with this rule (19/10). The chord it is for ran 37.6 mm
+                    # down the wall: a facet is taken if it spans along the
+                    # axis at least as far as the widest chord is wide.
+                    za = V @ p.axis
+                    if float(za.max() - za.min()) < abs(p.r0) * 2.0 * math.sin(math.radians(0.5 * CHORD_MAX_DEG)):
+                        continue
                     # (only into a notch of the wall, two sides or more on
                     # it: taken one side at a time, the facets ran up the
                     # window blends' rims and the wall's boundary there went
@@ -9274,6 +9335,18 @@ class Segmenter:
         regions = self._helical_bands(regions)
         regions = self._merge_free(regions)
         regions = self._fill_late(regions)
+        regions = self._close_walls(regions)
+        # ⚠️ A FILLED CORNER IS STILL PART OF THE ROUND NEXT TO IT. The loose
+        # facets a window bottom's B-spline didn't get (a wedge at the
+        # slot's corner, the row where the side round hands over, the rim
+        # near the wall) came out of the late fill as patches of 7-20 facets
+        # each, six on one test17 bottom: they get the merges once more, each
+        # with the patches next to it - after the walls have taken their fans
+        # back (merged first, two fan pieces and a rim piece made one patch
+        # the wall could no longer take whole).
+        late = {id(R) for R in getattr(self, "_late_fills", [])}
+        if late:
+            regions = self._merge_free(regions, only={k for k, R in enumerate(regions) if id(R) in late})
         regions = self._close_free(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
@@ -10292,7 +10365,7 @@ class Segmenter:
             out.append(describe_region(pr, topo, G2))
         return out
 
-    def _merge_free(self, regions):
+    def _merge_free(self, regions, only: Optional[set] = None):
         """
         ⚠️ A LOFT IS ONE FACE, NOT A STACK OF OSCULATING STRIPS. test18's legs
         are lofts from a quarter ring at the foot to a rounded rectangle at
@@ -10310,6 +10383,15 @@ class Segmenter:
         again. A junction where the curvature jumps (a round against a flat
         loft) is no B-spline's and stays as it was; a merged patch the
         engine refuses gives way to its pieces (fallback).
+        ⚠️ WITH THE HOLES IN IT. The loose facets a union encloses - test17's
+        window bottoms had islands of 3-12 inside their B-spline - go into
+        its fit: left out, the spline over them is held by nothing, the
+        patch that closes slits (_close_free) finds them off it, and the
+        late fill (_fill_late) made each a B-spline of its own - a window
+        bottom in eight faces. Enclosed: every neighbour in the union or the
+        island, 40 facets at most, none on the mesh's border.
+        only: the regions a merge has to involve (the late fill's patches,
+        once the walls have taken their fans: _run); all of them if None.
         """
         if not self.allow_free or len(regions) < 2:
             return regions
@@ -10337,6 +10419,33 @@ class Segmenter:
         owner = {i: k for k, R in enumerate(regions) for i in R.faces}
         rep_of = {k: k for k in cand}
         groups = {k: set(regions[k].faces) for k in cand}
+        absorbed = set()  # loose facets already in a group (its holes)
+
+        def holes(G):
+            ring = {j for i in G for j in topo.adj[i] if j not in G and j not in owner and j not in absorbed}
+            out_, seen = set(), set()
+            for s0 in ring:
+                if s0 in seen:
+                    continue
+                comp, st, closed = {s0}, [s0], True
+                seen.add(s0)
+                while st and closed:
+                    x = st.pop()
+                    if len(comp) > 40 or len(topo.adj[x]) < 3 or not (topo.planar[x] and 3 <= len(topo.verts[x]) <= 4):
+                        closed = False
+                        break
+                    for y in topo.adj[x]:
+                        if y in G or y in comp:
+                            continue
+                        if y in owner or y in absorbed:
+                            closed = False
+                            break
+                        comp.add(y)
+                        seen.add(y)
+                        st.append(y)
+                if closed:
+                    out_ |= comp
+            return out_
         members = {k: [k] for k in cand}
         sag_r = {k: float(regions[k].sag) for k in cand}
         prims = {}
@@ -10360,8 +10469,11 @@ class Segmenter:
                     key = (frozenset(members[k]), frozenset(members[r]))
                     if r == k or key in tried:
                         continue
+                    if only is not None and not any(q in only for q in members[k] + members[r]):
+                        continue
                     tried.add(key)
                     union = groups[k] | groups[r]
+                    union |= holes(union)
                     if len(union) > 1200:
                         continue
                     n_try += 1
@@ -10370,7 +10482,24 @@ class Segmenter:
                     if not got:
                         continue
                     pr = got[0][0]
+                    # ⚠️ ONE FACE, NOT A HEAVIER ONE. On test15 the late pass
+                    # merged a 6-facet corner into a 5x11 thread patch: 18x48
+                    # poles, and the phases after it came out with four faces
+                    # more. Two free-form patches go together late only if the
+                    # union needs no more than half again the poles of the two
+                    # (test17's window bottom: 54x27 for 32x41 and 12x12). (A
+                    # quadric's piece is no measure: held to it, test16's torus
+                    # r 23 osculating a blend stayed, 0.032 off between its
+                    # vertices.)
+                    if only is not None:
+                        fa_ = getattr(prims.get(k, regions[k].prim), "free", None)
+                        fb_ = getattr(prims.get(r, regions[r].prim), "free", None)
+                        if fa_ is not None and fb_ is not None:
+                            n_poles = lambda f_: int(np.prod(f_.poles.shape[:2]))
+                            if n_poles(pr.free) > 1.5 * (n_poles(fa_) + n_poles(fb_)):
+                                continue
                     pr.fill = None
+                    absorbed |= union - groups[k] - groups[r]
                     groups[k] = union
                     members[k] += members[r]
                     sag_r[k] = max(sag_r[k], sag_r[r])
@@ -10462,6 +10591,7 @@ class Segmenter:
                     n_f += len(G2)
         if n_p:
             Log.debug(f"Filled corners between the rounds: {n_p} patches on {n_f} loose facets")
+        self._late_fills = regions[len(regions) - n_p:] if n_p else []
         return regions
 
     def _tube_patches(self, regions):
@@ -12333,6 +12463,121 @@ class Segmenter:
             n_reg += 1
         if n_add:
             Log.debug(f"Free-form patches closed: {n_add} facets in slits and holes taken by {n_reg} patches ({n_moved} of them from the patch next to it, {len(gone_regs)} small patches taken whole)")
+        return [R for R in regions if R.faces]
+
+    def _close_walls(self, regions):
+        """
+        ⚠️ UNDER A WINDOW THE COARSE WALL IS A FAN, NOT A CHORD. test17's
+        47-gon wall (sides 2.85 mm, 0.047 deep) runs under each window's
+        bottom round in a fan of thirty-odd slivers, from the polygon's
+        corners and the points on its sides at the flange (down to 0.047
+        inside) up to the round's foot, which the CAD put on the true circle.
+        None is a chord - twisted up to 17 degrees, one corner on the circle
+        or two - so _reclaim_chords leaves them, and the late stages cover
+        them with cylinders r 5-25 and B-splines of three to seven facets: a
+        dozen slivers of faces a window, and its round's lower contour cut
+        into as many pieces. Here, once every stage has had its go, a coarse
+        polygon cylinder (_deep_chords, half round at least) takes the
+        groups of facets beside it that lie in its chords' band - no vertex
+        outside, none deeper than its own deepest chord, one on it, the
+        normal within 30 degrees of its own - each as long along the axis
+        as half the polygon's side (a round's rim facets at a window's arch
+        are 0.3-0.6 mm: _reclaim_chords), loose or a small region (under 16
+        facets) taken whole, in groups of two facets or more (a single
+        facet beside a window's arch is a round's rim, not a fan). Without
+        a refit; if the engine refuses the wall, the wall as it was is
+        tried (bare).
+        """
+        topo = self.topo
+        tol = self.tol_fit
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        cmin = math.cos(math.radians(30.0))
+        n_take = n_regs = 0
+        for w, R in enumerate(regions):
+            p = R.prim
+            if p is None or p.kind != AXIAL or abs(p.slope) >= 1e-9 or len(R.faces) < 50:
+                continue
+            C = np.array([topo.cents[i] for i in R.faces]) - p.center
+            ex, ey = ortho_frame(p.axis)
+            th = np.floor((np.arctan2(C @ ey, C @ ex) + math.pi) / (2.0 * math.pi) * 36.0).astype(int)
+            if len(set(th.tolist())) < 18 or not self._deep_chords(R.faces, p, ring=False):
+                continue
+            wf = set(R.faces)
+            deep = abs(p.r0) * (1.0 - math.cos(0.5 * math.radians(CHORD_MAX_DEG))) + tol
+            sag_w = 0.0
+            for i in wf:
+                V = topo.verts[i]
+                if topo.planar[i] and len(V) >= 3:
+                    sag_w = max(sag_w, -float(p.dist(V).min()))
+            sag_w = min(sag_w, deep)
+            side = 2.0 * math.sqrt(2.0 * abs(p.r0) * sag_w)
+            if side <= 0.0:
+                continue
+            memo = {}
+
+            def band(j):
+                if j in memo:
+                    return memo[j]
+                ok = False
+                k = owner.get(j)
+                V = topo.verts[j]
+                if (k is None or (k != w and len(regions[k].faces) < 16)) and topo.planar[j] and len(V) >= 3:
+                    d = p.dist(V)
+                    za = V @ p.axis
+                    ok = (
+                        float(d.max()) <= tol
+                        and float(d.min()) >= -(sag_w + tol)
+                        and int((np.abs(d) <= tol).sum()) >= 1
+                        and float(za.max() - za.min()) >= 0.5 * side
+                        and abs(float(p.normal_at(topo.cents[j][None, :])[0] @ topo.norms[j])) >= cmin
+                    )
+                memo[j] = ok
+                return ok
+
+            cand = set()
+            st = [j for i in wf for j in topo.adj[i] if j not in wf and band(j)]
+            cand |= set(st)
+            while st:
+                x = st.pop()
+                for y in topo.adj[x]:
+                    if y not in cand and y not in wf and band(y):
+                        cand.add(y)
+                        st.append(y)
+            # (a region only whole, and still reached from the wall through
+            # the others)
+            while True:
+                part = {owner[j] for j in cand if j in owner and not all(i in cand for i in regions[owner[j]].faces)}
+                if not part:
+                    break
+                cand = {j for j in cand if owner.get(j) not in part}
+                reach = {j for j in cand if any(q in wf for q in topo.adj[j])}
+                st = list(reach)
+                while st:
+                    x = st.pop()
+                    for y in topo.adj[x]:
+                        if y in cand and y not in reach:
+                            reach.add(y)
+                            st.append(y)
+                cand = reach
+            add = set()
+            for g in _face_groups(cand, topo.adj):
+                if len(g) >= 2:
+                    add |= set(g)
+            if not add:
+                continue
+            gone = {owner[j] for j in add if j in owner}
+            R2 = describe_region(p, topo, sorted(wf | add))
+            R2.note, R2.repeated, R2.fallback = R.note, R.repeated, R.fallback
+            R2.bare = R.bare if R.bare is not None else R
+            regions[w] = R2
+            for kb in gone:
+                regions[kb] = Region(prim=regions[kb].prim, faces=[])
+            for j in add:
+                owner[j] = w
+            n_take += len(add)
+            n_regs += len(gone)
+        if n_take:
+            Log.debug(f"Coarse walls closed: {n_take} facets of their fans taken back ({n_regs} small regions on them dissolved)")
         return [R for R in regions if R.faces]
 
     def _grow_free(self, pr, faces, busy, check_tol: float, rounds: int = 3):
@@ -16453,6 +16698,25 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
                 # that doesn't mean anything.
                 if dev <= tol and dev < 0.2 * dev_retta and arc_deviation(circ, P) <= arc_tol:
                     cv = circ
+        # ⚠️ THE VERTICES STAND OFF THE CURVE AS FAR AS THEY STAND OFF THE
+        # FACES. Under test17's windows the 47-gon wall meets the flange
+        # along a curve of the window cutters' points between the polygon
+        # and the circle, up to 0.04 inside it: the exact circle, wall x
+        # flange, stood off them by that, no circle went through them, and
+        # every chain with one stayed a polyline - 105 segments along the
+        # flange once the wall had taken the fans above them (_close_walls).
+        # An exact curve lies on both faces: last of all it may stand off the
+        # vertices as far as the edges it replaces already stand off the
+        # faces (their tolerance), never past the arc's own gate - on three
+        # segments or more, after the circle through the vertices. (Tried
+        # before it, or on two segments, it took the place of the circles
+        # beside the windows' arches - the two-segment one below - and failed
+        # their pcurves: eight arcs lost.)
+        if cv is None and pa is not None and pb is not None and ex_c and len(cat) >= 3:
+            vtol = min(max(tol, 1.1 * max(float(bt_Tolerance(topo.edges[k])) for k in cat)), arc_tol)
+            if vtol > tol:
+                cv = choose_curve(ex_c, Pq, vtol, scale=diag, arc_tol=arc_tol)
+                exact = cv is not None
         # ⚠️ TWO SEGMENTS: THE CIRCLE THROUGH THEM, ON PROBATION. Where a
         # rolling-ball fillet hands over to the r1 cylinder its ball sweeps
         # next (test13, each end of the fillets) the two faces are tangent
@@ -17081,17 +17345,22 @@ def run_phase(
         pending = again
         Log.info(f"Second pass on {len(pending)} regions rejected for polygonal boundaries")
     # a rejected swept face or free-form patch: what it had replaced, as it was
+    # (and a rejected piece's own pieces in turn: a late fill merged into a
+    # merged patch - _fill_late)
     backs = []
-    for R in regions:
-        if R.fallback and R.status.startswith("rejected"):
-            for Q in R.fallback:
-                if any(Q is B for B in backs):
-                    continue
-                Q.fobjs = [topo.faces[i] for i in Q.faces]
-                Q.status, Q.note = "", ""
-                eng.convert(Q, strict_hole=is_b)
-                Q.note = (Q.note + " · " if Q.note else "") + "in place of a rejected swept face"
-                backs.append(Q)
+    todo = [R for R in regions if R.fallback and R.status.startswith("rejected")]
+    while todo:
+        R = todo.pop(0)
+        for Q in R.fallback:
+            if any(Q is B for B in backs):
+                continue
+            Q.fobjs = [topo.faces[i] for i in Q.faces]
+            Q.status, Q.note = "", ""
+            eng.convert(Q, strict_hole=is_b)
+            Q.note = (Q.note + " · " if Q.note else "") + "in place of a rejected swept face"
+            backs.append(Q)
+            if Q.fallback and Q.status.startswith("rejected"):
+                todo.append(Q)
     regions = regions + backs + split_parts
 
     res.shape = eng.shape

@@ -251,6 +251,12 @@ are reported but left in.
   free-form patch's rim ceiling raised to the mesh's chord sag - 33 faces fewer, 9 circles fewer.)
   `test17`: 589 → 571 faces, the most circles and the fewest polyline edges between curved faces of
   any version; the rest unchanged.
+  Nor a round's facet: a round leaving the wall tangentially has facets a few hundredths inside it
+  with the wall's normal, and the top of a window arch lost two of its blend's to the wall, a knee
+  of another one a third - notches in the arches' contours. A chord of an extruded wall runs along
+  it (the one this is for, 37.6 mm), a round's facet doesn't (0.27-0.56 mm): a facet is taken only
+  if it spans along the axis at least as far as the widest chord is wide. `test17` 489 → 480, the
+  arches smooth again, the rest unchanged.
 - **Latitude bands of a coarse round.** `test17`'s bore floor round (R8.5 r2, OpenSCAD's
   rotate_extrude in 47 sectors) came out as four spheres r 10.5-14, each exact through its two
   rings, and the strips between them: with 18 degrees between bands they don't meet tangentially,
@@ -280,6 +286,40 @@ are reported but left in.
   curved region touches them - 90 polyline edges more, 5 circles and 4 ellipses fewer; the strips
   under the windows are the circle's, finer than the 47-gon's sides, with one corner on the window
   bottom's rim 0.04 inside it.)
+- **A window bottom in one piece.** `test17`'s window bottoms are one round wrapped 180 degrees
+  round the slot's end, exported as corners and a middle whose seams carry vertex pairs 0.01 mm
+  apart. A 180-degree bend has no mean plane, so the union of a bottom's halves is laid out
+  conformally - and there each pair's offset comes out a few percent off its 3D one: the
+  interpolation through the points, exact at them, swung 2.2 mm off the facets between them, and no
+  grid held (3e-2 off at 42x23). When the conformal layout fails, it is smoothed (least squares of
+  (u, v) on a quadratic in the points' coordinates) and tried again, if every triangle then turns
+  the way it faces in 3D, with one more grid between 0.5 and 0.35 facets a span (everywhere, that
+  grid made a strip under another window a face the readers couldn't mesh). A merge takes the loose
+  islands its union encloses (40 facets at most): left out, the spline over them was held by
+  nothing, and the late fill made each a patch of its own. And the late fill's patches - the wedge
+  at a slot's corner, the row where the side round hands over - get the merges once more, after the
+  walls have taken their fans back; two free-form patches only if the union needs no more than half
+  again their poles (`test15`'s 6-facet corner made a 5x11 thread patch 18x48, and four faces more
+  after it), a quadric's piece always (held to it, a torus r 23 osculating one of `test16`'s blends
+  stayed, 0.032 off between its vertices). A rejected merge gives way to its pieces, and a rejected
+  piece to its own.
+- **Under a window the coarse wall is a fan.** Below each window bottom the 47-gon wall runs in a
+  fan of thirty-odd slivers, from the polygon's sides at the flange (down to 0.047 inside) up to the
+  round's foot on the true circle: twisted up to 17 degrees, one corner on the circle or two, never
+  a chord, so the seeds covered them with cylinders r 5-25 and B-splines of three to seven facets.
+  Once every stage has had its go, a coarse polygon cylinder takes the groups beside it that lie in
+  its chords' band - no vertex outside, none deeper than its own deepest chord, one on it, the normal
+  within 30 degrees, each facet as long along the axis as half the polygon's side (a round's rim
+  facets at an arch are 0.3-0.6 mm) - loose or small regions taken whole, two facets or more. The
+  wall then met the flange along the cutters' points, between the polygon and the circle: the exact
+  circle stood off them and 105 segments stayed polylines. Last of all, on three segments or more,
+  an exact curve may stand off the vertices as far as the edges it replaces stand off the faces
+  (tried first, or on two segments, it took the place of the circles beside the arches and failed
+  their pcurves).
+  The two together: `test17` 480 → 367 faces (each window bottom one B-spline and a few slivers,
+  the skirts under them gone; polyline edges between curved faces 765 → 549, between curved faces
+  and planes 405 → 316), `test18` 489 → 337 (1337 → 1059, 382 → 272; deviation 0.025 → 0.024),
+  `test16` 808 → 801, `test9` 890 → 886, the rest and the CAD comparisons unchanged.
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
