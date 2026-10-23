@@ -2756,6 +2756,35 @@ def removable_vertices(shape, lin_tol: float, planar_only: bool = False):
             else:
                 start = k
                 k += 1
+    # ⚠️ A FACE KEEPS THREE EDGES. A sliver triangle on test17's bore floor
+    # shared two of its sides, nearly in line, with the same cylinder: the
+    # merge made them one line, on top of its third side - a face bounded by
+    # two coincident lines, valid, and no reader meshes it (collapse_lenses
+    # leaves it: both its neighbours are curved). Each vertex removed takes
+    # an edge from both its faces; a face left with fewer than three, every
+    # face around it curved, keeps its vertices. (Beside a plane the lens
+    # goes, as it should: a needle of the raw mesh, collapse_lenses - kept
+    # there, test17 came out with a hundred faces more.)
+    n_fe = Counter(i for fs in e_faces for i in fs)
+    f_nb = defaultdict(set)
+    for fs in e_faces:
+        for i in fs:
+            f_nb[i].update(j for j in fs if j != i)
+    flat = {}
+
+    def all_curved(i):
+        for j in f_nb[i]:
+            if j not in flat:
+                flat[j] = BRepAdaptor_Surface(td_Face(fmap.FindKey(j + 1)), True).GetType() == GeomAbs_Plane
+            if flat[j]:
+                return False
+        return True
+    for _ in range(4):
+        lost = Counter(i for j in removable for i in fkey[v_edges[j][0]])
+        short = {i for i, n in lost.items() if n_fe[i] - n < 3 and all_curved(i)}
+        if not short:
+            break
+        removable -= {j for j in removable if short & set(fkey[v_edges[j][0]])}
     keep = [ve.FindKey(j + 1) for j in range(nV) if j not in removable]
     return keep, len(removable)
 
@@ -9356,11 +9385,12 @@ class Segmenter:
         # test17 window bottom's slot edge failed against the half-bottom it
         # met first and fits the whole bottom (44x23 poles). So the small
         # pieces (40 facets at most, free-form or a quadric off its facets -
-        # an exact one stays) and what the walls cut (_close_walls) get their
-        # turn too.
+        # an exact one stays, unless it's a sphere or torus one facet wide:
+        # _merge_free) and what the walls
+        # cut (_close_walls) get their turn too.
         late = {id(R) for R in getattr(self, "_late_fills", []) + getattr(self, "_walls_cut", [])}
         tol_ex = 0.05 * self.tol_fit
-        only = {k for k, R in enumerate(regions) if id(R) in late or (len(R.faces) <= 40 and (R.prim.kind == FREE or (R.prim.kind in (AXIAL, TORUS, SPHERE) and R.rms > tol_ex)))}
+        only = {k for k, R in enumerate(regions) if id(R) in late or (len(R.faces) <= 40 and (R.prim.kind == FREE or (R.prim.kind in (AXIAL, TORUS, SPHERE) and (R.rms > tol_ex or (R.prim.kind != AXIAL and self._one_wide(R.faces))))))}
         if only:
             regions = self._merge_free(regions, only=only)
         regions = self._close_free(regions)
@@ -10388,6 +10418,14 @@ class Segmenter:
             out.append(describe_region(pr, topo, G2))
         return out
 
+    def _one_wide(self, faces) -> bool:
+        """no vertex of the facets has all its facets among them: a strip
+        one facet wide, whose fit says nothing across it"""
+        topo = self.topo
+        fs = set(faces)
+        vs = {a for i in fs for e in topo.f_edges[i] for a in topo.e_verts[e] if a >= 0}
+        return not any(all(f in fs for e in topo.v_edges[v] for f in topo.e_faces[e]) for v in vs)
+
     def _merge_free(self, regions, only: Optional[set] = None):
         """
         ⚠️ A LOFT IS ONE FACE, NOT A STACK OF OSCULATING STRIPS. test18's legs
@@ -10421,15 +10459,32 @@ class Segmenter:
         topo = self.topo
         tol = self.tol_fit
 
+        # ⚠️ ONE FACET WIDE IS NO EVIDENCE. A strip one facet wide across a
+        # test17 window bottom - every vertex on one of its two long sides -
+        # fitted a sphere to 2.3e-5 (r 2.08 on one window, 2.45 on its copy,
+        # a torus on the others): two samples across say nothing of the
+        # curvature across. A sphere or torus with no vertex inside its
+        # region (_one_wide) is weak; a cylinder's band of full-length facets
+        # is held by its two circles and stays exact.
         def weak(R):
             p = R.prim
-            if getattr(p, "ball", None) is not None or getattr(p, "helix", None) is not None or getattr(p, "tube", None) is not None:
+            if getattr(p, "ball", None) is not None or getattr(p, "helix", None) is not None:
+                return False
+            # (a tube's patch too, unless it holds its facets as a CAD's own
+            # tube does: across a test17 window bottom the middle rows of the
+            # round, three strips going a quarter turn round the slot, came
+            # out a tube of their own at 0.45 of the tolerance and the bottom
+            # stayed in three faces - its twins, where no tube held, in one.
+            # test9's pipes, 0.01-0.1 of it, merged with the pieces around
+            # them were refused at their coarse edge, and the pieces given
+            # back last left 22 planes of mesh beside them)
+            if getattr(p, "tube", None) is not None and R.rms <= 0.2 * tol:
                 return False
             if p.kind == FREE:
                 return True
             if p.kind not in (AXIAL, TORUS, SPHERE):
                 return False
-            if R.rms <= 0.05 * tol and len(R.faces) >= 8:
+            if R.rms <= 0.05 * tol and len(R.faces) >= 8 and not (p.kind in (TORUS, SPHERE) and self._one_wide(R.faces)):
                 return False
             return len(R.faces) < 60 or R.coverage * 360.0 < 45.0
 
@@ -12378,7 +12433,8 @@ class Segmenter:
         patches meet, the line between them zigzags facet by facet (on
         test17 two B-splines shared a window bottom along a saw-tooth): a
         facet of the neighbour with two sides on this patch, held by this
-        surface, changes hands, if the neighbour stays in one piece.
+        surface, changes hands, if the neighbour stays in one piece - a
+        quadric's as well as a patch's.
         """
         if not self.allow_free:
             return regions
@@ -12421,7 +12477,16 @@ class Segmenter:
 
             add = set()
             took = {}  # neighbour patch -> the facets it gives
-            free_nb = lambda j: j not in owner or (owner[j] != k and regions[owner[j]].prim.kind == FREE)
+            # (and the teeth of an exact quadric next to it: where a test17
+            # window's arch leg meets its knee, the leg's cylinder - on its
+            # vertices to 1e-7 - had grown a facet or two down past the seam,
+            # a step in the seam on every window. Held back while the final
+            # Phase A could leave the sliver beside them a face of two
+            # coincident edges: removable_vertices. Not a noisy one's: on
+            # test16 50 facets changed hands and it came out with 32 faces
+            # more)
+            tol_ex = 0.05 * self.tol_fit
+            free_nb = lambda j: j not in owner or (owner[j] != k and (regions[owner[j]].prim.kind == FREE or (regions[owner[j]].prim.kind in (AXIAL, TORUS, SPHERE) and regions[owner[j]].rms <= tol_ex)))
             for _ in range(20):
                 cur = fs | add
                 cand = {j for i in cur for j in topo.adj[i] if j not in cur and free_nb(j)}

@@ -343,6 +343,32 @@ are reported but left in.
   fewer between curved faces, but the bore floor's last merges then left a plane bounded by two
   lines on top of each other, a face no reader meshes; a big patch taking a cylinder's teeth only,
   `test16` 801 → 833.)
+- **Five windows, one bottom each.** `test17`'s five windows are copies of one mesh, and their
+  bottoms still came out three ways. On two of them a strip one facet wide across the bottom fitted
+  a sphere to 2.3e-5 (r 2.08 on one, 2.45 on the other, a torus on the rest): every vertex on one
+  of its two long sides, and two samples across say nothing of the curvature across. Such a sphere
+  or torus, no vertex inside its region, is no longer exact for the merges (a cylinder's band of
+  full-length facets is held by its two circles and stays). On the window at -20 degrees, three
+  rows of the bottom's middle had come out a tube patch (`_tube_patches`, three strips a quarter
+  turn round the slot, 0.45 of the tolerance off its facets), and a tube never merged: the bottom
+  stayed in three faces. A tube merges now, unless it holds its facets as a CAD's own tube does,
+  within a fifth of the tolerance (`test9`'s pipes, 0.01-0.1 of it: merged with the pieces around
+  them they were refused at their coarse edge, and the pieces given back last left 22 planes of mesh
+  beside them). And a patch takes the teeth of an exact quadric next to it, as it takes a free-form
+  one's (an arch leg's cylinder, on its vertices to 1e-7, grown a facet past its seam into the
+  knee), now that the final Phase A can't leave a face two edges: two segments in line between the
+  same two faces are one line only if each face keeps three edges, wherever every face around it is
+  curved (beside a plane the lens still collapses, as the raw mesh's needles should: held there too,
+  `test17` came out with a hundred faces more). Not a noisy quadric's: `test16` gave 50 facets and
+  came out with 32 faces more. `test17` 329 → 323 (each of the five bottoms one B-spline; polyline
+  edges between curved faces 495 → 461), `test18` 316 → 312 (between curved faces 1044 → 1007, curved
+  and planes 254 → 240; deviation 0.024 → 0.023), `test15` 354 → 353, the rest and the CAD
+  comparisons unchanged. (Tried: halving a refused merge only when it was made of four pieces or
+  more - `test17` 329 → 338, a bore-floor corner of three came back as its pieces.) Still stepped:
+  each window's knee where the arch leg's side wall meets it - Phase A merged the first triangles of
+  the knee's round into that plane, within its tolerance, and the plane is a single facet to the
+  segmenter; the right knee at 140 degrees is meshed coarser than its twins and keeps the exact torus
+  and cylinder its facets lie on.
 
 The phases run in the order they're written on the command line. With no flags the sequence is
 `A C A(0.005) C A(0.005)`, the one that came out best on the test parts, every sequence run on all
