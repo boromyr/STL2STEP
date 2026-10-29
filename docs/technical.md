@@ -143,7 +143,12 @@ are reported but left in.
   one face: a B-spline swept along the helix for a flank, cylinders cut into pieces of at most
   300° for a crest or a root (`test15`: an internal thread of 4.4 turns, pitch 2.14 mm, two faces
   where there were 190 regions and 3,400 triangles, 1,431 → 795 faces; `test17`: the lid's 1/8"
-  thread, 2,642 → 1,730 faces).
+  thread, 2,642 → 1,730 faces). A rounded crest or root is a circular arc of the profile, swept the
+  same way; a flank takes the triangles wedged in its rim whose corners are all on its sweep (taking
+  only those standing on a row left a sawtooth rim that touched itself at every vertex, and the face
+  was invalid); a 300° piece of crest or root cylinder that is refused (a helical band went 354°
+  round with its facets' width: "ambiguous angular coverage") gives way to its halves (`test14`'s M10 nut, pitch 0.907 mm, 42,000 triangles: on the hole cut
+  out of the part, 5,515 → 3,735 faces, its flanks from none to almost all converted).
   A tube that is no quadric - a loft narrowing along its axis, its sections ellipses on tilted
   planes - used to come out as dozens of osculating cylinders and cones, each a strip of a few
   degrees. Strips that touch, with nearly parallel axes and similar radii, going round a common
@@ -429,7 +434,12 @@ STEP keeps no tolerances, so a face that was valid in memory only thanks to a ve
 sliver whose ring touches the face's rim) can read back invalid with or without pcurves. When that
 happens the part as read back is mended — the vertex moved to the edges' crossing, the sliver
 covered by the face around it — and written again, kept only if it reads back better and with the
-same volume (`test12` now reads back valid), also when the reader has cut a face in two. A
+same volume, also when the reader has cut a face in two. On a planar face the crossing is looked
+for in the face's own (u, v), at any angle and between two straight edges too: two skew lines never
+meet in space, but `test12`'s 5.3 and 13.8 mm edges at a right-angled corner touched in a T 2.1e-4
+from their vertex once read back. A hole may be filled by two or three slivers together (an
+ellipse, its chord and a 0.03 mm edge): they go as one. `test12`, whose file read back with one or
+three invalid faces, now reads back valid. A
 degenerate edge on a surface that has no pole there (a plane, a cylinder, a torus with R > r) is
 dropped before writing: the reader made a wire of its own out of one, and a 0.33 mm² face of a
 `test14` spindle torus came back as the whole torus, 36,342 mm².

@@ -1997,6 +1997,65 @@ def _lost_faces(shape, ri, tol: float) -> Set[int]:
     return lost
 
 
+def _plane_crossing(A, B, P_v, fmap, reach: float, hits: list, a: int, b: int) -> bool:
+    """Where the pcurves of two edges (fix_crossing_vertices' tuples) cross
+    on a planar face they share, near the vertex P_v: appended to hits as
+    (distance, a, b, point, ua, ub); True if one was found."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve2d
+
+    for fi in sorted(A[6] & B[6]):
+        F = td_Face(fmap.FindKey(fi))
+        if BRepAdaptor_Surface(F, False).GetType() != GeomAbs_Plane:
+            continue
+        try:
+            ta = np.linspace(A[8][0], A[8][1], 200)
+            tb = np.linspace(B[8][0], B[8][1], 200)
+            ca, cb = BRepAdaptor_Curve2d(A[0], F), BRepAdaptor_Curve2d(B[0], F)
+            Qa = np.array([[p.X(), p.Y()] for p in (ca.Value(float(t)) for t in ta)])
+            Qb = np.array([[p.X(), p.Y()] for p in (cb.Value(float(t)) for t in tb)])
+        except Exception:
+            continue
+        ra, sa = Qa[:-1], Qa[1:] - Qa[:-1]
+        rb, sb = Qb[:-1], Qb[1:] - Qb[:-1]
+        # every segment of one against every segment of the other
+        den = sa[:, None, 0] * sb[None, :, 1] - sa[:, None, 1] * sb[None, :, 0]
+        dq = rb[None, :, :] - ra[:, None, :]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            s = (dq[..., 0] * sb[None, :, 1] - dq[..., 1] * sb[None, :, 0]) / den
+            t = (dq[..., 0] * sa[:, None, 1] - dq[..., 1] * sa[:, None, 0]) / den
+        ok = np.isfinite(s) & np.isfinite(t) & (s >= 0.0) & (s <= 1.0) & (t >= 0.0) & (t <= 1.0)
+        cand = []
+        for i, j in zip(*np.nonzero(ok)):
+            cand.append((float(ta[i] + s[i, j] * (ta[i + 1] - ta[i])), float(tb[j] + t[i, j] * (tb[j + 1] - tb[j]))))
+        # (or one's end ON the other: test12's 13.8 mm edge starts 2.1e-4
+        # off the vertex, right on the 5.3 mm one running past it - a T that
+        # touches, no crossing to find)
+        near_tol = max(float(bt_Tolerance(A[0])), float(bt_Tolerance(B[0])), 1e-7)
+        for Q0, T0, R_, S_, TR, mine in ((Qb, tb, ra, sa, ta, 1), (Qa, ta, rb, sb, tb, 0)):
+            e_ = 0 if (B if mine else A)[4] else -1
+            p = Q0[e_]
+            L2 = np.maximum(np.einsum("ij,ij->i", S_, S_), 1e-300)
+            w = np.clip(np.einsum("ij,ij->i", p - R_, S_) / L2, 0.0, 1.0)
+            dd = np.linalg.norm(R_ + w[:, None] * S_ - p, axis=1)
+            k = int(np.argmin(dd))
+            if dd[k] <= near_tol:
+                u_other = float(TR[k] + w[k] * (TR[k + 1] - TR[k]))
+                cand.append((u_other, float(T0[e_])) if mine else (float(T0[e_]), u_other))
+        found = False
+        for ua, ub in cand:
+            if not (A[2] <= ua <= A[3] and B[2] <= ub <= B[3]):
+                continue
+            qa, qb = A[1].Value(ua), B[1].Value(ub)
+            X = 0.5 * (np.array([qa.X(), qa.Y(), qa.Z()]) + np.array([qb.X(), qb.Y(), qb.Z()]))
+            dv = float(np.linalg.norm(X - P_v))
+            if 1e-6 < dv < reach:
+                hits.append((dv, a, b, X, ua, ub))
+                found = True
+        if found:
+            return True
+    return False
+
+
 def fix_crossing_vertices(shape, faces, reach: float = 5e-3) -> int:
     """
     ⚠️ VALID IN MEMORY, SELF-INTERSECTING ONCE WRITTEN. Where two edges of a
@@ -2058,7 +2117,19 @@ def fix_crossing_vertices(shape, faces, reach: float = 5e-3) -> int:
         for a in range(len(es)):
             for b in range(a + 1, len(es)):
                 A, B = es[a], es[b]
-                if (A[7] and B[7]) or not (A[6] & B[6]) or abs(float(A[5] @ B[5])) < cos_t:
+                if not (A[6] & B[6]):
+                    continue
+                # ⚠️ IN THE PLANE, NOT IN SPACE. Two straight edges of a
+                # planar face meeting at a right angle (test12: 5.3 and 13.8
+                # mm at a corner of an inclined plane) read back each a hair
+                # off the plane, skew: in space they never meet, but their
+                # pcurves cross 2e-4 from the vertex, past its 2.2e-4 once the
+                # reader rebuilt them - SelfIntersectingWire. On a planar face
+                # the crossing is looked for in its (u, v), any angle, lines
+                # too.
+                if _plane_crossing(A, B, P_v, fmap, reach, hits, a, b):
+                    continue
+                if (A[7] and B[7]) or abs(float(A[5] @ B[5])) < cos_t:
                     continue
                 try:
                     # (parallel curves have no isolated extremum: Points raises,
@@ -2100,6 +2171,30 @@ def fix_crossing_vertices(shape, faces, reach: float = 5e-3) -> int:
     return moved
 
 
+def _ring_island(es, nb, ef, gone, max_faces: int = 3):
+    """The faces (at most max_faces, one wire each) filling an inner ring
+    whose edges es have the single other faces nb: together bounded by the
+    ring alone - every other edge of theirs between two of them. None if
+    they aren't (or one is already gone)."""
+    isl = []
+    for x in nb:
+        if not any(x[0].IsSame(g) for g in isl):
+            isl.append(x[0])
+    if len(isl) > max_faces or any(L.IsSame(g) for L in isl for g in gone):
+        return None
+    for L in isl:
+        if count_sub(L, TopAbs_WIRE) != 1:
+            return None
+        for e in explore(L, TopAbs_EDGE):
+            e = td_Edge(e)
+            if any(e.IsSame(r) for r in es):
+                continue
+            fs_ = list(_iter_list(ef.FindFromKey(e)))
+            if len(fs_) != 2 or not all(any(g.IsSame(h) for h in isl) for g in fs_):
+                return None
+    return [td_Face(L) for L in isl]
+
+
 def remove_lens_holes(shape, faces, max_dev: float, max_edges: Optional[int] = None):
     """
     ⚠️ A LENS-SHAPED HOLE TOUCHING THE FACE'S RIM. A facet cut by an exact
@@ -2118,6 +2213,11 @@ def remove_lens_holes(shape, faces, max_dev: float, max_edges: Optional[int] = N
     its inside within max_dev of the surface too, not only its rim (test12
     has a facet so: covered, the part lost 2 mm3). max_edges: rings of at
     most that many edges.
+    ⚠️ OR TWO OF THEM. A ring can be filled by a few faces that together
+    have no other border (test12: a cylinder's hole between an ellipse and
+    its 0.83 mm chord, filled by a 0.0097 mm2 lens and a 0.0009 mm2 sliver,
+    touching the outer wire at a point - IntersectingWires, the only
+    invalid face left): they go together, up to three (_ring_island).
     Only `faces` (those that read back broken). Returns (shape, removed).
     """
     GeomAPI_ProjectPointOnSurf = _m("GeomAPI").GeomAPI_ProjectPointOnSurf
@@ -2143,29 +2243,30 @@ def remove_lens_holes(shape, faces, max_dev: float, max_edges: Optional[int] = N
             lens = None
             if not w.IsSame(outer) and 2 <= len(es) <= (max_edges or len(es)):
                 nb = [[g for g in _iter_list(ef.FindFromKey(e)) if not g.IsSame(F)] for e in es]
-                if all(len(x) == 1 for x in nb) and all(x[0].IsSame(nb[0][0]) for x in nb):
-                    L = td_Face(nb[0][0])
-                    if count_sub(L, TopAbs_EDGE) == len(es) and count_sub(L, TopAbs_WIRE) == 1 and not any(L.IsSame(g) for g in gone):
-                        srf = BRep_Tool.Surface_s(F)
-                        dev = 0.0
-                        Q = []
-                        for e in es:
-                            c, c0, c1 = edge_curve(e)
-                            Q.extend(c.Value(float(u)) for u in np.linspace(c0, c1, 9))
-                        if len(es) > 2:
+                isl = _ring_island(es, nb, ef, gone) if all(len(x) == 1 for x in nb) else None
+                if isl is not None:
+                    srf = BRep_Tool.Surface_s(F)
+                    dev = 0.0
+                    Q = []
+                    for L in isl:
+                        for e in explore(L, TopAbs_EDGE):
+                            c, c0, c1 = edge_curve(td_Edge(e))
+                            if c is not None:
+                                Q.extend(c.Value(float(u)) for u in np.linspace(c0, c1, 9))
+                        if count_sub(L, TopAbs_EDGE) > 2:
                             # (a facet's inside: towards its centre from every corner)
                             V = face_vertices(L)
                             m = V.mean(axis=0)
                             Q.extend(gp_Pnt(*map(float, m + t * (p - m))) for p in V for t in (0.0, 0.5))
-                        for q in Q:
-                            pr = GeomAPI_ProjectPointOnSurf(q, srf)
-                            dev = max(dev, pr.LowerDistance() if pr.NbPoints() else math.inf)
-                        if dev <= max_dev:
-                            lens = L
+                    for q in Q:
+                        pr = GeomAPI_ProjectPointOnSurf(q, srf)
+                        dev = max(dev, pr.LowerDistance() if pr.NbPoints() else math.inf)
+                    if dev <= max_dev:
+                        lens = isl
             if lens is None:
                 keep.append(w)
             else:
-                drop.append(lens)
+                drop.extend(lens)
         if not drop:
             continue
         # (the raw surface and its location: Surface_s(F) alone is the surface
@@ -4202,20 +4303,61 @@ def _profile_poly(rho, zeta, tol, max_deg=3):
     return q0, d, cf, w - np.polyval(cf, s)
 
 
-def helix_spline(a, c, h, q0, d, s0, s1, th0, th1, tol):
+def _circle3_2d(p, q, r):
+    """(centre, radius) of the circle through three points of the plane, or (None, None)"""
+    ax, ay = q - p
+    bx, by = r - p
+    den = 2.0 * (ax * by - ay * bx)
+    if abs(den) < 1e-15:
+        return None, None
+    a2, b2 = ax * ax + ay * ay, bx * bx + by * by
+    o = p + np.array([(by * a2 - ay * b2) / den, (ax * b2 - bx * a2) / den])
+    return o, float(np.linalg.norm(p - o))
+
+
+def _circle_fit_2d(Q):
+    """least-squares (algebraic) circle through points of the plane: (centre, radius) or (None, None)"""
+    if len(Q) < 3:
+        return None, None
+    A = np.c_[2.0 * Q, np.ones(len(Q))]
+    try:
+        x = np.linalg.lstsq(A, (Q**2).sum(axis=1), rcond=None)[0]
+    except Exception:
+        return None, None
+    o = x[:2]
+    r2 = float(x[2] + o @ o)
+    return (o, math.sqrt(r2)) if r2 > 0 else (None, None)
+
+
+def helix_spline(a, c, h, q0, d, s0, s1, th0, th1, tol, arc=None):
     """
     Cubic B-spline of the straight profile q0 + s d (s0..s1, in (rho, zeta))
     swept by the screw (a, c, h) from theta th0 to th1, within 2% of tol: a
     tensor of cos, sin and theta in u (theta itself is exact on the Greville
     abscissae) and the segment in v - the representation a CAD gives a
-    swept thread, there is no exact one.
+    swept thread, there is no exact one. arc = (centre, radius): the profile
+    is that circle's arc from angle s0 to s1 instead (a rounded crest or
+    root), its poles fitted within 2% of tol too.
     """
     e1, e2 = ortho_frame(a)
-    kv = _bs_knots(s0, s1, 4)
-    gv = _bs_greville(kv, 4)
-    cr = q0[0] + gv * d[0]
-    cz = q0[1] + gv * d[1]
-    rmax = float(max(abs(q0[0] + s0 * d[0]), abs(q0[0] + s1 * d[0])))
+    if arc is None:
+        nv = 4
+        kv = _bs_knots(s0, s1, nv)
+        gv = _bs_greville(kv, nv)
+        cr = q0[0] + gv * d[0]
+        cz = q0[1] + gv * d[1]
+        rmax = float(max(abs(q0[0] + s0 * d[0]), abs(q0[0] + s1 * d[0])))
+    else:
+        (o_r, o_z), rr = arc
+        ss = np.linspace(s0, s1, 200)
+        for nv in (4, 5, 6, 8, 10):
+            kv = _bs_knots(s0, s1, nv)
+            Bv = _bs_basis(ss, kv, nv)
+            cr = np.linalg.lstsq(Bv, o_r + rr * np.cos(ss), rcond=None)[0]
+            cz = np.linalg.lstsq(Bv, o_z + rr * np.sin(ss), rcond=None)[0]
+            if float(np.hypot(Bv @ cr - o_r - rr * np.cos(ss), Bv @ cz - o_z - rr * np.sin(ss)).max()) <= 0.02 * tol:
+                break
+        rmax = float(np.abs(o_r + rr * np.cos(ss)).max())
     for per_turn in (24, 32, 48, 64, 96):
         nu = int(math.ceil((th1 - th0) / (2.0 * math.pi / per_turn))) + 3
         ku = _bs_knots(th0, th1, nu)
@@ -12172,6 +12314,13 @@ class Segmenter:
                 elif float(A[fs][inv[fs]].sum()) >= 0.6 * float(A[fs].sum()):
                     dissolve.add(k)
             C = [i for i in np.flatnonzero(inv).tolist() if owner.get(i) is None or owner[i] in dissolve or owner[i] in cyls]
+            if Log.level <= 10:
+                held_ = defaultdict(list)
+                for i in np.flatnonzero(inv).tolist():
+                    if owner.get(i) is not None and owner[i] not in dissolve and owner[i] not in cyls:
+                        held_[owner[i]].append(i)
+                for k_, fs_ in sorted(held_.items(), key=lambda t: -len(t[1]))[:6]:
+                    Log.debug(f"  screw: {len(fs_)} of its facets held by {regions[k_].prim.label()} ({len(regions[k_].faces)} facets), rho {float(np.median(rho[fs_])):.3f}")
             Cs = set(C)
             er = rad / np.maximum(rho, 1e-12)[:, None]
             phi = np.degrees(np.arctan2(np.einsum("ij,ij->i", N, er), -(N @ a)))
@@ -12246,7 +12395,9 @@ class Segmenter:
             return screw(x)
 
         def segments(P_, th, a, c, h):
-            """the straight pieces of a strip's profile: [(facets, q0, d)]"""
+            """the straight pieces of a strip's profile: [(facets, q0, d)],
+            then its arcs: [(facets, (centre, radius), None)]"""
+            pitch = 2.0 * math.pi * abs(h)
             vids, rv, zv, _ = _screw_profile(topo, th, a, c, h)
             pos = {v: k for k, v in enumerate(vids)}
             Q = np.c_[rv, zv]
@@ -12288,6 +12439,52 @@ class Segmenter:
                     break
                 out.append(([P_[rest[k]] for k in np.flatnonzero(best)], q0, d))
                 rest = [rest[k] for k in np.flatnonzero(~best)]
+            # ⚠️ AND THE ROUNDED ONES. test14's M10 thread has its crest and
+            # root rounded: their facets sit on no straight piece of the
+            # profile, stayed out of every flank and came out 2,900 slivers
+            # of mesh between the helical faces. A circular arc of the
+            # profile (radius up to a pitch, under half a turn) is swept
+            # like a segment: (facets, (centre, radius), None).
+            for _ in range(4):
+                if len(rest) < 12:
+                    break
+                flat = np.concatenate([fl[k] for k in rest])
+                offs = np.cumsum([0] + [len(fl[k]) for k in rest[:-1]])
+                vsel = np.unique(flat)
+                if len(vsel) < 3:
+                    break
+
+                def inl_arc(o, r):
+                    dv = np.abs(np.linalg.norm(Q - o, axis=1) - r)
+                    return np.maximum.reduceat(dv[flat], offs) <= tol_p
+
+                best, best_n, arc = None, 11, None
+                for _t in range(200):
+                    i, j, k = rng.choice(vsel, 3, replace=False)
+                    o, r = _circle3_2d(Q[i], Q[j], Q[k])
+                    if o is None or not (4.0 * tol_p <= r <= pitch):
+                        continue
+                    m = inl_arc(o, r)
+                    if int(m.sum()) > best_n:
+                        best, best_n, arc = m, int(m.sum()), (o, r)
+                if best is None:
+                    break
+                for _r in range(3):
+                    vv = np.unique(np.concatenate([fl[rest[k]] for k in np.flatnonzero(best)]))
+                    o, r = _circle_fit_2d(Q[vv])
+                    if o is None or not (4.0 * tol_p <= r <= pitch):
+                        break
+                    m = inl_arc(o, r)
+                    if int(m.sum()) < 12:
+                        break
+                    best, arc = m, (o, r)
+                vv = np.unique(np.concatenate([fl[rest[k]] for k in np.flatnonzero(best)]))
+                ang = np.arctan2(Q[vv, 1] - arc[0][1], Q[vv, 0] - arc[0][0])
+                mid = math.atan2(float(np.sin(ang).sum()), float(np.cos(ang).sum()))
+                if int(best.sum()) < 12 or float(np.ptp((ang - mid + math.pi) % (2.0 * math.pi))) > 0.9 * math.pi:
+                    break
+                out.append(([P_[rest[k]] for k in np.flatnonzero(best)], arc, None))
+                rest = [rest[k] for k in np.flatnonzero(~best)]
             return out
 
         done = []
@@ -12311,7 +12508,12 @@ class Segmenter:
             flanks, rings = [], []
             for P_, th in sts:
                 segs_ = segments(P_, th, a, c, h)
-                Log.debug(f"  strip of {len(P_)} facets: profile segments {[(len(fs), round(float(np.degrees(np.arctan2(d[1], d[0]))), 1)) for fs, _, d in segs_]}")
+                if Log.level <= 10:
+                    left_ = set(P_) - {i for fs, _, _ in segs_ for i in fs}
+                    if left_:
+                        _, rl_, zl_, _ = _screw_profile(topo, {v: th[v] for i in left_ for v in fverts(i)}, a, c, h)
+                        Log.debug(f"  strip of {len(P_)} facets: {len(left_)} on no piece of the profile, rho {np.round(np.quantile(rl_, [0.0, 0.5, 1.0]), 3).tolist()}")
+                Log.debug(f"  strip of {len(P_)} facets: profile segments {[(len(fs), round(float(np.degrees(np.arctan2(d[1], d[0]))), 1) if d is not None else f'arc r {q0[1]:.3f}') for fs, q0, d in segs_]}")
                 for fs, q0, d in segs_:
                     fs = [i for i in fs if i not in taken]
                     fset = set(fs)
@@ -12343,10 +12545,19 @@ class Segmenter:
 
             def sweep(G, q0, d, th):
                 vids, rv, zv, thv = _screw_profile(topo, th, a, c, h)
-                s = (np.c_[rv, zv] - q0) @ d
-                ds = 0.03 * float(np.ptp(s)) + tol_grow
                 dt = 0.02
-                spl = helix_spline(a, c, h, q0, d, float(s.min()) - ds, float(s.max()) + ds, float(thv.min()) - dt, float(thv.max()) + dt, tol_fit)
+                if d is None:
+                    # (an arc: its angle around the centre, continuous)
+                    (o, r) = q0
+                    ang = np.arctan2(zv - o[1], rv - o[0])
+                    mid = math.atan2(float(np.sin(ang).sum()), float(np.cos(ang).sum()))
+                    s = mid + (ang - mid + math.pi) % (2.0 * math.pi) - math.pi
+                    ds = 0.03 * float(np.ptp(s)) + tol_grow / r
+                    spl = helix_spline(a, c, h, None, None, float(s.min()) - ds, float(s.max()) + ds, float(thv.min()) - dt, float(thv.max()) + dt, tol_fit, arc=(o, r))
+                else:
+                    s = (np.c_[rv, zv] - q0) @ d
+                    ds = 0.03 * float(np.ptp(s)) + tol_grow
+                    spl = helix_spline(a, c, h, q0, d, float(s.min()) - ds, float(s.max()) + ds, float(thv.min()) - dt, float(thv.max()) + dt, tol_fit)
                 dv = np.abs(spl.dist(topo.vpos[vids]))
                 if float(dv.max()) > tol_p:
                     return None
@@ -12367,11 +12578,59 @@ class Segmenter:
                     cuts[min(n - 1, int((tc[i] - lo) / step))].add(i)
                 return [sorted(g) for k in sorted(cuts) for g in _face_groups(cuts[k], topo.adj)]
 
+            def notches(G, th, spl):
+                """G with the facets wedged in its rim: two sides on it, every
+                vertex already G's and on its sweep, loose or of a region the
+                thread dissolves - or of a flank not built yet, which loses it"""
+                gs = set(G)
+                why = defaultdict(int)
+                while True:
+                    add = []
+                    for i in {j for k in gs for j in topo.adj[k]} - gs - taken:
+                        if sum(1 for j in topo.adj[i] if j in gs) < 2:
+                            continue
+                        q = owner.get(i)
+                        if q is not None and q not in dis and q not in cyl and i not in in_flank:
+                            why["held"] += 1
+                            continue
+                        vs = fverts(i)
+                        if not flat[i] or any(v not in th for v in vs):
+                            why["vertex not the flank's"] += 1
+                            continue
+                        if float(np.abs(spl.dist(topo.vpos[vs])).max()) <= tol_p:
+                            add.append(i)
+                        else:
+                            why["off the sweep"] += 1
+                    if not add:
+                        Log.debug(f"  flank of {len(G)} facets: {len(gs) - len(G)} notches taken, left {dict(why)}")
+                        return sorted(gs)
+                    gs.update(add)
+
+            # ⚠️ A FLANK WITH A SAWTOOTH RIM IS NO FACE. On test14's M10
+            # thread a flank's profile segment took, along a row, only the
+            # triangles standing on it (base on the lower row, apex on the
+            # upper): those between them, apex down, went elsewhere, and the
+            # flank's wire came back to every upper vertex twice - 13 flanks
+            # "SelfIntersectingWire", the thread 3,500 faces of mesh. Their
+            # vertices are the flank's own: the notches go in with it. Where
+            # two flanks meet on a row the triangles alternate between them:
+            # one whose corners are all on this flank's sweep is this flank's
+            # (no triangle has all three on both), and the other one, built
+            # later, does without it.
+            in_flank = {i for G, *_ in flanks for i in G}
             n0 = len(new_regions)
             for G, q0, d, th in flanks:
+                G = [i for i in G if i not in taken]
+                if len(G) < 12:
+                    continue
                 R = sweep(G, q0, d, th)
                 if R is None:
                     continue
+                G2 = notches(G, th, R.prim.free)
+                if len(G2) > len(G):
+                    R2 = sweep(G2, q0, d, th)
+                    if R2 is not None:
+                        G, R = G2, R2
                 fb = []
                 thv = np.fromiter(th.values(), float)
                 if float(thv.max() - thv.min()) > 2.2 * math.pi:
@@ -12391,9 +12650,15 @@ class Segmenter:
             for G, r, th in rings:
                 pr = Prim(AXIAL, c.copy(), a.copy(), r, 0.0)
                 pr.chord_ok = chords(G, th)
+                # (a crest band is a helix on its cylinder, and with the
+                # facets' own width a 300-degree piece of test14's M10 crest
+                # went 354 degrees round - "ambiguous angular coverage", 449
+                # facets of mesh: a piece refused gives way to its halves)
                 for g in turns(G, th, 5.0 * math.pi / 3.0):
                     if len(g) >= self.min_faces:
-                        new_regions.append(describe_region(pr, topo, g))
+                        Rg = describe_region(pr, topo, g)
+                        Rg.fallback = [describe_region(pr, topo, g2) for g2 in turns(g, th, math.pi) if len(g2) >= self.min_faces]
+                        new_regions.append(Rg)
                         taken |= set(g)
             dissolved |= dis
             cut_cyls |= cyl
