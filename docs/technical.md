@@ -113,7 +113,11 @@ are reported but left in.
   cut where its curvature jumps (the end of a fillet, the corner between two curves), and a spline
   wall the seeds had already cut into a few osculating cylinders is taken whole again when one
   profile holds it (`test9` 1,062 → 954 faces, `test8` 479 → 468). Stretches tessellated so
-  coarsely that the mesh doesn't say where the curve runs stay planar. Where a free-form band runs
+  coarsely that the mesh doesn't say where the curve runs stay planar, and so does a face Phase A
+  already made planar that meets a couple of slivers of the round along its rim: a merged polygon
+  carrying twenty times the area of all the other strips together is the face, and the band is
+  tried without it (`test14`'s 485 mm² side, a plane in the CAD, had become an 8×4 B-spline; any
+  strip four times bigger took ten good bands off `test9`'s spline walls). Where a free-form band runs
   into a round it's tangent to, the facets along the contact line sit on both: one with more sides
   on its neighbour than on its own region, and on the neighbour's surface, goes over to it (`test4`:
   no more notches at the ends of the chamfer bands, edges 137 → 126). Every facet is a chord of
@@ -218,6 +222,11 @@ are reported but left in.
   single B-spline holds (`test17`'s eight windows blend into the bore's floor round in sections a
   plane owns: 200 loose triangles). `test17`: 1,131 → 657 faces; `test18`: 1,212 → 766; `test16`
   874 → 864; `test8` 457 → 452.
+  Only the facets the patch would take can make a plane own a section: on `test17`'s slots the
+  section of a shoulder (where the slot's r 1.5 round turns) held three big triangles of the r 21.5
+  wall it is tangent to, the biggest 26% of the section - "a plane" - and the shoulder was left to
+  tori merged late into a stepped spline, while its mirror twin, whose triangle was 25%, became
+  one patch. The wall's cylinder straddles the section and the patch leaves its triangles out.
   A piece of a chord is still under the circle: a flat facet with two vertices on a cylinder and
   the others inside it, each ten tolerances deep at least and no deeper than a quarter of what the
   cylinder drops over its distance to the nearest vertex on it (L²/4r), is a chord of it - a round
@@ -439,7 +448,17 @@ for in the face's own (u, v), at any angle and between two straight edges too: t
 meet in space, but `test12`'s 5.3 and 13.8 mm edges at a right-angled corner touched in a T 2.1e-4
 from their vertex once read back. A hole may be filled by two or three slivers together (an
 ellipse, its chord and a 0.03 mm edge): they go as one. `test12`, whose file read back with one or
-three invalid faces, now reads back valid. A
+three invalid faces, now reads back valid.
+The reader's own pcurves can also break a face the part had whole: `test12`'s 55×26 patch over a
+blend (115 mm²) has an edge 6.7e-3 off its surface, its projected pcurve came back ending 0.003
+off its neighbours' in (u, v), the reader closed both gaps with degenerate edges and no mesher
+could triangulate the face — a hole in any viewer, 3.3 mm off the mesh. Since the part read back
+invalid too and was mended on what the reader made of it, the broken face had become the reference
+and the file passed as faithful. Before writing, every B-spline face is now written alone without
+pcurves and read back (0.04 s each); those that come back unable to mesh carry their pcurves in
+every file written (`test12`: 1 face, valid, 0.055 mm from the mesh, 12.4 → 16.5 MB). And a
+region whose new face the mesher can't triangulate at all is refused in the engine, instead of
+passing on the global volume. A
 degenerate edge on a surface that has no pole there (a plane, a cylinder, a torus with R > r) is
 dropped before writing: the reader made a wire of its own out of one, and a 0.33 mm² face of a
 `test14` spindle torus came back as the whole torus, 36,342 mm².

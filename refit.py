@@ -1838,6 +1838,81 @@ def unmeshable_faces(shape, defl: float) -> List[int]:
     return sorted(bad)
 
 
+def _face_meshes(f, defl: float) -> bool:
+    """f triangulates (BRepMesh) over its own area, within 10%."""
+    try:
+        _BRepMesh.BRepMesh_IncrementalMesh(f, float(defl), False, 0.3, False)
+        tri = bt_Triangulation(f, TopLoc_Location())
+    except Exception:
+        return False
+    if tri is None or tri.NbTriangles() == 0:
+        return False
+    N = np.array([(q.X(), q.Y(), q.Z()) for q in (tri.Node(k) for k in range(1, tri.NbNodes() + 1))])
+    T = np.array([tri.Triangle(k).Get() for k in range(1, tri.NbTriangles() + 1)], dtype=int) - 1
+    a_mesh = 0.5 * float(np.linalg.norm(np.cross(N[T[:, 1]] - N[T[:, 0]], N[T[:, 2]] - N[T[:, 0]]), axis=1).sum())
+    a = face_area(f)
+    return abs(a_mesh - a) <= 0.1 * a + 1e-6
+
+
+def _fragile_faces(shape, defl: float) -> Set[int]:
+    """
+    B-spline faces (explore order) that a file without pcurves breaks: each
+    one written alone without them and read back, kept if it then won't
+    triangulate where in memory it does.
+    ⚠️ THE READER'S PROJECTION CAN OPEN A HOLE. test12's 55x26 patch over a
+    blend (115 mm2), one of its edges 6.7e-3 off the surface, read back
+    with that edge's projected pcurve ending 0.003 off its neighbours' in
+    (u,v): ShapeFix closed both gaps with degenerated edges, and the
+    mesher gave up on the face - a hole in any viewer, 3.3 mm off the
+    mesh in tools/qa.py. The file also came back with three invalid faces,
+    so it was mended on what the reader made of it, and the broken patch
+    became the reference: "faithful". The same face alone does it the
+    same way (0.04 s), and with its pcurves written comes back whole.
+    """
+    faces = [td_Face(f) for f in explore(shape, TopAbs_FACE)]
+    cand = [i for i, f in enumerate(faces) if face_surface_type(f) == _GeomAbs.GeomAbs_BSplineSurface]
+    out: Set[int] = set()
+    if not cand:
+        return out
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".refit.step")
+    os.close(fd)
+    msg = _m("Message").Message.DefaultMessenger_s()
+    P = msg.Printers()
+    printers = [P.Value(k) for k in range(1, P.Length() + 1)]
+    for p in printers:
+        msg.RemovePrinter(p)
+    try:
+        for i in cand:
+            f = faces[i]
+            if not _face_meshes(f, defl):
+                continue  # (not the file's doing)
+            w = STEPControl_Writer()
+            _iface_set("write.step.schema", "AP214IS")
+            _iface_set("write.step.unit", "MM")
+            _iface_set("write.precision.mode", "0")
+            _iface_set("write.surfacecurve.mode", "0")
+            w.Transfer(f, STEPControl_AsIs)
+            if w.Write(tmp) != IFSelect_RetDone:
+                continue
+            r = STEPControl_Reader()
+            if r.ReadFile(tmp) != IFSelect_RetDone:
+                continue
+            r.TransferRoots()
+            back = [td_Face(g) for g in explore(r.OneShape(), TopAbs_FACE)]
+            if len(back) != 1 or not _face_meshes(back[0], defl):
+                out.add(i)
+    finally:
+        for p in printers:
+            msg.AddPrinter(p)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return out
+
+
 def _strip_pcurves(shape, keep: Set[int]):
     """Copy of shape without the stored pcurves, except on the faces in keep
     (indices in explore order). Only for writing: the copy isn't valid."""
@@ -2391,12 +2466,42 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     shape, n_deg = drop_stray_degenerate(shape)
     if n_deg:
         Log.info(f"Degenerate edges on surfaces with no pole removed before writing: {n_deg}")
-    write_step(shape, path, src=src, pcurves=pcurves)
-    ri, _ = read_step(path)
     if pcurves:
-        return ri
+        write_step(shape, path, src=src, pcurves=True)
+        return read_step(path)[0]
     V = Topo(shape).vpos
     defl = 2e-5 * (float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if len(V) else 1.0)
+    # (the B-spline faces the reader would break carry their pcurves from
+    # the start, in every file written here: see _fragile_faces)
+    frag: Dict[int, Set[int]] = {}
+
+    def fragile(sh) -> Set[int]:
+        if id(sh) not in frag:
+            frag[id(sh)] = _fragile_faces(sh, 10.0 * defl)
+            if frag[id(sh)]:
+                Log.info(f"{len(frag[id(sh)])} B-spline faces written with their pcurves: read back without them, they don't mesh")
+        return frag[id(sh)]
+
+    def wr(sh, keep: Set[int] = frozenset()):
+        """sh written with pcurves on keep and the fragile faces only, read back"""
+        k = set(keep) | fragile(sh)
+        if not k:
+            write_step(sh, path, src=src, pcurves=False)
+            return read_step(path)[0]
+        # ⚠️ a face left without pcurves can be DROPPED by the writer
+        # (test8: four tori bounded by four circles, fine in a file without
+        # any pcurve, gone from one with some): those get theirs back and
+        # it's written again
+        for _ in range(3):
+            write_step(_strip_pcurves(sh, k), path, src=src, pcurves=True)
+            r_, _ = read_step(path)
+            lost = _lost_faces(sh, r_, 50.0 * defl)
+            if not lost or lost <= k:
+                break
+            k = k | lost
+        return r_
+
+    ri = wr(shape)
     # (only the faces that triangulate worse than in memory: a few did
     # already, and the pcurves aren't what's wrong with them)
     base_bad = set(unmeshable_faces(copy_shape(shape), defl))
@@ -2418,8 +2523,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
     if sc[0] == 1 and bad and is_valid(shape):
         fixed = _mend_for_step(ri, bad, 10.0 * defl, shape_volume(shape))
         if fixed is not None:
-            write_step(fixed, path, src=src, pcurves=False)
-            ri_f, _ = read_step(path)
+            ri_f = wr(fixed)
             base_f = set(unmeshable_faces(copy_shape(fixed), defl))
             # (the mended part may still hold a face the reader cuts in two:
             # test14's eight that the reader joins at a vertex)
@@ -2431,7 +2535,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
                 if sc == (0, 0, 0):
                     return ri
             else:
-                write_step(shape, path, src=src, pcurves=False)
+                wr(shape)
     tried = [(sc, 0, "without pcurves", None)]
     if bad:
         # the faces to blame, then those plus their neighbors (an edge is
@@ -2444,17 +2548,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
                 ring.update(fs)
         for keep in (set(bad), ring):
             try:
-                # ⚠️ a face left without pcurves can be DROPPED by the writer
-                # (test8: four tori bounded by four circles, fine in a file
-                # without any pcurve, gone from one with some): those get
-                # theirs back and it's written again
-                for _ in range(3):
-                    write_step(_strip_pcurves(shape, keep), path, src=src, pcurves=True)
-                    ri1, _ = read_step(path)
-                    lost = _lost_faces(shape, ri1, 50.0 * defl)
-                    if not lost or lost <= keep:
-                        break
-                    keep = keep | lost
+                ri1 = wr(shape, keep)
                 sc1, _, _ = _read_back_check(shape, ri1, base_bad, defl, mended)
                 if sc1 == (0, 0, 0):
                     Log.info(f"the file without pcurves read back with {why}: written again with pcurves on {len(keep)} faces only")
@@ -2474,11 +2568,7 @@ def write_step_checked(shape, path: str, src: Optional[str] = None, pcurves: boo
         return ri2
     # the pcurves didn't help: back to the smaller file
     Log.warn(f"the file reads back with {why} with or without pcurves: kept {best[2]}")
-    if best[1] == 1:
-        write_step(_strip_pcurves(shape, best[3]), path, src=src, pcurves=True)
-    else:
-        write_step(shape, path, src=src, pcurves=False)
-    ri, _ = read_step(path)
+    ri = wr(shape, best[3] if best[1] == 1 else set())
     if count_sub(ri, TopAbs_FACE) == 0 and count_sub(shape, TopAbs_FACE) > 0:
         # (an invalid solid can come out of the writer with nothing in it:
         # say so loudly, never a quiet "Saved")
@@ -10416,11 +10506,21 @@ class Segmenter:
             # B-spline flat to 6e-3 - where the CAD has a plane. Facets
             # coplanar with one of the section's largest (vertices within the
             # tolerance of its plane) covering a quarter of it are that plane.
+            # ⚠️ ONLY AMONG THE FACETS THE PATCH WOULD TAKE. On test17's slots
+            # the section of a shoulder (where the slot's r1.5 round turns)
+            # held three big triangles of the r21.5 wall it is tangent to, the
+            # biggest 2.2 mm2: 26% of the section, "a plane" - and the shoulder
+            # stayed a mosaic of tori merged late into a jagged spline, while
+            # its mirror twin, whose triangle was 25%, became one clean patch.
+            # Those triangles belong to the wall's cylinder, which straddles
+            # the section: the patch leaves them out anyway.
+            fuori = {i for i in m if owner.get(i) is not None and owner[i] not in dentro}
+            m_in = [i for i in m if i not in fuori]
             cos1 = math.cos(math.radians(1.0))
             owned = False
-            for i0 in sorted(m, key=lambda i: -topo.areas[i])[:5]:
+            for i0 in sorted(m_in, key=lambda i: -topo.areas[i])[:5]:
                 n_pl, c_pl = topo.norms[i0], topo.cents[i0]
-                a_pl = sum(topo.areas[i] for i in m if float(topo.norms[i] @ n_pl) > cos1 and float(np.abs((topo.verts[i] - c_pl) @ n_pl).max()) <= self.tol_fit)
+                a_pl = sum(topo.areas[i] for i in m_in if float(topo.norms[i] @ n_pl) > cos1 and float(np.abs((topo.verts[i] - c_pl) @ n_pl).max()) <= self.tol_fit)
                 if a_pl > 0.25 * a_sec:
                     owned = True
                     break
@@ -10436,8 +10536,7 @@ class Segmenter:
             n_pc = len(dentro) + len(dentro_f)
             if n_pc < min(2, self.blend_min):
                 continue
-            fuori = {i for i in m if owner.get(i) is not None and owner[i] not in dentro}
-            faces = [int(i) for i in m if i not in fuori]
+            faces =[int(i) for i in m if i not in fuori]
             if len(faces) < 4 * self.min_faces:
                 continue
             faces = self._fill_islands(faces, owner)
@@ -12073,6 +12172,31 @@ class Segmenter:
 
         def fit_band(g, d0, cut, depth, out):
             if len(g) < 3:
+                return
+            # ⚠️ A PLANE WITH TWO SLIVERS ON ITS RIM IS NOT A SWEPT FACE. On
+            # test14's side a 485 mm2 face Phase A had already made planar
+            # met two 0.4 mm2 slivers of the round along it, at 0.8 and 2.4
+            # degrees: three "strips", a profile that bends only in the
+            # slivers, within the tolerance - and the plane came out a 8x4
+            # B-spline. A polygon Phase A merged (five vertices or more: a
+            # strip of the tessellation has three or four) carrying twenty
+            # times the area of all the other strips together is the face;
+            # the rest is tried without it. (Four times, and any strip, took
+            # ten good bands off test9's spline walls: one wide strip of a
+            # flat stretch and two narrow ones of the bend, 884 -> 890.)
+            ar = {i: float(topo.areas[i]) for i in g}
+            i_big = max(ar, key=ar.get)
+            if len(topo.verts[i_big]) >= 5 and ar[i_big] > 20.0 * (sum(ar.values()) - ar[i_big]):
+                cut = cut | {k for k, _ in links(g) if i_big in k}
+                g = set(g) - {i_big}
+                nb_ = defaultdict(set)
+                for (a_, b_), _ in links(g):
+                    if (a_, b_) not in cut:
+                        nb_[a_].add(b_)
+                        nb_[b_].add(a_)
+                for c in _face_groups(g, nb_):
+                    if len(c) >= 3:
+                        fit_band(set(c), d0, cut, depth + 1, out)
                 return
             pr, fs, P, d, sag, width = fit_once(g, d0, cut)
             if pr is not None:
@@ -16030,6 +16154,15 @@ class Engine:
                 return False, f"volume changed by {v_new - v_old:+.5f} mm3 (limit {bound:.5f})"
             self.free0 = fe
             return True, ""
+        # ⚠️ A FACE THE MESHER CAN'T TRIANGULATE IS A HOLE IN EVERY VIEWER.
+        # test12's 55x26 patch over a blend (115 mm2) was valid to BRepCheck
+        # and passed here on the global volume, the old faces meshing fine
+        # and the new one not at all, at any deflection: tools/qa.py found
+        # the part 3.3 mm off the mesh there. The old faces mesh, a new one
+        # doesn't even ten times coarser: the region is refused.
+        if np.isfinite(v_old) and not np.isfinite(v_new):
+            if any(not np.isfinite(tri_flux([f], 10.0 * defl)) for f in new_f):
+                return False, "new face doesn't triangulate"
         # no triangulation: the global volume (closed shells only) as before.
         # (self.vol0 isn't kept up to date by the path above: recomputed.)
         if self.free0 > 0:
