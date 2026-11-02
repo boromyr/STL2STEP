@@ -556,6 +556,7 @@ DEPENDENCIES
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import math
 import os
@@ -3965,6 +3966,38 @@ class FreeForm:
         h = 1e-4 * max(float(self.ku[-1] - self.ku[0]), 1e-9)
         return ((self.height(u + h, v) - self.height(u - h, v)) / (2.0 * h), (self.height(u, v + h) - self.height(u, v - h)) / (2.0 * h))
 
+    def foot(self, P: np.ndarray, iters: int = 5):
+        """
+        (u, v) of the CLOSEST point of the surface, not of the one straight
+        below (uv): Gauss-Newton from the vertical foot, a point kept only
+        where its distance went down.
+        ⚠️ A PCURVE MADE FROM THE VERTICAL FOOT MEASURES THE VERTICAL GAP. An
+        edge's tolerance is |C(t) - S(pcurve(t))|, and with the point below
+        that is the gap along Z: on a flank at 60-70 degrees from the base
+        plane two to three times the true distance - test17's slot ends,
+        whose spline sits 0.02 off a chord, got edges of 0.05-0.085 against
+        a ceiling of 0.035 and were refused.
+        """
+        d = np.atleast_2d(P) - self.C
+        x, y, z = d @ self.X, d @ self.Y, d @ self.Z
+        u, v = x.copy(), y.copy()
+        r2 = (z - self.height(u, v)) ** 2
+        for _ in range(iters):
+            h = self.height(u, v)
+            gu, gv = self._grad(u, v)
+            ru, rv, rz = u - x, v - y, h - z
+            a, b, c = 1.0 + gu * gu, gu * gv, 1.0 + gv * gv
+            fu, fv = ru + rz * gu, rv + rz * gv
+            det = np.maximum(a * c - b * b, 1e-300)
+            un = u - (c * fu - b * fv) / det
+            vn = v - (a * fv - b * fu) / det
+            rn = (un - x) ** 2 + (vn - y) ** 2 + (self.height(un, vn) - z) ** 2
+            ok = rn < r2
+            if not ok.any():
+                break
+            u, v, r2 = np.where(ok, un, u), np.where(ok, vn, v), np.where(ok, rn, r2)
+        return u, v
+
     def dist(self, P: np.ndarray) -> np.ndarray:
         """
         (Signed) PERPENDICULAR distance from the surface.
@@ -4039,6 +4072,8 @@ def fit_free(
     max_tilt_deg: float = 70.0,
     soft: Optional[np.ndarray] = None,
     soft_w: float = 0.05,
+    bnd: Optional[np.ndarray] = None,
+    bnd_w: float = 0.0,
 ) -> Optional[Prim]:
     """
     Least-squares B-spline over a point cloud with normals.
@@ -4047,6 +4082,9 @@ def fit_free(
     check     : points INSIDE the facets (centroids and side midpoints).
     check_tol : how far those are allowed to be.
     soft      : points INSIDE the facets used as WEAK data (weight soft_w).
+    bnd       : points along the face's future EDGES (weight bnd_w), inside
+                the grid even where they leave the vertices' footprint (see
+                Engine._refit_to_boundary).
 
     ⚠️ A FAN-TESSELLATED BAND HAS NO VERTEX INSIDE. A chamfer running
     around a corner whose wall is tilted against the floor is a RULED
@@ -4120,6 +4158,13 @@ def fit_free(
         return None
     x0, x1 = x.min() - 0.06 * ex, x.max() + 0.06 * ex
     y0, y1 = y.min() - 0.06 * ey, y.max() + 0.06 * ey
+    if bnd is not None and len(bnd) and bnd_w > 0.0:
+        db = np.atleast_2d(np.asarray(bnd, float)) - C
+        xb, yb, zb = db @ X, db @ Y, db @ Z
+        x0, x1 = min(x0, float(xb.min()) - 0.02 * ex), max(x1, float(xb.max()) + 0.02 * ex)
+        y0, y1 = min(y0, float(yb.min()) - 0.02 * ey), max(y1, float(yb.max()) + 0.02 * ey)
+    else:
+        xb = yb = zb = np.zeros(0)
     S = np.zeros((0, 3)) if soft is None else np.atleast_2d(np.asarray(soft, float))
     if S.size:
         ds = S - C
@@ -4157,6 +4202,10 @@ def fit_free(
                 As = (_bs_basis(xs, ku, nu)[:, :, None] * _bs_basis(ys, kv, nv)[:, None, :]).reshape(len(xs), nu * nv)
                 AtA = AtA + soft_w**2 * (As.T @ As)
                 Atz = Atz + soft_w**2 * (As.T @ zs)
+            if len(xb):
+                Ab = (_bs_basis(xb, ku, nu)[:, :, None] * _bs_basis(yb, kv, nv)[:, None, :]).reshape(len(xb), nu * nv)
+                AtA = AtA + bnd_w**2 * (Ab.T @ Ab)
+                Atz = Atz + bnd_w**2 * (Ab.T @ zb)
             RtR = Rg.T @ Rg
             I = np.eye(nu * nv)
         except Exception:
@@ -13884,7 +13933,9 @@ class SurfParam:
         d = P - self.C
         k = self.prim.kind
         if k == FREE:
-            return self.prim.free.uv(P)
+            # (a SplineSurf's uv is a projection already)
+            ff = self.prim.free
+            return ff.foot(P) if isinstance(ff, FreeForm) else ff.uv(P)
         if k == PLANE:
             return d @ self.X, d @ self.Y
         t = d @ self.Z
@@ -15283,7 +15334,19 @@ class Engine:
         tol_cap = max(self.max_edge_tol, min(2.0 * R.sag, 5.0 * self.max_edge_tol))
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
+            bnd = self._wire_samples(F) if prim.kind == FREE and not getattr(R, "_bnd_refit", False) else None
             self._restore_all(vtol_backup)
+            if bnd is not None:
+                pr2 = self._refit_to_boundary(R, rf, bnd, tol_cap)
+                if pr2 is not None:
+                    R.prim, R._bnd_refit = pr2, True
+                    ok2, why2 = self._convert(R, strict_hole, analytic_planes, analytic_curved, fitted_curves)
+                    R._bnd_refit = False
+                    if self.verbose:
+                        Log.debug(f"    refitted to its edges: {'ok' if ok2 else why2}")
+                    if ok2:
+                        return ok2, why2
+                    R.prim = prim
             return False, (f"polygonal edge tolerance {worst_edge_tol:.1e} > ceiling {tol_cap:.1e}")
 
         det = check_detail(F)
@@ -15762,6 +15825,57 @@ class Engine:
         return ([(td_Edge(me.Edge()), fwd_from_A)], A, B, True), ""
 
     # --- wire ----------------------------------------------------------------------
+    def _wire_samples(self, F) -> Optional[np.ndarray]:
+        """Points along every edge of the face's wires, about 0.5 mm apart."""
+        out = []
+        try:
+            for e in explore(F, TopAbs_EDGE):
+                c, a, b = edge_curve(td_Edge(e))
+                if c is None:
+                    continue
+                n = min(65, max(3, int(math.ceil(edge_length(td_Edge(e)) / 0.5)) + 1))
+                out.append(curve_points(c, a, b, n)[0])
+        except Exception:
+            return None
+        return np.vstack(out) if out else None
+
+    def _refit_to_boundary(self, R: Region, rf, bnd: np.ndarray, tol_cap: float) -> Optional[Prim]:
+        """
+        ⚠️ A B-SPLINE PATCH KNOWS ITS FACETS, NOT ITS EDGES. The fit holds
+        the vertices and the facets' interior, but the face is bounded by
+        the mesh's own polyline and by the arcs and intersections already
+        made against its neighbours, and nothing held the spline along
+        them: between two vertices of a 17 mm edge of test14's twisted
+        fillet (CAD face 650) it bulged 0.07-0.15 mm off a chord that lies
+        ON the CAD surface (0.004 off it), and an r 13.35 arc against a
+        floor runs outside the facets' footprint, where the spline is only
+        extrapolated - polygonal edge tolerance over the ceiling, the patch
+        refused, the facets left as a mosaic of planes. Refitted once with
+        points along the very edges it was refused on as data of their own
+        (weights 0.15 to 0.6, a vertex weighing 1): taken only if the
+        vertices stay within the tolerance, the interior no further than
+        a quarter beyond the first fit and the edges under the ceiling.
+        """
+        topo = self.topo
+        old = R.prim.free
+        try:
+            P = np.vstack([topo.verts[i] for i in rf])
+            N = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in rf])
+            chk = sag_points(topo, rf)
+            ctol = max(1.25 * float(np.abs(old.dist(chk)).max()), 2.0 * self.tol_fit)
+        except Exception:
+            return None
+        for w in (0.15, 0.3, 0.6):
+            pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=ctol, soft=chk, bnd=bnd, bnd_w=w)
+            if pr is None:
+                continue
+            if 1.2 * float(np.abs(pr.free.dist(bnd)).max()) + 1e-7 > 0.9 * tol_cap:
+                continue
+            p2 = copy.copy(R.prim)
+            p2.free, p2.center, p2.axis, p2.rms = pr.free, pr.center, pr.axis, pr.rms
+            return p2
+        return None
+
     def _build_wires(self, F, sp: SurfParam, loops, new_edges, seam, flip: bool):
         """
         Builds the face's wires with the pcurves unwrapped along the traversal.
@@ -17192,6 +17306,15 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
         if len(Pq) < 3:
             return False
         seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+        # ⚠️ NOT A SLIVER INTO A LENS. A 0.001 mm2 triangle beside a test17
+        # slot patch had two of its three edges in the chain: one arc and
+        # the third edge left, 0.29 mm long and a few microns apart - valid
+        # in memory, merged into ONE edge by the STEP reader, and the part
+        # read back invalid. A face left with two edges and thinner than
+        # twice the tolerance keeps its polyline.
+        for fi in facce:
+            if fi is not None and fi >= 0 and len(topo.f_edges[fi]) - len(cat) + 1 <= 2 and float(topo.areas[fi]) < 2.0 * tol * float(seg.sum()):
+                return False
         if not closed:
             dr = P[-1] - P[0]
             L = float(np.linalg.norm(dr))

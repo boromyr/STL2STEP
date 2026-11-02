@@ -330,6 +330,26 @@ are reported but left in.
   a section's) is cut in halves first and each filled again; if one goes in, the halves stay, and a
   half refused in turn stays mesh. (The halves were filled on facet indices that converting the
   first one renumbered: each is now held by its faces.)
+- **A free-form patch held at its rim.** A B-spline patch is fitted to its facets' vertices and sag
+  points, so along a long edge nothing holds it between two vertices: `test14`'s variable blend by
+  the frame's front edge (CAD face 650) has a 17 mm edge whose polyline lies on the CAD to 0.004,
+  while the spline bulged 0.07-0.15 off it, and a neighbour's arc r 13.35 ran outside the vertices'
+  footprint, where the spline is only extrapolated - refused for an edge polygonal beyond the
+  ceiling. Such a patch is now fitted once more with points along its edges every 0.5 mm as data of
+  their own (weight 0.15, 0.3, then 0.6, the grid widened to cover them), kept only if the vertices
+  stay within the tolerance, the interior no more than a quarter beyond the first fit and every edge
+  under the ceiling, and the face is built again; if that fails too, the first fit's refusal stands.
+  And an edge's tolerance on a free-form patch was measured to its vertical foot on the height
+  field, not to the nearest point - on a steep flank 2-3 times the distance (`test17`'s slot ends,
+  0.05-0.085 against a ceiling of 0.035): the pcurve now goes through the orthogonal foot (Newton,
+  five steps). Between them, a 0.001 mm2 triangle beside a `test17` slot patch kept two edges, an
+  arc and a chord 0.29 mm long a few microns apart: valid in memory, one edge once the STEP reader
+  had merged them, and the part read back invalid. A face that would be left with two edges and is
+  thinner than twice the tolerance keeps its polyline. `test17` 322 → 306 faces (deviation 0.067 →
+  0.057), `test12` 3083 → 3046, `test14` 4240 → 4188 (0.274 → 0.260), the rest unchanged. Face 650
+  itself is still mostly facets: the analytic edges of a 37-facet piece of it stand 0.3-0.5 off the
+  patch, and fitted to them the spline folds (the face's (u, v) loop crosses itself) - the rollback
+  leaves the mesh.
 - **Under a window the coarse wall is a fan.** Below each window bottom the 47-gon wall runs in a
   fan of thirty-odd slivers, from the polygon's sides at the flange (down to 0.047 inside) up to the
   round's foot on the true circle: twisted up to 17 degrees, one corner on the circle or two, never
