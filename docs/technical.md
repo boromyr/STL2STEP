@@ -350,6 +350,27 @@ are reported but left in.
   itself is still mostly facets: the analytic edges of a 37-facet piece of it stand 0.3-0.5 off the
   patch, and fitted to them the spline folds (the face's (u, v) loop crosses itself) - the rollback
   leaves the mesh.
+- **Spheres and tori as neighbours.** A new edge against a neighbour already built on a curved
+  surface gets its pcurve there in a frame rebuilt from that face, and on the two closed surfaces
+  the frame was wrong. A sphere is built with its X axis turned away from the reference it is
+  given, so that its seam runs behind the face; rebuilt from the face's own X, the frame came out
+  half a turn round the pole, every pcurve on a sphere neighbour sat on the far side of the
+  sphere, π off in u, and the neighbour's wire no longer closed (`BadOrientationOfSubshape`,
+  `Invalid`): all 219 refusals against a sphere in `test9`, `test12`, `test13` and `test14`. A
+  torus goes round in v as well, and the new pcurve's v was left where the unwrapping put it, in
+  (−π, π]: a tube face lying across v = π (`test8`'s r 0.5 corners, v 3.0 to 3.3) got its arc a
+  whole turn away (36 refusals in `test8`, `test12` and `test14`). Those regions went in at a later
+  try with every edge of their contour left a polyline, or not at all (`test14`: 94 and 3 refused,
+  `test12`: 17, `test13`: 8, `test8`: 6, `test9`: 1). The sphere's frame is now read from the face
+  as it is, like a plane's, and v is shifted into the face's own domain as u already was.
+  And the patch refitted to its rim was judged only at the points it was fitted on, 0.5 mm apart
+  and three on a short edge: on `test14`'s refused patches the boundary stood up to five times
+  further off between them (0.005 at the samples, 0.027 in between), and `test17`'s slot patches
+  passed to be refused right after; it is now judged every 0.1 mm, at least 17 points an edge.
+  `test13`: still 57 of 57 CAD faces, no refusal against a sphere (16 before) and no region left
+  with a polygonal contour (8), edge tolerance at most 0.0044 (0.0054); `test8`: no refusal
+  against a torus (12), polygonal contours 8 → 2, the same 452 faces; `test9`: no refusal against a
+  sphere (2), polyline edges 1,853 → 1,850, the same 886 faces.
 - **Under a window the coarse wall is a fan.** Below each window bottom the 47-gon wall runs in a
   fan of thirty-odd slivers, from the polygon's sides at the flange (down to 0.047 inside) up to the
   round's foot on the true circle: twisted up to 17 degrees, one corner on the circle or two, never

@@ -1983,11 +1983,11 @@ def _read_back_check(shape, ri, base_bad: Set[int], defl: float, mended: bool = 
     return (0, 0, len(bad)), why, bad
 
 
-def _shift_to_vertices(f, e, ua: float, ub: float) -> Optional[int]:
-    """Whole periods k to add to a new edge's pcurve (from ua to ub in u) so
-    its ends land where the edges face f already has at the same vertices
-    have theirs (see Engine._pcurve_on_neighbor); None if no edge of f
-    reaches either vertex."""
+def _shift_to_vertices(f, e, ua: float, ub: float, axis: int = 0) -> Optional[int]:
+    """Whole periods k to add to a new edge's pcurve (from ua to ub in u, or
+    in v with axis 1) so its ends land where the edges face f already has at
+    the same vertices have theirs (see Engine._pcurve_on_neighbor); None if
+    no edge of f reaches either vertex."""
     from OCP.BRepAdaptor import BRepAdaptor_Curve2d
 
     ends = []
@@ -2003,7 +2003,7 @@ def _shift_to_vertices(f, e, ua: float, ub: float) -> Optional[int]:
                 cg = BRepAdaptor_Curve(g)
                 for t in (c.FirstParameter(), c.LastParameter()):
                     if cg.Value(t).Distance(pv) <= max(10.0 * float(bt_Tolerance(v)), 1e-4):
-                        cands.append(c.Value(t).X())
+                        cands.append(c.Value(t).X() if axis == 0 else c.Value(t).Y())
             except Exception:
                 continue
         if cands:
@@ -15335,9 +15335,10 @@ class Engine:
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
             bnd = self._wire_samples(F) if prim.kind == FREE and not getattr(R, "_bnd_refit", False) else None
+            bnd_chk = self._wire_samples(F, 0.1, 17, 257) if bnd is not None else None
             self._restore_all(vtol_backup)
             if bnd is not None:
-                pr2 = self._refit_to_boundary(R, rf, bnd, tol_cap)
+                pr2 = self._refit_to_boundary(R, rf, bnd, tol_cap, bnd_chk)
                 if pr2 is not None:
                     R.prim, R._bnd_refit = pr2, True
                     ok2, why2 = self._convert(R, strict_hole, analytic_planes, analytic_curved, fitted_curves)
@@ -15825,21 +15826,22 @@ class Engine:
         return ([(td_Edge(me.Edge()), fwd_from_A)], A, B, True), ""
 
     # --- wire ----------------------------------------------------------------------
-    def _wire_samples(self, F) -> Optional[np.ndarray]:
-        """Points along every edge of the face's wires, about 0.5 mm apart."""
+    def _wire_samples(self, F, step: float = 0.5, nmin: int = 3, nmax: int = 65) -> Optional[np.ndarray]:
+        """Points along every edge of the face's wires, about step mm apart
+        (nmin to nmax on each)."""
         out = []
         try:
             for e in explore(F, TopAbs_EDGE):
                 c, a, b = edge_curve(td_Edge(e))
                 if c is None:
                     continue
-                n = min(65, max(3, int(math.ceil(edge_length(td_Edge(e)) / 0.5)) + 1))
+                n = min(nmax, max(nmin, int(math.ceil(edge_length(td_Edge(e)) / step)) + 1))
                 out.append(curve_points(c, a, b, n)[0])
         except Exception:
             return None
         return np.vstack(out) if out else None
 
-    def _refit_to_boundary(self, R: Region, rf, bnd: np.ndarray, tol_cap: float) -> Optional[Prim]:
+    def _refit_to_boundary(self, R: Region, rf, bnd: np.ndarray, tol_cap: float, bnd_chk: Optional[np.ndarray] = None) -> Optional[Prim]:
         """
         ⚠️ A B-SPLINE PATCH KNOWS ITS FACETS, NOT ITS EDGES. The fit holds
         the vertices and the facets' interior, but the face is bounded by
@@ -15865,11 +15867,21 @@ class Engine:
             ctol = max(1.25 * float(np.abs(old.dist(chk)).max()), 2.0 * self.tol_fit)
         except Exception:
             return None
+        # ⚠️ ...AND JUDGED WHERE THE EDGES WILL BE MEASURED. The points it
+        # is fitted on, 0.5 mm apart and three on a short edge, said nothing
+        # of the spline between them: on test14's refused patches the
+        # boundary stood up to five times further off between them (0.005
+        # at the samples, 0.027 in between), and test17's slot patches
+        # passed here to be refused right after (0.058-0.072 against
+        # 0.037). Checked every 0.1 mm, at least 17 points an edge, as the
+        # pcurves will be: a fit that fails there makes way for the next
+        # weight.
+        Q = bnd if bnd_chk is None else bnd_chk
         for w in (0.15, 0.3, 0.6):
             pr = fit_free(P, N, self.tol_fit, check=chk, check_tol=ctol, soft=chk, bnd=bnd, bnd_w=w)
             if pr is None:
                 continue
-            if 1.2 * float(np.abs(pr.free.dist(bnd)).max()) + 1e-7 > 0.9 * tol_cap:
+            if 1.2 * float(np.abs(pr.free.dist(Q)).max()) + 1e-7 > 0.9 * tol_cap:
                 continue
             p2 = copy.copy(R.prim)
             p2.free, p2.center, p2.axis, p2.rms = pr.free, pr.center, pr.axis, pr.rms
@@ -16326,11 +16338,21 @@ class Engine:
             # fitted primitive's has nothing to do with the already-built
             # face's: the pcurve would end up translated by millimeters and
             # the neighbor's wire would no longer close.
-            if prim.kind == PLANE:
+            # ⚠️ ...AND SO DOES THE SPHERE. SurfParam turns a sphere's X AWAY
+            # from the ref it is given (the seam behind the face), and the
+            # ref here was the built face's own X: the frame came out half a
+            # turn round the pole, every pcurve laid on a sphere neighbour
+            # sat on the far side of the sphere, pi off in u, and the
+            # neighbour's wire no longer closed (BadOrientationOfSubshape).
+            # All 219 refusals against a sphere in test9/12/13/14 were this:
+            # test13's r2 rods went in only at the second try, a 10-edge
+            # polyline against their round ends, and a free-form fillet of
+            # test14 refitted to its edges was refused at x -199.
+            if prim.kind in (PLANE, SPHERE):
                 ad = BRepAdaptor_Surface(f, True)
-                if ad.GetType() != GeomAbs_Plane:
-                    return "the neighbor isn't a plane"
-                pos = ad.Plane().Position()
+                if ad.GetType() != (GeomAbs_Plane if prim.kind == PLANE else GeomAbs_Sphere):
+                    return "the neighbor isn't a plane" if prim.kind == PLANE else "the neighbor isn't a sphere"
+                pos = (ad.Plane() if prim.kind == PLANE else ad.Sphere()).Position()
                 o, dx, dy, dz = pos.Location(), pos.XDirection(), pos.YDirection(), pos.Direction()
                 spn.C = np.array([o.X(), o.Y(), o.Z()])
                 spn.X = np.array([dx.X(), dx.Y(), dx.Z()])
@@ -16346,26 +16368,37 @@ class Engine:
             # while the hole's face lives on [2.13, 8.41], and its wire gets
             # a 2*pi hole ("face:Invalid"). The pcurve is shifted by whole
             # periods to sit in the middle of the face's own domain.
+            # ⚠️ A TORUS GOES ROUND IN v TOO, and v is unwrapped the same way,
+            # from the principal angle in (-pi, pi]: a tube face lying across
+            # v = pi (test8's r0.5 corner, v 2.996 to 3.288) got its new arc
+            # at v -2.996, a whole turn off its other edges - the wire open,
+            # BadOrientationOfSubshape, the region refused (36 refusals
+            # against a torus in test8/12/14). The same shift, in v.
             if prim.kind in (AXIAL, SPHERE, TORUS):
                 try:
-                    u_lo, u_hi, _, _ = _st(_BRepTools.BRepTools, "UVBounds")(f)
+                    bounds = _st(_BRepTools.BRepTools, "UVBounds")(f)
                     a_, b_ = c2d.FirstParameter(), c2d.LastParameter()
-                    ua, ub = c2d.Value(a_).X(), c2d.Value(b_).X()
-                    um = 0.5 * (ua + ub)
-                    k_ = round((0.5 * (u_lo + u_hi) - um) / (2.0 * math.pi))
-                    # ⚠️ ...BUT A SLANTED SEAM HAS A STRIP ON BOTH SIDES. A face
-                    # whose seam is a path of mesh edges (test17's boss rim, its
-                    # seam 0.29 rad aslant) spans more than a period: a strip of
-                    # it has two u's, and an edge there put by the middle of the
-                    # domain took the far one - its wire went the long way round,
-                    # a strip covered twice. There the edge's own ends say: the
-                    # u the face's edges already have at its two vertices.
-                    if u_hi - u_lo > 2.0 * math.pi + 1e-3:
-                        k_v = _shift_to_vertices(f, e, ua, ub)
-                        if k_v is not None:
-                            k_ = k_v
-                    if k_ != 0 and u_hi - u_lo < 4.0 * math.pi:
-                        c2d.Translate(gp_Vec2d(2.0 * math.pi * k_, 0.0))
+                    pa_, pb_ = c2d.Value(a_), c2d.Value(b_)
+                    shift = [0.0, 0.0]
+                    for ax in (0, 1) if prim.kind == TORUS else (0,):
+                        w_lo, w_hi = bounds[2 * ax], bounds[2 * ax + 1]
+                        wa, wb = (pa_.X(), pb_.X()) if ax == 0 else (pa_.Y(), pb_.Y())
+                        k_ = round((0.5 * (w_lo + w_hi) - 0.5 * (wa + wb)) / (2.0 * math.pi))
+                        # ⚠️ ...BUT A SLANTED SEAM HAS A STRIP ON BOTH SIDES. A face
+                        # whose seam is a path of mesh edges (test17's boss rim, its
+                        # seam 0.29 rad aslant) spans more than a period: a strip of
+                        # it has two u's, and an edge there put by the middle of the
+                        # domain took the far one - its wire went the long way round,
+                        # a strip covered twice. There the edge's own ends say: the
+                        # u the face's edges already have at its two vertices.
+                        if w_hi - w_lo > 2.0 * math.pi + 1e-3:
+                            k_v = _shift_to_vertices(f, e, wa, wb, ax)
+                            if k_v is not None:
+                                k_ = k_v
+                        if k_ != 0 and w_hi - w_lo < 4.0 * math.pi:
+                            shift[ax] = 2.0 * math.pi * k_
+                    if shift[0] != 0.0 or shift[1] != 0.0:
+                        c2d.Translate(gp_Vec2d(shift[0], shift[1]))
                 except Exception:
                     pass
             tol = max(float(bt_Tolerance(e)), 1.2 * dev + 1e-7)
