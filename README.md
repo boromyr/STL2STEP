@@ -23,7 +23,8 @@ triangles.
 - **Automatic mesh repair.** Holes, duplicate and degenerate triangles, non-manifold edges and
   inconsistent orientation are detected and repaired before conversion, without moving vertices.
 - **Integrated viewer.** A desktop application displays the input mesh, the converted model and
-  the original CAD side by side, with faces colored by surface type.
+  the original CAD side by side, with faces colored by surface type, and lets you fix by hand the
+  faces that came out in pieces.
 - **Parallel execution.** All CPU cores are used, and the result is identical regardless of the
   number of processes.
 
@@ -78,6 +79,13 @@ python viewer/server.py
 
 The viewer allows selecting a mesh, running the conversion and inspecting the result. The type,
 radius and area of each face are shown on hover.
+
+Faces that came out in pieces can be fixed by hand: press **Fix faces** (E) on the STEP, click one
+of the pieces (the selection grows to the pieces like it; Shift+click or Shift+drag paints single
+faces in or out, and only the selection is coloured), choose what they are — Auto, Plane,
+Cylinder, Cone, Torus, Sphere, Tube or Free-form — and press **Build**. The choices are saved next to the mesh as `<name>.hints.json`, and the conversion
+(`--hints`) turns each of them into one face of that type (two, for a Free-form or Tube round that
+runs all the way round a hole).
 
 ## Repository contents
 

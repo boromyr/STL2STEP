@@ -75,6 +75,43 @@ already exists and will be overwritten. `--browser` shows the same page in the d
 instead (that's also the fallback without pywebview), `--serve` only runs the local server; in the
 browser, files dropped on the view are copied into `viewer_uploads/`.
 
+**Hand fixes.** Where a face came out in pieces - a round rolling along a curved edge in strips of
+cylinders, tori and little B-splines, a loft, a blend no rule found whole - the user can say what
+it is. **Fix faces** (E) on the STEP (a STEP opened on its own hands over to the mesh beside it,
+the STEP as that one's output): a click picks the face under the cursor and grows across edges
+where the faces are tangent (within 30°) into the pieces like it: faces of a similar curvature
+(within 2.5x: the round's strips, not the wall or the bore it rounds), the mesh triangles left
+between them, never a face twenty times bigger than the pieces so far; from a plane, only the
+pieces of that plane. Shift+click adds or removes a single face, Shift+drag paints them in (or out,
+from a face already picked); while picking only the pick is coloured, the menu docked under the
+toolbar. Then one of Auto, Plane, Cylinder,
+Cone, Torus, Sphere, Tube or Free-form: the page previews the quadric's size and how far the
+triangles' corners stand off it, and the choice goes to `<name>.hints.json` beside the mesh -
+`{"refit_hints": 1, "groups": [{"type": "torus", "points": [[x, y, z], ...], "areas": [...]}]}`,
+one point per input triangle under the picked faces (its centroid) and that triangle's area, so it
+holds for every later conversion of that mesh, not just the one it was picked on. A few triangles
+of another face left inside the pick (at most 5% of its triangles and 2% of its area) go with it.
+**Build** runs the conversion with `--hints`: each Phase C takes the facets the group covers (half
+of each facet's area at least: Phase A merges a plane's triangles into one facet, and a lone
+triangle of a plane in the pick isn't the whole plane), fits them as the type chosen (Auto: the
+simplest quadric holding the vertices within twice the tolerance, else free-form; Free-form and
+Tube widen the tolerances step by step until one patch holds; a closed ring - a round all round a
+hole - doesn't lay flat in one sheet, so a free-form patch or a tube on it is fitted on each half
+of the ring, two faces, while a quadric goes round whole) and converts it first, its facets taken
+from the regions the seeds made - what those kept outside the group stays theirs, in pieces if the
+pick cut them. The engine's sag and polygonal-edge limits follow the surface the user chose, up to
+5 edge tolerance ceilings off the facets (`HINT_MAX_DEV`; the page warns before Build): past that
+the group is refused - better tessellated than deformed (a torus picked over 27 faces of `test15`
+missed them by 6 mm). Validity, closure and volume are checked as for any face, and a group the
+engine refuses goes back to what the segmentation had made of it. The log ends with one line per
+hand fix, and the page shows them built or refused. On a closed section of `test18`'s window, the
+r 1.2 round along the bottom of the window (17 faces, 2,008 triangles) picked as Free-form: one
+B-spline face, its vertices within 2.5e-3 mm, and 228 faces in all instead of 235 (qa 0.047 mm).
+The whole round all round the window (one click: 26 faces, 4,150 triangles) as Free-form: two
+B-spline faces, 211 faces in all (qa 0.049 mm) - but the round's straight runs were exact
+cylinders and one bend an exact torus, and their circles went into the B-splines with them (99
+circles -> 60): what is already exact is better left out of the pick (Shift+click).
+
 ## Mesh check (STL input)
 
 Before anything else the mesh is checked: triangles with a repeated vertex or zero area, duplicate

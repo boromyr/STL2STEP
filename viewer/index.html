@@ -67,6 +67,38 @@ button, input, select { font: inherit; color: inherit; }
 #secbox button:hover { color: var(--text); background: #2a2e37; }
 #gizmo { position: absolute; left: 14px; bottom: 14px; width: 96px; height: 96px; pointer-events: none; }
 
+/* hand fixes: pick the pieces, choose what they are */
+#fixmenu { position: absolute; right: 18px; top: 64px; display: none; flex-direction: column; gap: 4px; padding: 8px 10px 10px; background: rgba(17,19,23,.96); border: 1px solid #2f6f63; border-radius: 12px; z-index: 6; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
+#fixmenu.show { display: flex; }
+#fixmenu .ttl { font-size: 12px; color: var(--muted); padding: 0 2px 4px; display: flex; gap: 8px; align-items: center; }
+#fixmenu .ttl b { color: var(--text); font-weight: 600; }
+#fixmenu .ttl .x { margin-left: auto; cursor: pointer; color: var(--faint); padding: 0 2px; }
+#fixmenu .ttl .x:hover { color: var(--text); }
+#fixmenu .r { display: flex; gap: 4px; justify-content: center; }
+#fixmenu button { border: 1px solid transparent; background: transparent; color: #c4c9d1; padding: 6px 11px; border-radius: 7px; cursor: pointer; font-size: 13px; white-space: nowrap; }
+#fixmenu button:hover { background: #2a2e37; color: var(--text); }
+#fixmenu button[data-type=auto] { border-color: #2f6f63; color: var(--accent); }
+#fixtag { position: absolute; left: 50%; bottom: 74px; transform: translateX(-50%); display: none; padding: 7px 14px; border-radius: 9px; background: rgba(17,19,23,.94); border: 1px solid var(--line); font-size: 13px; z-index: 4; white-space: nowrap; pointer-events: none; }
+#fixtag.show { display: block; }
+#fixtag .hl { color: var(--accent); }
+#fixtag .far { color: var(--warn); }
+#view.logopen #fixtag { bottom: calc(36% + 70px); }
+#view.fixing #c { cursor: crosshair; }
+#fixbtn.on { background: var(--accent); color: var(--accent-ink); }
+#fixes { display: none; }
+#fixes.show { display: block; }
+.fixrow { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; background: var(--card); border: 1px solid var(--line-soft); margin-bottom: 4px; font-size: 12.5px; cursor: default; }
+.fixrow:hover { border-color: #3a3f48; }
+.fixrow .lb { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c4c9d1; }
+.fixrow .st { color: var(--faint); font-size: 11.5px; white-space: nowrap; }
+.fixrow .st.ok { color: var(--ok); } .fixrow .st.no { color: var(--warn); }
+.fixrow .del { cursor: pointer; color: var(--faint); padding: 0 3px; }
+.fixrow .del:hover { color: var(--err); }
+.fixbtns { display: flex; gap: 6px; margin-top: 8px; }
+.fixbtns .btn { flex: 1; }
+#fixbuild { background: var(--accent); color: var(--accent-ink); border: 0; font-weight: 600; }
+#fixbuild:disabled { background: #2a2e36; color: #5c626d; cursor: default; }
+
 #tip { position: absolute; pointer-events: none; background: rgba(15,17,21,.94); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; font-size: 12.5px; display: none; white-space: nowrap; z-index: 5; }
 #pivot { position: absolute; width: 10px; height: 10px; margin: -5px 0 0 -5px; border-radius: 50%; background: #6fd65c; border: 2px solid #0f1115; pointer-events: none; display: none; z-index: 3; }
 #tip .k { color: var(--muted); }
@@ -196,8 +228,26 @@ table.stats tr.gap td { padding-top: 10px; }
           <button id="secmflip">⇅ Flip side</button>
           <button id="secmoff">✕ Off</button>
         </div>
+        <span class="sep"></span>
+        <button id="fixbtn" title="Fix faces by hand: click a face, choose what it is (E)" disabled>Fix faces</button>
       </div>
     </div>
+    <div id="fixmenu">
+      <div class="ttl"><b id="fixmtitle">1 face</b><span id="fixmhint">Shift+click or Shift+drag: add or remove faces</span><span class="x" id="fixmclose" title="Clear the selection (Esc)">✕</span></div>
+      <div class="r">
+        <button data-type="auto" title="The simplest surface that holds them, else one free-form face">Auto</button>
+        <button data-type="plane">Plane</button>
+        <button data-type="cylinder">Cylinder</button>
+        <button data-type="cone">Cone</button>
+        <button data-type="torus">Torus</button>
+      </div>
+      <div class="r">
+        <button data-type="sphere">Sphere</button>
+        <button data-type="tube" title="A tube that is no quadric: a B-spline around its axis">Tube</button>
+        <button data-type="freeform" title="One B-spline patch over all of them">Free-form</button>
+      </div>
+    </div>
+    <div id="fixtag"></div>
     <div id="secbox">
       <span class="ax" id="secax">X</span>
       <input id="secval" inputmode="decimal" spellcheck="false" title="Section position (Enter to apply, ↑ ↓ to step, Shift ×10)">
@@ -280,6 +330,13 @@ table.stats tr.gap td { padding-top: 10px; }
     <div id="runstate">
       <div class="top"><div class="spin" id="runspin"></div><div class="ph" id="runphase"></div><div class="tm" id="runtime"></div></div>
       <div class="sum" id="runsum"></div>
+    </div>
+
+    <div id="fixes">
+      <h3>Hand fixes</h3>
+      <div id="fixlist"></div>
+      <div class="checks" style="grid-template-columns:1fr"><label title="--hints &lt;name&gt;.hints.json"><input type="checkbox" id="o_hints" checked> Use them when converting</label></div>
+      <div class="fixbtns"><button class="btn" id="fixbuild" title="Convert again with the hand fixes">Build</button><button class="btn" id="fixclear" title="Forget every hand fix of this mesh">Clear</button></div>
     </div>
 
     <h3 id="stattitle">Model</h3>
@@ -546,6 +603,11 @@ const S = {
   models: { input: null, output: null, cad: null }, tab: "input",
   disp: { shaded: true, edges: true, mesh: false }, color: "type", flat: false,
   isolate: null, hover: -1, job: null, fitted: null,
+  // hand fixes: on = picking mode; sel = faces picked (of the STEP shown);
+  // groups = the input's hints file; mark = face -> type of a group not built yet
+  fix: { on: false, sel: new Set(), label: "", groups: [], path: null, mark: new Map(), results: {} },
+  // a STEP opened as the input: the mesh it was converted from, if it's beside it
+  mesh: null,
 };
 
 function resize() {
@@ -669,13 +731,31 @@ function buildSTEP(h, pos, idx, seg) {
 const tmp = new THREE.Color();
 function faceColor(m, i, out) {
   const f = m.h.faces[i];
+  // (picking faces: only the pick in colour - among the type colours a pick
+  // was hard to tell from a cylinder or a B-spline)
+  if (S.fix.on && m === S.models.output) {
+    out.copy(S.fix.sel.has(i) ? SEL_COLOR : PLAIN);
+    if (i === S.hover) out.lerp(SEL_COLOR, 0.35);
+    return out;
+  }
   if (S.color === "type") out.set(FACE_COLORS[faceKey(f)] || FACE_COLORS.other);
   else if (S.color === "faces") out.setHSL((i * 0.6180339887) % 1, 0.55, 0.62);
   else out.copy(PLAIN);
   if (S.isolate) faceKey(f) === S.isolate ? out.set(FACE_COLORS[S.isolate]) : out.copy(DIM);
-  if (i === S.hover) out.lerp(new THREE.Color("#ffffff"), 0.45);
+  if (m === S.models.output) {
+    if (S.fix.sel.has(i)) out.copy(SEL_COLOR);
+    else if (S.fix.mark.has(i)) out.set(FIX_COLORS[S.fix.mark.get(i)] || FIX_COLORS.auto).lerp(WHITE, 0.25);
+  }
+  if (i === S.hover) out.lerp(WHITE, 0.45);
   return out;
 }
+const WHITE = new THREE.Color("#ffffff");
+const SEL_COLOR = new THREE.Color("#35d0f0");
+const FIX_COLORS = {
+  auto: "#6fd6bf", plane: FACE_COLORS.plane, cylinder: FACE_COLORS.cylinder, cone: FACE_COLORS.cone, sphere: FACE_COLORS.sphere,
+  torus: FACE_COLORS.torus, tube: FACE_COLORS.bspline, freeform: FACE_COLORS.bspline,
+};
+const FIX_NAMES = { auto: "Auto", plane: "Plane", cylinder: "Cylinder", cone: "Cone", sphere: "Sphere", torus: "Torus", tube: "Tube", freeform: "Free-form" };
 function paintFace(m, i) {
   const f = m.h.faces[i], a = m.geo.attributes.color.array;
   faceColor(m, i, tmp);
@@ -690,7 +770,7 @@ function recolor(m) {
     for (let i = 0; i < m.h.faces.length; i++) paintFace(m, i);
     const ea = m.egeo.attributes.color.array;
     for (const [s0, n, kind, free] of m.h.edges) {
-      const c = free ? FREE_EDGE : S.color === "curves" ? tmp.set(CURVE_COLORS[kind] || CURVE_COLORS.other) : EDGE_DARK;
+      const c = free ? FREE_EDGE : S.color === "curves" && !(S.fix.on && m === S.models.output) ? tmp.set(CURVE_COLORS[kind] || CURVE_COLORS.other) : EDGE_DARK;
       for (let k = 6 * s0, e = 6 * (s0 + n); k < e; k += 3) { ea[k] = c.r; ea[k + 1] = c.g; ea[k + 2] = c.b; }
     }
     m.egeo.attributes.color.needsUpdate = true;
@@ -759,6 +839,7 @@ async function loadTab(tab, show = true, force = false) {
       if (tab !== "input") { S.paths[tab] = null; refreshTabs(); }
       return;
     } finally { if (show) overlay(null); }
+    if (tab === "output") { S.fix.sel.clear(); renderFixes(); }
   }
   if (show) setTab(tab); else renderStats();
 }
@@ -858,6 +939,227 @@ function pivotTick() {
 canvas.addEventListener("dblclick", (e) => {
   const hit = pick(e);
   if (hit) { controls.target.copy(hit.point); controls.update(); }
+});
+
+// ---------------------------------------------------------------- hand fixes
+// Some rounds come out in pieces. "Fix faces" (E): a click on one picks it and
+// the pieces like it (the server grows the pick across smooth edges), Shift+click
+// adds or removes a single face; then choose what they are. Each choice goes to
+// <name>.hints.json beside the input (one point per input triangle under the
+// faces) and the next conversion turns each group into ONE face of that type.
+// (a STEP opened on its own: Fix faces opens its mesh, the STEP as that one's output - see fixOnMesh)
+const stepWithMesh = () => !!(S.input && /\.(step|stp)$/i.test(S.input) && S.mesh);
+const fixable = () => !!(S.input && /\.stl$/i.test(S.input) && S.paths.output && S.models.output) || stepWithMesh();
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? undefined : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await res.json();
+  if (!res.ok) throw new Error(j.error || res.statusText);
+  return j;
+}
+function repaintOutput() {
+  const m = S.models.output;
+  if (m) recolor(m);
+}
+// The fixes are kept on the mesh's triangles and Build converts the mesh again:
+// a STEP opened as the input hands over to the mesh beside it, the STEP as its
+// output (named in the output field when refit wouldn't write that file).
+async function fixOnMesh() {
+  const step = S.input, mesh = S.mesh;
+  try {
+    const r = await (await fetch(`/api/default-output?input=${encodeURIComponent(mesh)}&args=${encodeURIComponent(buildArgs())}`)).json();
+    const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
+    $("#output").value = norm(r.output) === norm(step) ? "" : step;
+    await loadFiles(mesh);
+    await pickInput(mesh);
+    if (S.input !== mesh) return;
+    await loadTab("output");
+    if (!S.models.output) return;
+    setFixMode(true);
+    fixTag(`Fixing on <span class="hl">${escapeHtml(base(mesh))}</span>, the mesh ${escapeHtml(base(step))} was made from · click a face`, 7000);
+  } catch (ex) { toast(`Fix faces: ${ex.message}`); }
+}
+function setFixMode(on) {
+  if (on && stepWithMesh()) { fixOnMesh(); return; }
+  on = !!on && fixable();
+  S.fix.on = on;
+  $("#fixbtn").classList.toggle("on", on);
+  $("#view").classList.toggle("fixing", on);
+  if (on && S.tab !== "output") loadTab("output");
+  if (!on) clearPick();
+  repaintOutput();
+  fixTag(on ? (S.fix.sel.size ? null : "Click a face to pick it and the pieces like it · <span class='hl'>Shift</span>+click or drag paints faces in or out") : "");
+}
+function fixTag(html, ms) {
+  const el = $("#fixtag");
+  if (html === null) return;
+  el.innerHTML = html;
+  el.classList.toggle("show", !!html);
+  clearTimeout(fixTag.t);
+  if (html && ms) fixTag.t = setTimeout(() => el.classList.remove("show"), ms);
+}
+function clearPick() {
+  if (!S.fix.sel.size && !$("#fixmenu").classList.contains("show")) return;
+  S.fix.sel.clear();
+  $("#fixmenu").classList.remove("show");
+  repaintOutput();
+}
+function showFixMenu(x, y) {
+  const n = S.fix.sel.size;
+  if (!n) { $("#fixmenu").classList.remove("show"); return; }
+  $("#fixmtitle").textContent = S.fix.label || `${n} face${n === 1 ? "" : "s"}`;
+  // (docked under the toolbar, on the right: by the cursor it covered the
+  // faces next to the pick, the ones a Shift+click wants next)
+  const menu = $("#fixmenu"), r = $("#view").getBoundingClientRect();
+  menu.style.top = Math.round($("#topbar").getBoundingClientRect().bottom - r.top + 10) + "px";
+  menu.classList.add("show");
+}
+async function fixClick(e) {
+  const m = S.models.output;
+  const hit = pick(e);
+  if (!hit) { clearPick(); return; }
+  const i = m.faceOfVert[hit.face.a];
+  if (e.shiftKey) {
+    S.fix.sel.has(i) ? S.fix.sel.delete(i) : S.fix.sel.add(i);
+    S.fix.label = "";
+    repaintOutput();
+    showFixMenu(e.clientX, e.clientY);
+    return;
+  }
+  try {
+    const r = await api("/api/select", { output: S.paths.output, face: i });
+    S.fix.sel = new Set(r.faces);
+    S.fix.label = r.label;
+  } catch (ex) { toast(`Pick: ${ex.message}`); return; }
+  repaintOutput();
+  fixTag("", 0);
+  showFixMenu(e.clientX, e.clientY);
+}
+// Shift + left button held: a brush - every face the cursor passes over joins
+// the pick (or leaves it, when the first one was in it); the view doesn't turn.
+let brush = null;
+function brushAt(x, y) {
+  const m = S.models.output, hit = pick({ clientX: x, clientY: y });
+  if (!m || !hit) return;
+  const i = m.faceOfVert[hit.face.a];
+  if (brush.add === null) brush.add = !S.fix.sel.has(i);
+  if (brush.add === S.fix.sel.has(i)) return;
+  brush.add ? S.fix.sel.add(i) : S.fix.sel.delete(i);
+  paintFace(m, i);
+  m.geo.attributes.color.needsUpdate = true;
+  brush.n++;
+}
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.button !== 0 || !e.shiftKey || e.altKey || e.ctrlKey || !S.fix.on || S.tab !== "output" || !S.models.output) return;
+  e.stopImmediatePropagation();
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch {}
+  S.fix.label = "";
+  brush ={ add: null, last: [e.clientX, e.clientY], n: 0 };
+  brushAt(e.clientX, e.clientY);
+}, true);
+canvas.addEventListener("pointermove", (e) => {
+  if (!brush) return;
+  e.stopImmediatePropagation();
+  // (every few pixels along the stroke: a quick one skips no face)
+  const [x0, y0] = brush.last, d = Math.hypot(e.clientX - x0, e.clientY - y0), k = Math.max(1, Math.ceil(d / 4));
+  for (let j = 1; j <= k; j++) brushAt(x0 + (e.clientX - x0) * j / k, y0 + (e.clientY - y0) * j / k);
+  brush.last = [e.clientX, e.clientY];
+}, true);
+function brushEnd(e) {
+  if (!brush) return;
+  e.stopImmediatePropagation();
+  brush = null;
+  try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  repaintOutput();
+  showFixMenu();
+}
+canvas.addEventListener("pointerup", brushEnd, true);
+canvas.addEventListener("pointercancel", brushEnd, true);
+let fixDown = null;
+canvas.addEventListener("pointerdown", (e) => { fixDown = e.button === 0 ? [e.clientX, e.clientY] : null; }, true);
+canvas.addEventListener("pointerup", (e) => {
+  const d = fixDown;
+  fixDown = null;
+  // a click, not a drag (the left button rotates the view)
+  if (!d || !S.fix.on || S.tab !== "output" || e.altKey || e.ctrlKey) return;
+  if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > 4) return;
+  fixClick(e);
+}, true);
+$$("#fixmenu button[data-type]").forEach((b) => b.addEventListener("click", async () => {
+  const faces = [...S.fix.sel];
+  if (!faces.length) return;
+  const type = b.dataset.type;
+  $("#fixmenu").classList.remove("show");
+  fixTag(`Fitting ${FIX_NAMES[type].toLowerCase()} to ${faces.length} face${faces.length === 1 ? "" : "s"}…`);
+  try {
+    const st = await api("/api/hints/add", { input: S.input, output: S.paths.output, faces, type });
+    S.fix.sel.clear();
+    setHints(st);
+    const pv = st.preview;
+    fixTag(`${escapeHtml(st.label.replace(/ → .*/, ""))} → <span class="${pv.far ? "far" : "hl"}">${escapeHtml(pv.text)}</span> · `
+      + (pv.far ? `<span class="far">too far: refit leaves anything past ${pv.cap.toPrecision(2)} mm as it is</span>` : "Build to apply"), pv.far ? 14000 : 9000);
+  } catch (ex) { fixTag("", 0); toast(`Hand fix: ${ex.message}`); repaintOutput(); }
+}));
+$("#fixmclose").addEventListener("click", clearPick);
+$("#fixbtn").addEventListener("click", () => setFixMode(!S.fix.on));
+
+function setHints(st) {
+  S.fix.groups = st.groups || [];
+  S.fix.path = st.path || null;
+  S.fix.mark = new Map();
+  // (a group shows in its type's colour until it's built: once one face holds it, it's done)
+  for (const g of S.fix.groups) if ((g.faces || []).length > 1) for (const i of g.faces) S.fix.mark.set(i, g.type);
+  renderFixes();
+  repaintOutput();
+  updateCmd();
+}
+function renderFixes() {
+  const box = $("#fixlist");
+  $("#fixes").classList.toggle("show", !!(S.input && /\.stl$/i.test(S.input)) && (S.fix.groups.length > 0 || fixable()));
+  if (!S.fix.groups.length) {
+    box.innerHTML = `<div class="muted small">${fixable() ? "None yet. <b>Fix faces</b> (E), click a face that came out in pieces, choose what it is, then Build." : "Convert first, or open the STEP beside it: the faces are picked on the STEP."}</div>`;
+  } else {
+    box.innerHTML = S.fix.groups.map((g, k) => {
+      const res = S.fix.results[k + 1];
+      const nf = (g.faces || []).length;
+      const st = res ? `<span class="st ${res.ok ? "ok" : "no"}" title="${escapeHtml(res.text)}">${res.ok ? "built ✓" : "refused"}</span>`
+        : `<span class="st">${nf === 1 ? "built" : "pending"}</span>`;
+      return `<div class="fixrow" data-k="${k}" title="${escapeHtml(g.label || "")}"><span class="swatch" style="background:${FIX_COLORS[g.type] || FIX_COLORS.auto}"></span>` +
+        `<span class="lb"><b>${FIX_NAMES[g.type] || g.type}</b> · ${escapeHtml((g.label || "").replace(/^.*? → /, "") || `${g.n} triangles`)}</span>${st}<span class="del" title="Remove this fix">✕</span></div>`;
+    }).join("");
+  }
+  box.querySelectorAll(".fixrow").forEach((row) => {
+    const k = +row.dataset.k;
+    row.querySelector(".del").addEventListener("click", async () => {
+      try { setHints(await api("/api/hints/remove", { input: S.input, output: S.paths.output, index: k })); delete S.fix.results[k + 1]; renderFixes(); }
+      catch (ex) { toast(ex.message); }
+    });
+    // hovering a fix shows its faces
+    row.addEventListener("mouseenter", () => {
+      const g = S.fix.groups[k];
+      if (g?.faces && !$("#fixmenu").classList.contains("show")) { S.fix.sel = new Set(g.faces); repaintOutput(); }
+    });
+    row.addEventListener("mouseleave", () => { if (!$("#fixmenu").classList.contains("show")) { S.fix.sel.clear(); repaintOutput(); } });
+  });
+  $("#fixbuild").disabled = !S.fix.groups.length || !!S.job;
+  $("#fixbtn").disabled = !fixable();
+  $("#fixbtn").title = fixable() ? "Fix faces by hand: click a face, choose what it is (E)"
+    : S.input && /\.(step|stp)$/i.test(S.input) ? "Fix faces needs the mesh this STEP was converted from (<name>.stl beside it)"
+    : "Convert first: the faces are picked on the STEP";
+}
+async function refreshHints() {
+  S.fix.results = {};
+  if (!S.input || !/\.stl$/i.test(S.input)) { setHints({ groups: [] }); return; }
+  try {
+    const out = S.paths.output ? `&output=${encodeURIComponent(S.paths.output)}` : "";
+    setHints(await api(`/api/hints?input=${encodeURIComponent(S.input)}${out}`));
+  } catch (ex) { setHints({ groups: [] }); }
+}
+$("#fixbuild").addEventListener("click", () => { $("#o_hints").checked = true; updateCmd(); $("#go").click(); });
+$("#fixclear").addEventListener("click", async () => {
+  if (!S.fix.groups.length || !confirm(`Forget all ${S.fix.groups.length} hand fixes of ${base(S.input)}?`)) return;
+  try { S.fix.results = {}; setHints(await api("/api/hints/clear", { input: S.input, output: S.paths.output })); }
+  catch (ex) { toast(ex.message); }
 });
 
 // ---------------------------------------------------------------- section
@@ -1234,8 +1536,11 @@ async function pickInput(path) {
     S.models[t] = null;
   }
   S.paths = { input: path || null, output: null, cad: null };
+  S.mesh = null;
   S.isolate = null;
   S.fitted = null;
+  S.fix.sel.clear();
+  setFixMode(false);
   try { localStorage.setItem("refit.input", path || ""); } catch {}
   refreshTabs(); renderStats(); updateCmd(); updateStatus(); setTitle();
   $("#go").disabled = !path || !!S.job;
@@ -1245,9 +1550,12 @@ async function pickInput(path) {
   if (S.input !== path) return;
   S.paths.output = rel.output || null;
   S.paths.cad = rel.original && rel.original !== path ? rel.original : null;
+  S.mesh = rel.mesh || null;
   refreshTabs();
+  renderFixes();
   // prefetch in the background so the panel can compare them
-  if (S.paths.output) loadTab("output", false);
+  if (S.paths.output) loadTab("output", false).then(refreshHints);
+  else refreshHints();
   if (S.paths.cad) loadTab("cad", false);
 }
 $("#file").addEventListener("change", (e) => pickInput(e.target.value));
@@ -1296,7 +1604,8 @@ function updateCmd() {
   const args = buildArgs();
   const inp = S.input ? q(base(S.input)) : "<file>";
   const outField = $("#output").value.trim();
-  $("#cmd").textContent = `python refit.py ${inp}${args ? " " + args : ""}${outField ? " -o " + q(outField) : ""}`;
+  const hints = useHints() ? ` --hints ${q(base(S.fix.path))}` : "";
+  $("#cmd").textContent = `python refit.py ${inp}${args ? " " + args : ""}${hints}${outField ? " -o " + q(outField) : ""}`;
   $$("#presets button").forEach((b) => b.classList.toggle("on", b.dataset.seq === $("#seq").value.trim()));
   saveOpts();
   clearTimeout(outTimer);
@@ -1312,7 +1621,9 @@ $$("#presets button").forEach((b) => b.addEventListener("click", () => { $("#seq
 $("#cmd").addEventListener("click", () => { navigator.clipboard?.writeText($("#cmd").textContent); flash($("#cmd")); });
 function flash(el) { el.style.borderColor = "var(--accent)"; setTimeout(() => (el.style.borderColor = ""), 400); }
 
-const OPT_IDS = ["seq", "tol", "lintol", "threads", "extra", ...FLAGS.map((f) => f[0]), "o_j1"];
+const OPT_IDS = ["seq", "tol", "lintol", "threads", "extra", ...FLAGS.map((f) => f[0]), "o_j1", "o_hints"];
+// (the hand fixes go in when there are any and the box is ticked; the server adds the path)
+const useHints = () => !!(S.fix.path && S.fix.groups.length && $("#o_hints").checked);
 function saveOpts() {
   const o = {};
   for (const id of OPT_IDS) { const el = $("#" + id); o[id] = el.type === "checkbox" ? el.checked : el.value; }
@@ -1359,11 +1670,13 @@ $("#logcopy").addEventListener("click", () => { navigator.clipboard?.writeText($
 
 $("#go").addEventListener("click", async () => {
   if (!S.input || S.job) return;
-  const body = { input: S.input, args: buildArgs(), output: $("#output").value.trim() };
+  const body = { input: S.input, args: buildArgs(), output: $("#output").value.trim(), hints: useHints() };
   const res = await fetch("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const j = await res.json();
   if (!res.ok) { toast(j.error); return; }
-  S.job = { id: j.id, input: S.input, next: 0, output: j.output, phase: "Starting…", t0: performance.now(), summary: [] };
+  S.job = { id: j.id, input: S.input, next: 0, output: j.output, phase: "Starting…", t0: performance.now(), summary: [], fixres: {} };
+  clearPick();
+  renderFixes();
   $("#logtext").textContent = "";
   appendLog(["$ " + j.cmd.map(q).join(" "), ""]);
   $("#logtitle").textContent = "refit.py — " + base(S.input);
@@ -1391,6 +1704,9 @@ async function poll() {
       const b = /^== (.*?)\s*─*$/.exec(s);
       if (b) job.phase = b[1];
       if (/^\[✓\] .*input faces -> /.test(s) || /^\[✓\] Phase .*regions converted/.test(s)) job.summary.push(s.replace(/^\[✓\]\s*/, ""));
+      // the hand fixes' outcome (refit.py: "Hand fix N (type): ..."; the last word wins)
+      const hf = /^\[(✓|!)\] Hand fix (\d+) \((.*?)\): (.*)$/.exec(s);
+      if (hf) job.fixres[+hf[2]] = { ok: hf[1] === "✓", text: hf[4] };
     }
   }
   job.next = st.next;
@@ -1424,8 +1740,16 @@ async function poll() {
       S.paths.output = st.output;
       refreshTabs();
       await loadTab("output", true, true);
+      await refreshHints();
+      S.fix.results = job.fixres;
+      const nf = Object.keys(job.fixres).length;
+      if (nf) {
+        const ok = Object.values(job.fixres).filter((r) => r.ok).length;
+        fixTag(`Hand fixes: <span class="hl">${ok} of ${nf} built</span>` + (ok < nf ? " · the others are back as they were (see the log)" : ""), 9000);
+      }
     }
   }
+  renderFixes();
 }
 function fmtTime(s) { s = Math.round(s); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; }
 async function openReport(path) {
@@ -1469,7 +1793,8 @@ $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () 
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
   if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) { e.preventDefault(); openFile(); }
-  else if (e.key === "Escape") showSecMenu(false);
+  else if (e.key === "Escape") { showSecMenu(false); clearPick(); }
+  else if (e.key === "e" || e.key === "E") setFixMode(!S.fix.on);
   else if (e.key === "f" || e.key === "F") fit(null, null);
   else if (e.key === "i" || e.key === "I") fit(null, "iso");
   else if (e.key === "o" || e.key === "O") setOrbit(!controls.free);

@@ -222,6 +222,7 @@ def step_payload(path):
         R.te_MapShapes(shape, R.TopAbs_FACE, fmap)
         nf = R._size(fmap)
         pos_l, idx_l, faces = [], [], []
+        tess = []  # (points, triangles) per face, as drawn: the hand fixes pick on them
         nv = nt = 0
         for i in range(1, nf + 1):
             f = R.td_Face(fmap.FindKey(i))
@@ -250,6 +251,7 @@ def step_payload(path):
             })
             pos_l.append(P.astype(np.float32))
             idx_l.append((T + nv).astype(np.uint32))
+            tess.append((np.asarray(P, dtype=float), np.asarray(T, dtype=np.int64)))
             nv += len(P)
             nt += len(T)
 
@@ -317,6 +319,12 @@ def step_payload(path):
         "idx": np.concatenate(idx_l) if idx_l else np.zeros((0, 3), np.uint32),
         "seg": np.concatenate(seg_l) if seg_l else np.zeros((0, 3), np.float32),
     }
+    with _info_lock:
+        if len(_STEP_INFO) > 6:
+            _STEP_INFO.pop(next(iter(_STEP_INFO)))
+        _STEP_INFO[_file_key(path)] = {
+            "shape": shape, "fmap": fmap, "tess": tess, "faces": faces, "diag": diag,
+        }
     return header, bufs
 
 
@@ -359,6 +367,457 @@ def mesh_bytes(path):
             _cache.pop(next(iter(_cache)))
         _cache[key] = data
     return data
+
+
+# =============================================================================
+# Hand fixes: pick faces of the converted STEP, say what they are
+# =============================================================================
+# Some rounds come out in pieces (strips of cylinders and tori, little
+# B-splines, triangles left between them). A click on one picks the piece and
+# grows across smooth edges into the pieces like it; the user says what the
+# whole is (auto, plane, cylinder, cone, sphere, torus, tube, free-form) and
+# the input's triangles under those faces go to <name>.hints.json, one point
+# per triangle. refit.py --hints then converts each group as ONE face of that
+# type (see "HAND FIXES" in refit.py). The file is the mesh's, so groups
+# picked on one conversion still hold on the next.
+_STEP_INFO = {}
+_STL_INFO = {}
+_info_lock = threading.Lock()
+HINT_TYPES = ("auto", "plane", "cylinder", "cone", "sphere", "torus", "tube", "freeform")
+
+
+def _file_key(path):
+    st = os.stat(path)
+    return (os.path.normcase(os.path.abspath(path)), st.st_mtime_ns, st.st_size)
+
+
+def step_info(path):
+    """The STEP as the page shows it: shape, faces (same order), tessellation."""
+    key = _file_key(path)
+    with _info_lock:
+        info = _STEP_INFO.get(key)
+    if info is None:
+        step_payload(path)
+        with _info_lock:
+            info = _STEP_INFO.get(key)
+    if info is None:
+        raise RuntimeError(f"could not read {path}")
+    return info
+
+
+def stl_info(path):
+    """The input's triangles (float64), their centroids and a KD-tree on them."""
+    from scipy.spatial import cKDTree
+
+    key = _file_key(path)
+    with _info_lock:
+        info = _STL_INFO.get(key)
+    if info is None:
+        tris = read_stl_triangles(path).astype(np.float64)
+        cen = tris.mean(axis=1)
+        lo, hi = tris.reshape(-1, 3).min(0), tris.reshape(-1, 3).max(0)
+        info = {"tris": tris, "cen": cen, "tree": cKDTree(cen), "diag": float(np.linalg.norm(hi - lo)) or 1.0, "t2f": {}}
+        with _info_lock:
+            if len(_STL_INFO) > 4:
+                _STL_INFO.pop(next(iter(_STL_INFO)))
+            _STL_INFO[key] = info
+    return info
+
+
+def _close_pick(si, pick):
+    """
+    The pick (a mask over the input's triangles) with the few triangles it
+    encloses - a triangle of another face left inside a round would make it
+    a ring, cut in two (refit.py: _hint_holes, the same rule): a connected
+    piece of the triangles outside the pick, not the largest, at most 5% of
+    the pick's triangles and 2% of its area.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    if "edges" not in si:
+        V, inv = np.unique(np.round(si["tris"].reshape(-1, 3), 9), axis=0, return_inverse=True)
+        T = inv.reshape(-1, 3)
+        E = np.sort(np.concatenate([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]), axis=1)
+        u, ei = np.unique(E, axis=0, return_inverse=True)
+        ei = ei.ravel()
+        tid = np.tile(np.arange(len(T)), 3)
+        M = coo_matrix((np.ones(len(tid)), (tid, ei)), shape=(len(T), len(u))).tocsr()
+        t = si["tris"]
+        area = 0.5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1)
+        si["edges"] = ((M @ M.T).tocsr(), area)
+    A, area = si["edges"]
+    out = ~pick
+    if not out.any() or not pick.any():
+        return pick
+    idx = np.nonzero(out)[0]
+    lab = connected_components(A[idx][:, idx], directed=False)[1]
+    size = np.bincount(lab)
+    a_c = np.bincount(lab, weights=area[idx])
+    ok = (size <= 0.05 * pick.sum()) & (a_c <= 0.02 * area[pick].sum()) & (np.arange(len(size)) != np.argmax(size))
+    if not ok.any():
+        return pick
+    res = pick.copy()
+    res[idx[ok[lab]]] = True
+    return res
+
+
+def _tri_normals(P, T):
+    A, B, C = P[T[:, 0]], P[T[:, 1]], P[T[:, 2]]
+    n = np.cross(B - A, C - A)
+    a = np.linalg.norm(n, axis=1)
+    return (A + B + C) / 3.0, n / np.maximum(a, 1e-300)[:, None], 0.5 * a
+
+
+def face_graph(info):
+    """
+    Neighbours of every face across its edges, with the angle between the two
+    faces there (their tessellations' normals next to the edge's middle: 0 =
+    tangent), and every face's curvature (1/radius: from its surface for the
+    quadrics, from its own tessellation for the rest, None for a lone
+    triangle).
+    """
+    if "graph" in info:
+        return info["graph"]
+    from scipy.spatial import cKDTree
+
+    R = refit_module()
+    tess, faces, fmap, shape = info["tess"], info["faces"], info["fmap"], info["shape"]
+    nf = len(faces)
+    C_l, N_l, O_l = [], [], []
+    kappa = [None] * nf
+    for i, (P, T) in enumerate(tess):
+        if not len(T):
+            continue
+        c, n, a = _tri_normals(P, T)
+        ok = a > 1e-18
+        C_l.append(c[ok]); N_l.append(n[ok]); O_l.append(np.full(int(ok.sum()), i))
+        f, p = faces[i], faces[i]["p"]
+        kind = f["type"]
+        if kind == "plane":
+            kappa[i] = None if f["facet"] else 0.0
+        elif kind in ("cylinder", "sphere") and p.get("radius"):
+            kappa[i] = 1.0 / p["radius"]
+        elif kind == "torus" and p.get("minorRadius"):
+            kappa[i] = 1.0 / p["minorRadius"]
+        elif ok.sum() >= 2:
+            # the turn between neighbouring triangles over the distance of their centres
+            E = {}
+            turns = []
+            for t, tri in enumerate(T):
+                if not ok[t]:
+                    continue
+                for a_, b_ in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
+                    k_ = (min(a_, b_), max(a_, b_))
+                    if k_ in E:
+                        s = E.pop(k_)
+                        d = float(np.linalg.norm(c[t] - c[s]))
+                        if d > 1e-12:
+                            turns.append(float(np.arccos(np.clip(n[t] @ n[s], -1.0, 1.0))) / d)
+                    else:
+                        E[k_] = t
+            kappa[i] = float(np.median(turns)) if turns else 0.0
+    TC = np.concatenate(C_l) if C_l else np.zeros((0, 3))
+    TN = np.concatenate(N_l) if N_l else np.zeros((0, 3))
+    TO = np.concatenate(O_l) if O_l else np.zeros(0, int)
+    tree = cKDTree(TC) if len(TC) else None
+    cent = [tess[i][0].mean(axis=0) if len(tess[i][0]) else np.zeros(3) for i in range(nf)]
+    nbr = [dict() for _ in range(nf)]
+    with _OCC_lock:
+        em = R.edge_face_map(shape)
+        for k in range(1, R._size(em) + 1):
+            e = R.td_Edge(em.FindKey(k))
+            if R.bt_Degenerated(e):
+                continue
+            fl = sorted({fmap.FindIndex(g) - 1 for g in R._iter_list(em.FindFromIndex(k))})
+            fl = [x for x in fl if x >= 0]
+            if len(fl) != 2 or tree is None:
+                continue
+            a, b = fl
+            try:
+                c = R.BRepAdaptor_Curve(e)
+                q = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()))
+                m = np.array([q.X(), q.Y(), q.Z()])
+            except Exception:
+                continue
+            _, idx = tree.query(m, k=min(64, len(TC)))
+            idx = np.atleast_1d(idx)
+            na = next((TN[j] for j in idx if TO[j] == a), None)
+            nb = next((TN[j] for j in idx if TO[j] == b), None)
+            ang = 90.0 if na is None or nb is None else float(np.degrees(np.arccos(np.clip(na @ nb, -1.0, 1.0))))
+            # (several edges between the same two faces: the sharpest counts)
+            ang = max(ang, nbr[a].get(b, 0.0))
+            nbr[a][b] = nbr[b][a] = ang
+    # a lone triangle: the turn to its smooth neighbours over the distance
+    for i in range(nf):
+        if kappa[i] is None:
+            ks = [np.radians(ang) / max(float(np.linalg.norm(cent[i] - cent[j])), 1e-12) for j, ang in nbr[i].items() if ang < 30.0]
+            kappa[i] = ("facet", float(np.median(ks)) if ks else 0.0)
+    info["graph"] = {"nbr": nbr, "kappa": kappa, "cent": cent}
+    return info["graph"]
+
+
+def grow_selection(info, seed, max_angle=30.0):
+    """
+    The face clicked and the pieces like it: across edges where the faces are
+    (nearly) tangent, into faces of a similar curvature (within 2.5x - a round's
+    strips; not the wall or the bore it rounds), the triangles left between
+    them, never into a face far bigger than the pieces so far (a face of its
+    own, not a piece). From a plane: the pieces of that plane only.
+    Returns (faces, label).
+    """
+    G = face_graph(info)
+    faces, nbr, kap = info["faces"], G["nbr"], G["kappa"]
+    flat = 3.0 / max(info["diag"], 1e-9)
+
+    def k_of(i):
+        k = kap[i]
+        return k[1] if isinstance(k, tuple) else k
+
+    def is_facet(i):
+        return isinstance(kap[i], tuple)
+
+    ks = k_of(seed)
+    planar = ks is None or ks < flat
+    sel, stack = {seed}, [seed]
+    amax = faces[seed]["area"]
+    while stack and len(sel) < 4000:
+        f = stack.pop()
+        for g, ang in nbr[f].items():
+            if g in sel:
+                continue
+            if ang > (2.0 if planar else max_angle):
+                continue
+            kg = k_of(g)
+            if planar:
+                if not is_facet(g) and kg is not None and kg >= flat:
+                    continue
+            elif not is_facet(g):
+                if kg is None or not (ks / 2.5 <= kg <= ks * 2.5):
+                    continue
+                if faces[g]["area"] > 20.0 * amax:
+                    continue
+            sel.add(g)
+            amax = max(amax, faces[g]["area"])
+            stack.append(g)
+    n = len(sel)
+    label = (f"One round, {n} faces" if not planar else f"One plane, {n} faces") if n > 1 else "1 face"
+    return sorted(sel), label
+
+
+def tri_faces(stl_path, step_path):
+    """For every input triangle the output face it lies on (the nearest of the
+    STEP's tessellation triangles to its centre)."""
+    from scipy.spatial import cKDTree
+
+    si = stl_info(stl_path)
+    key = _file_key(step_path)
+    if key in si["t2f"]:
+        return si["t2f"][key]
+    info = step_info(step_path)
+    C_l, O_l, A_l, B_l, D_l = [], [], [], [], []
+    for i, (P, T) in enumerate(info["tess"]):
+        if not len(T):
+            continue
+        A_l.append(P[T[:, 0]]); B_l.append(P[T[:, 1]]); D_l.append(P[T[:, 2]])
+        C_l.append(P[T].mean(axis=1)); O_l.append(np.full(len(T), i))
+    if not C_l:
+        raise RuntimeError("the STEP has no tessellation")
+    TC, TO = np.concatenate(C_l), np.concatenate(O_l)
+    TA, TB, TD = np.concatenate(A_l), np.concatenate(B_l), np.concatenate(D_l)
+    k = min(12, len(TC))
+    _, idx = cKDTree(TC).query(si["cen"], k=k)
+    idx = idx.reshape(len(si["cen"]), -1)
+    # exact distance to each candidate triangle, the nearest wins
+    best = np.full(len(si["cen"]), np.inf)
+    out = np.full(len(si["cen"]), -1)
+    for c in range(idx.shape[1]):
+        j = idx[:, c]
+        d = _pt_tri_dist(si["cen"], TA[j], TB[j], TD[j])
+        w = d < best
+        best[w] = d[w]
+        out[w] = TO[j][w]
+    si["t2f"] = {key: out}
+    return out
+
+
+def _pt_tri_dist(P, A, B, C):
+    """Distance from points P to triangles (A, B, C), row by row."""
+    AB, AC, AP = B - A, C - A, P - A
+    n = np.cross(AB, AC)
+    nn = np.maximum(np.einsum("ij,ij->i", n, n), 1e-300)
+    # barycentric of the projection
+    d00, d01, d11 = np.einsum("ij,ij->i", AB, AB), np.einsum("ij,ij->i", AB, AC), np.einsum("ij,ij->i", AC, AC)
+    d20, d21 = np.einsum("ij,ij->i", AP, AB), np.einsum("ij,ij->i", AP, AC)
+    den = np.maximum(d00 * d11 - d01 * d01, 1e-300)
+    v = (d11 * d20 - d01 * d21) / den
+    w = (d00 * d21 - d01 * d20) / den
+    inside = (v >= 0) & (w >= 0) & (v + w <= 1)
+    d_plane = np.abs(np.einsum("ij,ij->i", AP, n)) / np.sqrt(nn)
+
+    def seg(P_, X, Y):
+        XY = Y - X
+        t = np.clip(np.einsum("ij,ij->i", P_ - X, XY) / np.maximum(np.einsum("ij,ij->i", XY, XY), 1e-300), 0.0, 1.0)
+        return np.linalg.norm(P_ - (X + t[:, None] * XY), axis=1)
+
+    d_edge = np.minimum(np.minimum(seg(P, A, B), seg(P, B, C)), seg(P, C, A))
+    return np.where(inside, d_plane, d_edge)
+
+
+def hints_path(inp):
+    return os.path.splitext(inp)[0] + ".hints.json"
+
+
+def read_hints(inp):
+    p = hints_path(inp)
+    if not os.path.isfile(p):
+        return {"refit_hints": 1, "input": os.path.basename(inp), "groups": []}
+    with open(p, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    d.setdefault("groups", [])
+    return d
+
+
+def write_hints(inp, d):
+    p = hints_path(inp)
+    if not d.get("groups"):
+        if os.path.isfile(p):
+            os.remove(p)
+        return None
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, separators=(",", ":"))
+    os.replace(tmp, p)
+    return p
+
+
+def hints_state(inp, out=None):
+    """The groups of the input's hints file, each with the faces of the current
+    output it lies on (the faces holding most of its triangles)."""
+    d = read_hints(inp)
+    t2f = None
+    if out and os.path.isfile(out) and out.lower().endswith((".step", ".stp")) and inp.lower().endswith(".stl"):
+        try:
+            t2f = tri_faces(inp, out)
+            si = stl_info(inp)
+        except Exception:
+            t2f = None
+    groups = []
+    for g in d["groups"]:
+        e = {k: g.get(k) for k in ("type", "label", "result")}
+        e["n"] = len(g.get("points", []))
+        if t2f is not None and e["n"]:
+            dist, ti = si["tree"].query(np.asarray(g["points"], dtype=float))
+            fids = t2f[ti[dist < 1e-6 * si["diag"] + 1e-6]]
+            # a face counts if most of its triangles are the group's
+            cnt = np.bincount(fids[fids >= 0], minlength=1)
+            tot = np.bincount(t2f[t2f >= 0], minlength=len(cnt))[: len(cnt)]
+            e["faces"] = [int(i) for i in np.nonzero(cnt >= 0.5 * np.maximum(tot, 1))[0]]
+        groups.append(e)
+    return {"path": hints_path(inp) if d["groups"] else None, "groups": groups}
+
+
+def _boundary_loops(tris):
+    """How many boundary loops the largest connected piece of a set of
+    triangles (n, 3, 3) has (refit keeps only that piece of a pick): 1 a
+    patch, 2 or more a ring or a patch with holes."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    V, inv = np.unique(np.round(tris.reshape(-1, 3), 6), axis=0, return_inverse=True)
+    T = inv.reshape(-1, 3)
+    E = np.sort(np.concatenate([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]]), axis=1)
+    u, ei, c = np.unique(E, axis=0, return_inverse=True, return_counts=True)
+    ei = ei.ravel()
+    # (triangles joined through shared edges: the largest piece)
+    tid = np.tile(np.arange(len(T)), 3)
+    M = coo_matrix((np.ones(len(tid)), (tid, ei)), shape=(len(T), len(u))).tocsr()
+    lab_t = connected_components(M @ M.T, directed=False)[1]
+    big = np.argmax(np.bincount(lab_t))
+    keep = lab_t[tid] == big
+    e_in, n_in = np.unique(ei[keep], return_counts=True)
+    b = u[e_in[n_in == 1]]
+    if not len(b):
+        return 0
+    g = coo_matrix((np.ones(len(b)), (b[:, 0], b[:, 1])), shape=(len(V), len(V)))
+    lab = connected_components(g, directed=False)[1]
+    return len(np.unique(lab[np.unique(b)]))
+
+
+def _fit_preview(tris, kind, diag):
+    """What the type the user picked makes of those triangles - before any
+    Build: the quadric's size and how far the triangles' corners are from it."""
+    R = refit_module()
+    names = {"plane": "plane", "cylinder": "cylinder", "cone": "cone", "sphere": "sphere", "torus": "torus", "tube": "tube", "freeform": "free-form face", "auto": "face"}
+
+    def sheets(k):
+        # (a closed ring doesn't lay flat: refit cuts it in two - see fit_hint)
+        many = {"tube": "tubes", "freeform": "free-form faces"}[k]
+        return f"two {many} (a ring, or a patch with a hole, is cut in two)" if _boundary_loops(tris) >= 2 else f"one {names[k]}"
+
+    if kind in ("tube", "freeform"):
+        return {"kind": kind, "text": sheets(kind)}
+    verts = [t for t in tris]
+    n = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    a = np.linalg.norm(n, axis=1)
+    norms = n / np.maximum(a, 1e-300)[:, None]
+    areas = 0.5 * a
+    tol = max(2e-4, 1e-5 * diag)
+    with _OCC_lock:
+        p = R.fit_hint_quadric(kind, verts, norms, areas, list(range(len(tris))), tol)
+    if p is None:
+        return {"kind": "freeform" if kind == "auto" else kind, "text": sheets("freeform") if kind == "auto" else f"no {names[kind]} fits"}
+    P = tris.reshape(-1, 3)
+    dev = float(np.abs(p.dist(P)).max())
+    lab = p.label().lower()
+    lab = {"cyl": "cylinder", "free": "free-form face"}.get(lab, lab)
+    size = ""
+    if p.kind == R.TORUS:
+        size = f"R {p.r0:.4g} r {p.r1:.4g}"
+    elif p.kind == R.SPHERE or (p.kind == R.AXIAL and abs(p.slope) < 1e-12):
+        size = f"r {p.r0:.4g}"
+    elif p.kind == R.AXIAL:
+        size = f"half-angle {np.degrees(np.arctan(abs(p.slope))):.3g}°"
+    # (refit refuses a hand fix standing further off than this - HINT_MAX_DEV
+    # edge tolerance ceilings, Phase C's defaults)
+    cap = R.HINT_MAX_DEV * max(20.0 * tol, 2e-4 * diag)
+    return {"kind": lab, "text": f"one {lab}" + (f" · {size}" if size else "") + f" · within {dev:.2g} mm", "dev": dev, "cap": cap, "far": dev > cap}
+
+
+def hint_add(inp, out, faces, kind):
+    if kind not in HINT_TYPES:
+        raise ValueError(f"unknown type {kind}")
+    t2f = tri_faces(inp, out)
+    si = stl_info(inp)
+    pick = np.isin(t2f, np.asarray(faces, dtype=int))
+    if not pick.any():
+        raise ValueError("no input triangle under those faces")
+    pick = _close_pick(si, pick)
+    pts = np.round(si["cen"][pick], 6)
+    t = si["tris"][pick]
+    # (each point's triangle area: refit takes a merged facet only when the
+    # pick covers half of it - see _hint_owner)
+    areas = np.round(0.5 * np.linalg.norm(np.cross(t[:, 1] - t[:, 0], t[:, 2] - t[:, 0]), axis=1), 9)
+    pv = _fit_preview(t, kind, si["diag"])
+    d = read_hints(inp)
+    # (a triangle belongs to one group: the newest)
+    newset = set(map(tuple, pts.tolist()))
+    for g in d["groups"]:
+        keep = [tuple(q) not in newset for q in g.get("points", [])]
+        g["points"] = [q for q, k in zip(g.get("points", []), keep) if k]
+        if len(g.get("areas") or []) == len(keep):
+            g["areas"] = [a for a, k in zip(g["areas"], keep) if k]
+        else:
+            g.pop("areas", None)
+    d["groups"] = [g for g in d["groups"] if g.get("points")]
+    label = f"{len(faces)} face{'s' if len(faces) != 1 else ''} → {pv['text']}"
+    d["groups"].append({"type": kind, "label": label, "faces_picked": len(faces), "points": pts.tolist(), "areas": areas.tolist()})
+    d["input"] = os.path.basename(inp)
+    write_hints(inp, d)
+    st = hints_state(inp, out)
+    st["preview"] = pv
+    st["label"] = label
+    return st
 
 
 # =============================================================================
@@ -422,6 +881,27 @@ class Job:
 
 
 JOBS = {}
+
+
+def source_mesh(step_path):
+    """The mesh a STEP was converted from: <name>.stl beside it (any case of
+    the extension; <name>_refit / _phaseA.step count as <name>), None for a
+    <name>_original.step - the CAD, not a conversion."""
+    d, b = os.path.split(os.path.splitext(step_path)[0])
+    if b.endswith("_original"):
+        return None
+    for suf in ("_refit", "_phaseA"):
+        if b.endswith(suf):
+            b = b[: -len(suf)]
+    try:
+        names = os.listdir(d or ".")
+    except OSError:
+        return None
+    for n in names:
+        s, e = os.path.splitext(n)
+        if e.lower() == ".stl" and os.path.normcase(s) == os.path.normcase(b) and os.path.isfile(os.path.join(d, n)):
+            return os.path.join(d, n)
+    return None
 
 
 def default_output(inp, seq_args):
@@ -514,6 +994,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {
                     "output": out if (os.path.isfile(out) and out != p) else None,
                     "original": orig if os.path.isfile(orig) else None,
+                    "mesh": source_mesh(p) if p.lower().endswith((".step", ".stp")) else None,
                 })
             if u.path == "/api/default-output":
                 inp = resolve(q.get("input"))
@@ -536,6 +1017,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not j:
                     return self._send(404, {"error": "no such job"})
                 return self._send(200, j.state(int(q.get("since", 0))))
+            if u.path == "/api/hints":
+                inp = resolve(q.get("input"))
+                out = resolve(q["output"]) if q.get("output") else None
+                return self._send(200, hints_state(inp, out))
             return self._send(404, {"error": "not found"})
         except Exception as ex:  # noqa: BLE001
             return self._send(500, {"error": f"{type(ex).__name__}: {ex}"})
@@ -572,6 +1057,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(400, {"error": "the output must be a .step / .stp file"})
                 if any(j.rc is None for j in JOBS.values()):
                     return self._send(409, {"error": "a conversion is already running"})
+                # (the hand fixes picked in the page, if asked and there are any)
+                if body.get("hints") and os.path.isfile(hints_path(inp)) and "--hints" not in args:
+                    args += ["--hints", hints_path(inp)]
                 cmd = [_python_exe(), "-u", REFIT, inp, *args, "-o", out, "--no-color"]
                 j = Job(cmd, inp, out)
                 JOBS[j.id] = j
@@ -581,6 +1069,31 @@ class Handler(BaseHTTPRequestHandler):
                 if j:
                     j.cancel()
                 return self._send(200, {"ok": True})
+            if u.path == "/api/select":
+                # the face clicked and the pieces like it (see grow_selection)
+                body = self._json_body()
+                out = resolve(body.get("output"))
+                faces, label = grow_selection(step_info(out), int(body["face"]))
+                return self._send(200, {"faces": faces, "label": label})
+            if u.path in ("/api/hints/add", "/api/hints/remove", "/api/hints/clear"):
+                body = self._json_body()
+                inp = resolve(body.get("input"))
+                out = resolve(body["output"]) if body.get("output") else None
+                if not inp.lower().endswith(".stl"):
+                    return self._send(400, {"error": "hand fixes need an .stl input"})
+                if u.path == "/api/hints/add":
+                    if not out or not os.path.isfile(out):
+                        return self._send(400, {"error": "convert it first: the faces are picked on the STEP"})
+                    return self._send(200, hint_add(inp, out, [int(x) for x in body.get("faces", [])], str(body.get("type", "auto"))))
+                d = read_hints(inp)
+                if u.path == "/api/hints/remove":
+                    k = int(body.get("index", -1))
+                    if 0 <= k < len(d["groups"]):
+                        d["groups"].pop(k)
+                else:
+                    d["groups"] = []
+                write_hints(inp, d)
+                return self._send(200, hints_state(inp, out))
             return self._send(404, {"error": "not found"})
         except Exception as ex:  # noqa: BLE001
             return self._send(500, {"error": f"{type(ex).__name__}: {ex}"})

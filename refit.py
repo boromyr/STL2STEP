@@ -545,6 +545,7 @@ USAGE
     python refit.py part.stl -j 22            # 22 worker processes
     python refit.py part.stl -j 1             # everything on one core (same result, slower)
     python refit.py part.step -o out.step     # STEP input
+    python refit.py part.stl --hints part.hints.json  # with the hand fixes picked in the viewer
     python refit.py --check                   # check the environment
 
 DEPENDENCIES
@@ -5222,9 +5223,10 @@ def fit_fill(
     # gone, test16: a sphere beside them refused, 801 -> 837 faces). 16
     # spacings is a spine bending on some 250 times the round's radius:
     # straight, to a quadric.
+    # (chords="force": one patch the user asked for by hand - see apply_hints)
     if pr is None and not chords:
         return None
-    if pr is None and len(check):
+    if pr is None and len(check) and chords != "force":
         from scipy.spatial import cKDTree
 
         Pd_ = P[np.asarray(data, bool)]
@@ -15437,7 +15439,8 @@ class Engine:
             cc = self._chord_cap(R)
             if cc is not None:
                 cap = max(cap, cc)
-        if cap is not None and R.sag > cap:
+        # (a hand fix: the user chose the surface, its facets all go in)
+        if cap is not None and R.sag > cap and getattr(R, "forced", None) is None:
             # the facets that aren't chords stay tessellated, if the surface
             # holds the others within the tolerance: the boss's own r2 torus,
             # found once the sphere is gone, only had the flat top in it (its
@@ -15738,7 +15741,7 @@ class Engine:
         # facets of anything fit "exactly"), it is a face of the part.
         dof = {AXIAL: 6 if abs(prim.slope) > 1e-12 else 5, SPHERE: 4, TORUS: 7}.get(prim.kind)
         exact_few = dof is not None and R.rms <= 1e-3 * self.tol_fit and len({tuple(np.round(p_, 9)) for i in rf for p_ in topo.verts[i]}) >= 3 * dof
-        if not strict_hole and len(rf) < 12 and not R.repeated and not exact_few and len_debris > 0.6 * max(len_tot, 1e-9):
+        if not strict_hole and len(rf) < 12 and not R.repeated and not exact_few and getattr(R, "forced", None) is None and len_debris > 0.6 * max(len_tot, 1e-9):
             return False, (f"small region isolated among tessellated facets ({len(rf)} faces, {100.0 * len_debris / max(len_tot, 1e-9):.0f}% of the boundary): left as mesh")
         for L in loops:
             for ch in L.chains:
@@ -15975,6 +15978,10 @@ class Engine:
         # millimeter-sized, and without a hard ceiling the region would
         # pass through, deforming the part.
         tol_cap = max(self.max_edge_tol, min(2.0 * R.sag, 5.0 * self.max_edge_tol))
+        # (a hand fix: its boundary stands off the surface the user chose by
+        # what that surface misses the facets by - reported when it was fitted)
+        if getattr(R, "forced", None) is not None:
+            tol_cap = max(tol_cap, 1.5 * (R.max_res + R.sag) + self.tol_fit)
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
         if worst_edge_tol > tol_cap:
             bnd = self._wire_samples(F) if prim.kind == FREE and not getattr(R, "_bnd_refit", False) else None
@@ -18649,6 +18656,453 @@ def _measure_mesh_turn(regions: List[Region], tol_fit: float):
     return k, r_max, [(r, x) for r, x, _ in s]
 
 
+# =============================================================================
+# 11bis. HAND FIXES (--hints): the faces the user picked, and what they are
+# =============================================================================
+#
+# ⚠️ SOME ROUNDS COME OUT IN PIECES, AND THE USER CAN SEE WHAT THEY ARE. A
+# round rolling along a curved edge, a loft, a blend no quadric holds: the
+# segmentation covers them with strips - osculating cylinders and tori,
+# little B-splines, the facets left between them - each right on its few
+# facets, and where no rule finds the whole the user still sees one face.
+# The viewer lets them pick it (the face under the cursor, grown across
+# smooth edges into the pieces like it) and say what it is: a plane, a
+# cylinder, a cone, a sphere, a torus, a tube, one free-form patch, or
+# "auto". It writes the input's triangles under those faces to a hints file
+# beside the input, <name>.hints.json:
+#   {"refit_hints": 1, "groups": [{"type": "torus", "points": [[x, y, z], ...], "areas": [a, ...]}]}
+# one point per triangle, its centroid, and the triangle's area - the mesh's,
+# not one conversion's: the faces the group was picked on are gone once it is
+# rebuilt.
+# Every Phase C takes the facets the group covers (see _hint_owner) as a
+# region of its own, fits it as its type (a free-form patch or a tube on a
+# closed ring: on each half - see fit_hint), takes its facets from the
+# regions the seeds made and converts it first, with the tolerances its own
+# fit needs - up to HINT_MAX_DEV edge tolerance ceilings off the facets, no
+# further - and, if the engine still refuses it, converts what the seeds had
+# made of those facets instead.
+
+HINT_KINDS = ("auto", "plane", "cylinder", "cone", "sphere", "torus", "tube", "freeform")
+HINTS: Optional[List["Hint"]] = None
+# A hand fix's surface may stand off its facets' vertices by this many edge
+# tolerance ceilings, no more: the user says what the faces are, not how far
+# the part may move. On test15 a torus picked over 27 faces missed them by
+# 6 mm; built, it would have been a different part. Better tessellated than
+# deformed: past this the group goes back to the automatic segmentation.
+HINT_MAX_DEV = 5.0
+
+
+@dataclass(eq=False)  # confronto per identita': i campi sono array numpy
+class Hint:
+    kind: str
+    points: np.ndarray
+    label: str = ""
+    done: bool = False  # converted by an earlier Phase C
+    result: str = ""  # what it became, or why not
+    areas: Optional[np.ndarray] = None  # each point's triangle area (files from the viewer)
+
+
+def load_hints(path: str) -> List[Hint]:
+    """The groups of a hints file (see above). ValueError on a bad one."""
+    import json
+
+    with open(path, "r", encoding="utf-8") as fh:
+        d = json.load(fh)
+    out: List[Hint] = []
+    for k, g in enumerate(d.get("groups", []) if isinstance(d, dict) else []):
+        kind = str(g.get("type", "auto")).strip().lower().replace("-", "").replace("_", "").replace(" ", "")
+        kind = {"bspline": "freeform", "free": "freeform", "spline": "freeform"}.get(kind, kind)
+        if kind not in HINT_KINDS:
+            raise ValueError(f"group {k + 1}: unknown type {g.get('type')!r} (one of {', '.join(HINT_KINDS)})")
+        P = np.asarray(g.get("points", []), dtype=float).reshape(-1, 3)
+        A = np.asarray(g.get("areas") or [], dtype=float).ravel()
+        if len(P):
+            out.append(Hint(kind, P, str(g.get("label", "") or ""), areas=A if len(A) == len(P) and np.all(np.isfinite(A)) else None))
+    return out
+
+
+def _poly_rings(face) -> List[np.ndarray]:
+    """A face's wires as ordered polygons of their vertices, the outer first."""
+    Ff = td_Face(face.Oriented(TopAbs_FORWARD))
+    try:
+        outer = brt_OuterWire(Ff)
+    except Exception:
+        outer = None
+    rings = []
+    for w in explore(Ff, TopAbs_WIRE):
+        ex = _BRepTools.BRepTools_WireExplorer(td_Wire(w), Ff)
+        pts = []
+        while ex.More():
+            pts.append(vpos(ex.CurrentVertex()))
+            ex.Next()
+        if len(pts) >= 3:
+            rings.append((0 if (outer is not None and w.IsSame(outer)) else 1, np.array(pts)))
+    rings.sort(key=lambda r: r[0])
+    return [r[1] for r in rings]
+
+
+def _in_rings(Q: np.ndarray, rings: List[np.ndarray], n: np.ndarray) -> np.ndarray:
+    """Which points (on the plane of normal n) fall inside the polygon - the
+    outer ring less its holes: one even-odd count over every ring."""
+    u, v = ortho_frame(n / max(float(np.linalg.norm(n)), 1e-12))
+    x, y = Q @ u, Q @ v
+    inside = np.zeros(len(Q), bool)
+    for ring in rings:
+        X, Y = ring @ u, ring @ v
+        for a, b, c, d in zip(X, Y, np.roll(X, -1), np.roll(Y, -1)):
+            cross = (b > y) != (d > y)
+            if cross.any():
+                xi = a + (y - b) * (c - a) / (d - b if d != b else 1e-300)
+                inside ^= cross & (x < xi)
+    return inside
+
+
+def _hint_owner(n: int, rings_of, cents: np.ndarray, radii: np.ndarray, normals, eps: float, f_areas: Optional[np.ndarray] = None) -> Dict[int, int]:
+    """
+    face j (of n planar faces) -> the hint group whose points it holds - on
+    its plane within eps, inside its polygon (rings_of(j)) - the group it
+    holds most of when there are several.
+
+    ⚠️ A POINT INSIDE ISN'T THE FACE PICKED. Phase A merges a plane's
+    triangles into one facet: a lone triangle of a plane in the pick (test18's
+    slot: five of them, 1 or 2 triangles each, among the round's 26 faces) put
+    the whole of that plane in the group, and the free-form half it went into
+    held no more. With the points' triangle areas (f_areas: the faces'), a
+    face is the group's only if its triangles cover half of it.
+    """
+    if not HINTS or n == 0:
+        return {}
+    from scipy.spatial import cKDTree
+
+    pts = np.vstack([h.points for h in HINTS])
+    gid = np.concatenate([np.full(len(h.points), k) for k, h in enumerate(HINTS)])
+    w = np.concatenate([h.areas if h.areas is not None else np.full(len(h.points), np.nan) for h in HINTS])
+    tree = cKDTree(pts)
+    out: Dict[int, int] = {}
+    for j, js in enumerate(tree.query_ball_point(cents, radii + eps)):
+        if not js:
+            continue
+        js = np.asarray(js)
+        nj = np.asarray(normals[j], dtype=float)
+        rings = rings_of(j)
+        if not rings:
+            continue
+        Q = pts[js]
+        on = np.abs((Q - rings[0][0]) @ nj) <= eps
+        if not on.any():
+            continue
+        ins = np.zeros(len(js), bool)
+        ins[on] = _in_rings(Q[on], rings, nj)
+        if not ins.any():
+            continue
+        gi, wi = gid[js[ins]], w[js[ins]]
+        if f_areas is not None and np.all(np.isfinite(wi)):
+            cov = np.bincount(gi, weights=wi, minlength=len(HINTS))
+            g = int(np.argmax(cov))
+            if cov[g] >= 0.5 * float(f_areas[j]):
+                out[j] = g
+        else:
+            out[j] = int(np.argmax(np.bincount(gi, minlength=len(HINTS))))
+    return out
+
+
+def _hint_axial(verts, norms, areas, G, P, cylinder: bool) -> Optional[Prim]:
+    p = refit_exact(G, verts, norms, areas, AXIAL)
+    if p is None or not cylinder or abs(p.slope) < 1e-12:
+        return p
+    t = (P - p.center) @ p.axis
+    rad = P - p.center - np.outer(t, p.axis)
+    c = Prim(AXIAL, p.center.copy(), p.axis.copy(), float(np.linalg.norm(rad, axis=1).mean()), 0.0)
+    q = lm_refine(c, P, fix_slope=0.0) or c
+    return q if abs(q.slope) < 1e-12 else Prim(AXIAL, q.center, q.axis, q.r0, 0.0)
+
+
+def _hint_check_tol(tol: float) -> float:
+    """what the facets' inner points may stand off a fitted patch: the mesh's
+    own chord sag, as for the patches the merges make"""
+    return 2.0 * (MESH_SAG if MESH_SAG is not None else tol) + 2.0 * tol
+
+
+def _hint_free(topo, G, tol: float, min_faces: int) -> Optional[Prim]:
+    """One B-spline over the whole group, the tolerances widened step by step
+    until one holds (the user asked for one patch: how far it stands off is
+    reported, see apply_hints)."""
+    filler = PatchFiller(topo, tol, min_faces)
+    args = filler.whole_args(sorted(G))
+    if args is None:
+        return None
+    Pv, Tv, Nv, data, tol0, chk = args
+    ct = _hint_check_tol(tol)
+    for k in (1.0, 3.0, 10.0, 30.0):
+        pr = fit_fill(Pv, Tv, Nv, data, k * tol0, chk, k * ct, chords="force")
+        if pr is not None:
+            pr.fill = None
+            pr.merged = None
+            return pr
+    return None
+
+
+def _hint_tube(topo, G, tol: float) -> Optional[Prim]:
+    ax = refit_exact(G, topo.verts, topo.norms, topo.areas, AXIAL)
+    if ax is None:
+        return None
+    Pk = np.unique(np.round(np.vstack([topo.verts[i] for i in G]), 9), axis=0)
+    chk = sag_points(topo, G)
+    ct = _hint_check_tol(tol)
+    for k in (1.0, 3.0, 10.0, 30.0):
+        q = fit_tube(Pk, ax.axis, ax.center, k * tol, chk, k * ct)
+        if q is not None:
+            return q
+    return None
+
+
+def _worst(p, P: np.ndarray) -> float:
+    if p is None:
+        return math.inf
+    d = np.abs(p.dist(P))
+    return float(d.max()) if len(d) and np.all(np.isfinite(d)) else math.inf
+
+
+def fit_hint_quadric(kind: str, verts, norms, areas, G: List[int], tol: float) -> Optional[Prim]:
+    """A quadric of the type the user chose through facets G (verts, norms,
+    areas: per facet, as in Topo); "auto": the simplest holding the vertices
+    within twice the tolerance, else None. (The viewer previews with it.)"""
+    P = np.vstack([verts[i] for i in G])
+    if kind == "plane":
+        p = fit_plane(P)
+    elif kind in ("cylinder", "cone"):
+        p = _hint_axial(verts, norms, areas, G, P, kind == "cylinder")
+    elif kind in ("sphere", "torus"):
+        p = refit_exact(G, verts, norms, areas, SPHERE if kind == "sphere" else TORUS)
+    elif kind == "auto":
+        p = None
+        for k_ in ("plane", "cylinder", "cone", "sphere", "torus"):
+            c = fit_hint_quadric(k_, verts, norms, areas, G, tol)
+            if c is not None and _worst(c, P) <= 2.0 * tol:
+                p = c
+                break
+    else:
+        return None
+    if p is None or not np.isfinite(_worst(p, P)):
+        return None
+    p.rms = float(np.sqrt(np.mean(p.dist(P) ** 2)))
+    return p
+
+
+def _is_ring(topo, G) -> bool:
+    """Whether a group of facets has more than one boundary loop (a closed
+    ring, or a patch with a hole in it): its boundary edges, the ones with
+    one facet in the group, in more than one connected piece."""
+    gs = set(G)
+    bnd = {k for i in G for k in topo.f_edges[i] if sum(f in gs for f in topo.e_faces[k]) == 1}
+    par: Dict[int, int] = {}
+
+    def root(v):
+        while par.setdefault(v, v) != v:
+            par[v] = par[par[v]]
+            v = par[v]
+        return v
+
+    for k in bnd:
+        a, b = topo.e_verts[k]
+        par[root(a)] = root(b)
+    return len({root(v) for v in list(par)}) >= 2
+
+
+def _hint_holes(topo, G: List[int], taken: Set[int]) -> List[int]:
+    """
+    G with the few facets it encloses: a triangle of another face left
+    inside the pick (test18's slot: a sliver 0.1 x 2.9 mm in a round of
+    1,676) would make it a ring, cut in two. Enclosed: a connected piece of
+    the facets outside G, not the largest (the rest of the part), at most 5%
+    of G's facets and 2% of its area - the floor of a pocket the pick goes
+    round is more (a hole of radius a under a round of radius r: about
+    a^2 / (pi r (a + r/2)) of it, 8% at a = r/2), it stays.
+    """
+    gs = set(G)
+    comps = _face_groups(set(range(topo.nF)) - gs, topo.adj)
+    if len(comps) < 2:
+        return G
+    big = max(comps, key=len)
+    area = sum(topo.areas[i] for i in G)
+    add: Set[int] = set()
+    for c in comps:
+        # (facets only: a face an earlier conversion made stays its own)
+        if c is big or len(c) > 0.05 * len(G) or c & taken or not all(topo.planar[i] for i in c):
+            continue
+        if sum(topo.areas[i] for i in c) <= 0.02 * area:
+            add |= c
+    return sorted(gs | add) if add else G
+
+
+def _hint_halves(topo, G: List[int], min_faces: int) -> List[List[int]]:
+    """
+    A ring of facets cut in two, at the median of the facets' centres across
+    one of its principal directions (the longest first, as
+    PatchFiller.pieces cuts), into 2 to 4 connected pieces none of them a
+    ring any more; [] if no direction gives that.
+    """
+    C = np.array([topo.cents[i] for i in G])
+    w = np.array([topo.areas[i] for i in G])
+    c = (C * w[:, None]).sum(axis=0) / max(float(w.sum()), 1e-300)
+    small = max(min_faces, 2)
+    for ax in np.linalg.svd((C - c) * np.sqrt(w)[:, None], full_matrices=False)[2]:
+        x = (C - c) @ ax
+        m = float(np.median(x))
+        comps = []
+        for half in ({i for i, t in zip(G, x) if t <= m}, {i for i, t in zip(G, x) if t > m}):
+            comps += _face_groups(half, topo.adj)
+        out = [g for g in comps if len(g) >= small]
+        # (a few facets the cut leaves alone - their centre on one side, their
+        # neighbours on the other - go with the piece they touch)
+        for g in sorted((g for g in comps if len(g) < small), key=len):
+            near = [q for q in out if any(j in q for i in g for j in topo.adj[i])]
+            if not near:
+                out = []
+                break
+            near[0] |= g
+        out = [sorted(g) for g in out]
+        Log.debug(f"  hand fix: ring of {len(G)} facets cut across {np.round(ax, 2)}: pieces {[len(g) for g in out]}")
+        if 2 <= len(out) <= 4 and not any(_is_ring(topo, g) for g in out):
+            return out
+    return []
+
+
+def fit_hint(kind: str, topo, G: List[int], tol: float, min_faces: int, allow_free: bool = True) -> List[Tuple[Prim, List[int]]]:
+    """
+    The surfaces of a hand-fixed group of facets, of the type the user chose
+    ("auto": the simplest quadric holding the vertices within twice the
+    tolerance, else free-form, else the closest quadric), as [(prim,
+    facets)]: the whole group, or - a free-form patch or a tube on a closed
+    ring - the ring cut in two; [] if nothing fits.
+
+    ⚠️ ONE SHEET DOESN'T GO ROUND. fit_fill flattens its facets (onto their
+    mean plane, or conformally): a ring all round a hole doesn't lay flat. On
+    test18 the round all round the slot (26 faces, 3,723 facets) came back
+    from all four tolerances empty, after 165 s. A quadric goes round (a
+    torus, a cylinder: periodic surfaces); a free-form patch or a tube is
+    fitted on each half of the ring instead - two faces, not twenty-six.
+    """
+    def checked(p, F):
+        P = np.vstack([topo.verts[i] for i in F])
+        if p is None or not np.isfinite(_worst(p, P)):
+            return None
+        p.rms = float(np.sqrt(np.mean(p.dist(P) ** 2)))
+        return p
+
+    def sheets(k_):
+        parts = _hint_halves(topo, G, min_faces) if _is_ring(topo, G) else [G]
+        out = []
+        for F in parts:
+            p = checked(_hint_tube(topo, F, tol) if k_ == "tube" else _hint_free(topo, F, tol, min_faces), F)
+            if p is None:
+                Log.debug(f"  hand fix: no {k_} holds {len(F)} of its {len(G)} facets")
+                return []
+            out.append((p, F))
+        return out
+
+    if kind == "tube":
+        return sheets("tube")
+    if kind == "freeform":
+        return sheets("freeform") if allow_free else []
+    p = checked(fit_hint_quadric(kind, topo.verts, topo.norms, topo.areas, G, tol), G)
+    if p is not None or kind != "auto":
+        return [(p, G)] if p is not None else []
+    out = sheets("freeform") if allow_free else []
+    if out:
+        return out
+    P = np.vstack([topo.verts[i] for i in G])
+    cands = [fit_hint_quadric(k_, topo.verts, topo.norms, topo.areas, G, tol) for k_ in ("plane", "cylinder", "cone", "sphere", "torus")]
+    cands = [c for c in cands if c is not None]
+    p = checked(min(cands, key=lambda c: _worst(c, P)), G) if cands else None
+    return [(p, G)] if p is not None else []
+
+
+def apply_hints(regions: List[Region], topo, tol_fit: float, max_edge_tol: float, min_faces: int, allow_free: bool = True) -> List[Region]:
+    """
+    The hand-fixed groups as regions of their own (R.forced = the Hint),
+    first in the list, their facets taken from the regions the seeds made:
+    what those had inside a group becomes its fallback (converted if the
+    engine refuses it), what they had outside stays theirs.
+    """
+    if not HINTS or all(h.done for h in HINTS):
+        return regions
+    diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0))) if len(topo.vpos) else 1.0
+    eps = max(2.0 * tol_fit, 1e-6 * diag)
+    pl = [i for i in range(topo.nF) if topo.planar[i] and len(topo.verts[i]) >= 3]
+    cents = np.array([np.asarray(topo.verts[i]).mean(axis=0) for i in pl]) if pl else np.zeros((0, 3))
+    radii = np.array([float(np.linalg.norm(np.asarray(topo.verts[i]) - c, axis=1).max()) for i, c in zip(pl, cents)])
+
+    def rings_of(j):
+        i = pl[j]
+        return [np.asarray(topo.verts[i])] if len(topo.verts[i]) == 3 else _poly_rings(topo.faces[i])
+
+    own = _hint_owner(len(pl), rings_of, cents, radii, [topo.norms[i] for i in pl], eps, np.array([topo.areas[i] for i in pl]))
+    groups: Dict[int, List[int]] = defaultdict(list)
+    for j, g in own.items():
+        if not HINTS[g].done:
+            groups[g].append(pl[j])
+    forced: List[Region] = []
+    taken: Set[int] = set()
+    for g in sorted(groups):
+        h = HINTS[g]
+        G = [i for i in groups[g] if i not in taken]
+        # (one piece: a facet the points reach across the part isn't the pick)
+        G = largest_component(G, topo.adj) if G else []
+        G = _hint_holes(topo, G, taken) if G else []
+        tag = f"Hand fix {g + 1} ({h.kind}{', ' + h.label if h.label else ''})"
+        if len(G) < max(2, min_faces):
+            # (the second Phase C finds the few facets the first one left:
+            # its verdict says more)
+            h.result = h.result or f"only {len(G)} facet{'s' if len(G) != 1 else ''} of it left to fit"
+            continue
+        pieces = fit_hint(h.kind, topo, G, tol_fit, min_faces, allow_free)
+        if not pieces:
+            h.result = f"no {h.kind} fits its {len(G)} facets"
+            Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
+            continue
+        Rs = [describe_region(pr, topo, F) for pr, F in pieces]
+        worst, cap = max(R.max_res for R in Rs), HINT_MAX_DEV * max_edge_tol
+        if worst > cap:
+            h.result = f"its {h.kind} stands {worst:.2g} mm off the facets, past {cap:.2g} mm: better tessellated than deformed"
+            Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
+            continue
+        for (pr, F), R in zip(pieces, Rs):
+            R.forced = h
+            R.repeated = True
+            R.note = f"by hand ({h.kind})"
+            R.fobjs = [topo.faces[i] for i in F]
+            forced.append(R)
+            taken |= set(F)
+            Log.info(f"{tag}: {len(F)} facets -> {pr.label()}, vertices within {R.max_res:.1e} mm (rms {R.rms:.1e}), facets' sag {R.sag:.1e}")
+    if not forced:
+        return regions
+    owner_f = {i: F for F in forced for i in F.faces}
+    out: List[Region] = []
+    for R in regions:
+        ins = [i for i in R.faces if i in owner_f]
+        if not ins:
+            out.append(R)
+            continue
+        for F in forced:
+            part = [i for i in ins if owner_f[i] is F]
+            if len(part) >= min_faces:
+                Q = describe_region(R.prim, topo, part)
+                Q.fobjs = [topo.faces[i] for i in part]
+                F.fallback.append(Q)
+        # (what's left of it, every piece of it big enough: a merged round the
+        # pick cut through the middle keeps both its ends)
+        rest = [i for i in R.faces if i not in owner_f]
+        for part in (_face_groups(set(rest), topo.adj) if len(rest) >= min_faces else []):
+            if len(part) >= min_faces:
+                part = sorted(part)
+                R2 = describe_region(R.prim, topo, part)
+                R2.note, R2.repeated = R.note, R.repeated
+                R2.fobjs = [topo.faces[i] for i in part]
+                out.append(R2)
+    return forced + out
+
+
 def run_phase(
     shape,
     which: str,
@@ -18728,8 +19182,11 @@ def run_phase(
     eng.sag_cap = None if MESH_SAG is None else 2.0 * MESH_SAG + 2.0 * tol_fit
     eng.sag_turn = MESH_TURN if MESH_SAG is not None else None
     eng.min_faces_hint = min_faces
+    # (the hand fixes: regions of their own, converted first - see apply_hints)
+    if HINTS and not is_b:
+        regions = apply_hints(regions, topo, tol_fit, max_edge_tol, min_faces, allow_free)
     # order: large regions first (more analytic boundary for the following ones)
-    order = sorted(range(len(regions)), key=lambda k: -sum(topo.areas[i] for i in regions[k].faces))
+    order = sorted(range(len(regions)), key=lambda k: (getattr(regions[k], "forced", None) is None, -sum(topo.areas[i] for i in regions[k].faces)))
     pending = list(order)
     split_parts: List[Region] = []
     # ⚠️ two passes: a region rejected only because a neighbor was still
@@ -18825,6 +19282,24 @@ def run_phase(
             if Q.fallback and Q.status.startswith("rejected"):
                 todo.append(Q)
     regions = regions + backs + split_parts
+    # (one line per hand fix: a ring cut in two is one fix, built if all its pieces are)
+    by_hint: Dict[int, List[Region]] = defaultdict(list)
+    for R in regions:
+        if getattr(R, "forced", None) is not None:
+            by_hint[HINTS.index(R.forced)].append(R)
+    for g, Rs in sorted(by_hint.items()):
+        h = HINTS[g]
+        tag = f"Hand fix {g + 1} ({h.kind}{', ' + h.label if h.label else ''})"
+        bad = [R for R in Rs if R.status != "OK"]
+        if not bad:
+            h.done = True
+            kinds = "/".join(sorted({R.prim.label().lower() for R in Rs}))
+            what = f"one {kinds} face" if len(Rs) == 1 else f"{len(Rs)} {kinds} faces (a ring, or a patch with a hole, cut in {len(Rs)})"
+            h.result = f"{what}, {sum(len(R.faces) for R in Rs)} facets, vertices within {max(R.max_res for R in Rs):.1e} mm"
+            Log.ok(f"{tag}: {h.result}")
+        else:
+            h.result = bad[0].status if len(Rs) == 1 else f"{len(Rs) - len(bad)} of {len(Rs)} pieces built - {bad[0].status}"
+            Log.warn(f"{tag}: {h.result}" + (" - what the segmentation made of it converted instead" if any(R.fallback for R in bad) else ""))
 
     res.shape = eng.shape
     # ⚠️ EVERY REPLACEMENT IS CHECKED, THE SUM ISN'T ALWAYS. On test12 four
@@ -19140,6 +19615,12 @@ def parse_args(argv=None):
     g.add_argument("--no-cone", action="store_true", help="[C] don't recognize cones")
     g.add_argument("--no-torus", action="store_true", help="[C] don't recognize tori")
     g.add_argument("--no-free", action="store_true", help="[C] don't rebuild free-form fillet patches (B-spline): they stay tessellated or split into little cylinders")
+    g.add_argument(
+        "--hints",
+        metavar="FILE",
+        help="[A C] hand fixes (<name>.hints.json, written by the viewer): groups of the input's triangles, each converted as ONE face "
+        "of the type given (auto, plane, cylinder, cone, sphere, torus, tube, freeform)",
+    )
 
     g = p.add_argument_group("mesh input (STL)")
     g.add_argument(
@@ -19226,6 +19707,17 @@ def main(argv=None) -> int:
     if not args.input:
         Log.error("Missing input file (.stl or .step). Use -h for help.")
         return 2
+
+    global HINTS
+    HINTS = None
+    if args.hints:
+        try:
+            HINTS = load_hints(args.hints)
+        except (OSError, ValueError) as ex:
+            Log.error(f"Hand fixes: can't read {args.hints}: {ex}")
+            return 2
+        Log.info(f"Hand fixes: {len(HINTS)} group{'s' if len(HINTS) != 1 else ''} from {os.path.basename(args.hints)} ("
+                 + ", ".join(f"{h.kind} on {len(h.points)} triangles" for h in HINTS) + ")")
 
     # phase sequence, in the order written. No flags: DEFAULT_SEQUENCE.
     seq = list(getattr(args, "sequence", None) or [])
@@ -19331,6 +19823,9 @@ def main(argv=None) -> int:
     )
     for name, r in results:
         Log.ok(f"Phase {name}: {r.n_ok}/{len(r.regions)} regions converted")
+    # (one line per hand fix, the viewer reads them: "Hand fix N: ...")
+    for k, h in enumerate(HINTS or []):
+        (Log.ok if h.done else Log.warn)(f"Hand fix {k + 1} ({h.kind}): " + (h.result or "its triangles weren't found among the facets"))
     close_pool()
     return 0
 
