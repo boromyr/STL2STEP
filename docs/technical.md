@@ -153,6 +153,23 @@ are reported but left in.
   was invalid); a 300° piece of crest or root cylinder that is refused (a helical band went 354°
   round with its facets' width: "ambiguous angular coverage") gives way to its halves (`test14`'s M10 nut, pitch 0.907 mm, 42,000 triangles: on the hole cut
   out of the part, 5,515 → 3,735 faces, its flanks from none to almost all converted).
+  The profile is then cut once for the whole thread, not strip by strip: in screw coordinates every
+  vertex of every turn falls on one curve, the radius a periodic function of the position along the
+  pitch, and the fewest straight pieces and arcs that hold it within `tol_fit` are its faces - the
+  way the CAD drew it. Each stretch of the pitch is represented by its densest row of vertices (the
+  turns pile up on it, strays from a run-out or another feature don't), arcs go up to a fifth of the
+  pitch (a wider "arc" is a line and a rounding taken together), a line is preferred to an arc, a
+  piece takes the tangent rows it shares with its neighbours, and two pieces with no row between
+  them are joined by the straight piece between their ends (a flat crest has rows only on its edges).
+  Cut strip by strip, `test14`'s G1/8 Whitworth thread lost half of every root to the flank's
+  strip, where straight segments took it as chords; cut once, its six pieces come out as in its
+  CAD (crest arcs r 0.1249, flat crest, flanks at 27.5°, root arc r 0.1245 - 0.137 of the pitch,
+  Whitworth's). A piece of a turn is a band too (from 45°): the profile is proven by the whole
+  thread, and this one runs into a pocket for eight turns, 0.24 to 0.83 of each left. The cut once
+  is kept when it puts more facets in the thread's bands than the strips do (`test15`'s V thread:
+  the same two flanks either way). On a closed 4-turn section of `test14`'s thread: 1,183 → 245
+  faces, polyline edges 2,887 → 697, mean distance from the CAD 0.0049 → 0.0036 mm (maximum
+  unchanged, 0.038), valid.
   A tube that is no quadric - a loft narrowing along its axis, its sections ellipses on tilted
   planes - used to come out as dozens of osculating cylinders and cones, each a strip of a few
   degrees. Strips that touch, with nearly parallel axes and similar radii, going round a common
@@ -183,7 +200,15 @@ are reported but left in.
   `test17`: 940 → 931). A sphere's seam is put behind the face rather than through its middle, and
   an arc that would cross a neighbouring edge just past their shared vertex - a needle between two
   nearly tangent arcs, hidden in memory by the vertex's tolerance - is left a polyline: both came
-  back invalid from the STEP file.
+  back invalid from the STEP file. On a curved face the pcurves are asked the same in (u, v): on
+  `test18`'s window the r 1.2 round, once merged, ends in a needle between a cylinder and a patch it
+  meets almost tangent, and the curve where they cross wandered over the needle's other edge 1.6 mm
+  from their vertex - valid in memory and read back, but the mesher, given a wire crossing itself,
+  left a corner of the round uncovered at the patch's far end, 0.50 mm off the part. Refused, the
+  chain is cut and its pieces away from the needle still become curves. There a crossing inside
+  the vertex's tolerance doesn't count: `test8`'s ellipses on r 0.5 rounds meet a line at both
+  ends, nearly tangent, and cross 3e-4 from the vertex (tolerance 9.6e-3) - read back valid and
+  meshed; refused, 7 of its 17 ellipses went.
   Where rounds of different radii meet (`test16`'s r 4 along the handle running into the r 2 along
   the scoop's rim), the CAD fills the corners between them with patches of its own: free-form,
   folding over 90°, bounded by a dozen pieces of round, their facets on none of their neighbours. A
@@ -201,10 +226,37 @@ are reported but left in.
   edge are merged when one such filled B-spline holds them all: the strips of osculating
   cylinders, cones and little B-splines a loft, a variable-radius round or a round rolling between
   two lofts break into become one face, and a junction where the curvature jumps stays as it was
-  (a merged face the engine refuses gives way to its pieces). A face going all the way round whose
-  seam is a path of mesh edges, slanting, can cover a strip of its surface twice once its
-  neighbours' edges are in: valid to BRepCheck, its tessellation inside the part; it is tessellated
-  as it sits and, if it strays, built in pieces round the axis; a neighbour's new edge gets its
+  (a merged face the engine refuses gives way to its pieces). Where the vertices come in rows - a
+  CAD tessellates a round along a gently curved edge with its cross-section cut finely and the rows
+  millimetres apart, long facets between them - the interpolation doesn't follow the facets: across
+  a 3.5 mm gap between two rows of `test18`'s r 1.2 window rounds it swung 0.16 mm off facets that
+  sag 0.009, and two strips of the same round, each an osculating cylinder, never became one face.
+  There, when no interpolation holds, the spline is fitted to the vertices and, with a twentieth of
+  their weight in all, to points spread over the facets themselves, kept on the same terms
+  (vertices within the tolerance, the facets' inner points within what they sag, normals with the
+  facets); a patch that held already is the same. Only there: slices of one round - quadrics all,
+  their section radii within a twenty-fifth of their median (a cylinder's radius, a cone's where
+  its facets are, a torus' tube, a sphere's; `test18`'s within 2.2%, while within a tenth
+  `test11`'s exact r 3 cylinder and a 4-facet r 3.35 piece beside it made a patch and three
+  ellipses went) - whose vertices come in rows (the widest gap from a facet's
+  inner point to the nearest vertex six times the vertices' spacing or more: 6 to 14 on those
+  rounds, 1.5 for the median region). Everywhere, it held unions the interpolation had refused for
+  good reason - a round against a flat, the curvature jumping across - and exact pieces went
+  (`test8`: 452 → 384 faces, but 38 more polylines, 33 circles and 7 ellipses fewer; `test6` 4 mm³
+  of volume). And the rows no farther apart than sixteen spacings: the gap between a round's rows
+  grows as the square root of its spine's radius, and past that the spine is straight - a CAD's
+  exact cylinders along straight or polygonal edges, their vertices on their end circles
+  (`test4`'s r 3 and r 5; `test8`'s r 0.5 pieces, 19 to 95 spacings apart; `test16`'s r 1 ones, 100
+  to 680), which went into patches otherwise (`test8`: 9 ellipses gone; `test16`: a sphere beside
+  them refused, 801 → 837 faces). On a closed section of `test18`'s window (11,164
+  triangles): 260 → 235 faces, valid, polylines 995 → 926 mm in all (between curved faces 300 →
+  309, between a curved face and a plane 320 → 290), 0.050 and 0.048 mm from the mesh (0.019 and
+  0.057 before, the worst now where a merged patch meets the section's cut); 9 short edges a
+  quadric piece met as a circle are polylines along a patch now, 4 of them on the cut. A face
+  going all the way round whose seam is a path of mesh edges, slanting, can cover a strip of its
+  surface twice once its neighbours' edges are in: valid to BRepCheck, its tessellation inside the
+  part; it is tessellated as it sits and, if it strays, built in pieces round the axis; a
+  neighbour's new edge gets its
   pcurve on such a face by the face's own u at the edge's two vertices. A torus whose vertex rows
   round its tube have one gap far wider than the others (two rounds at the ends of a wall, read as
   one barrel through both) gets no allowance for a big radius's sag, and the facets it isn't the
@@ -371,6 +423,24 @@ are reported but left in.
   with a polygonal contour (8), edge tolerance at most 0.0044 (0.0054); `test8`: no refusal
   against a torus (12), polygonal contours 8 → 2, the same 452 faces; `test9`: no refusal against a
   sphere (2), polyline edges 1,853 → 1,850, the same 886 faces.
+- **Where u is cut.** A cylinder's or torus's u is unwrapped from the principal angle, so it is cut
+  at −X, and X was the facets' mean direction: right while the face is an arc, but round a ring that
+  is almost closed the mean is a short vector the facets' unevenness points anywhere. A face that
+  covers more than half a turn now has its cut in the middle of the widest gap between its vertices.
+  And a ring tessellated in uneven strips (`test12`'s 3.5 mm hole, 124 facets) has its widest gap
+  between vertices under one strip - 11°, "covered" 0.969 - so it was taken for an open face and
+  the cut fell under that strip: "wire not closed in parameter space, du 6.283". Whether the
+  boundary goes round the axis was asked only above 0.97 of coverage; it is now asked from 0.9, and
+  that hole goes in as a closed face. It is still refused there, by the plane whose contour runs
+  along its rim, but no longer by its own parametrization.
+- **A few facets on the surface to the float are a face.** A cylinder, cone, sphere or torus of
+  fewer than 12 facets whose boundary lies mostly against loose facets is left as mesh: it is the
+  noise of a fillet zone, fitted to a fraction of the tolerance (rms 1-2e-4 on the suite). A coarse
+  export of a real face has few facets too: OpenCascade at 28° gave `test4`'s r 5.6 cylinder 7
+  strips, 16 vertices on it to 1.3e-7, and it was left as mesh. A region whose vertices sit on its
+  surface within a thousandth of the tolerance, three of them or more for every parameter of the
+  primitive (three facets of anything fit "exactly"), now goes in (`test4` tessellated by
+  OpenCascade at 0.05 mm / 28°: 117 → 111 faces; the 13-part suite unchanged).
 - **Under a window the coarse wall is a fan.** Below each window bottom the 47-gon wall runs in a
   fan of thirty-odd slivers, from the polygon's sides at the flange (down to 0.047 inside) up to the
   round's foot on the true circle: twisted up to 17 degrees, one corner on the circle or two, never
@@ -457,6 +527,23 @@ itself (the same regions with `-j 1` and `-j 22` on `test15`, `test16` and `test
 `test17` 546 → 228 s, each with the very same file, and `test14` 1,971 → 1,486 s; the 13-part
 suite comes out identical, in about half the time. With `-v` the log lists where each segmentation spent its time
 (`Segmentation steps: ...`).
+The merges of weak regions into one B-spline try a group's neighbours in turn until one union
+holds - a fit of 0.1-0.3 s each, 766 of them on the closed section of `test18`'s window, 618 that
+didn't hold. Nothing a union reads changes until a merge, which ends the step, so all of a step's
+unions are built first, fitted on the workers together and read in the same order: the first that
+holds is the merge, the fits after it are dropped unread. The same merges as on one core (the
+section's regions compared facet by facet), 175 → 65 s; each facet's polygon is walked once per
+merge pass instead of once per union.
+The mesh's topology is rebuilt at every phase and for every engine, and each build looks for the
+vertices that sit on a chord of the mesh (T-vertices, see the curved phases): that search tried
+every pair of a vertex's neighbours once per facet, with a numpy cross product each, so every vertex
+six times over. It is now done once per vertex and kept, with the facet's own preference applied
+after, with the very same numpy operations (redone in plain Python, the sums in another order moved
+`test5`'s volume by a thousandth of a mm³: a vertex on a straight CAD edge sits at the float
+threshold); the cache goes with every change of the mesh. The same vertices to the last bit
+(`test16`, `test5`, `test4`, `test11`, `test0` and a section of `test14` compared facet by facet),
+the topology built 4-6 times faster (`test16` 20.0 → 4.8 s, a 15,000-triangle section of `test14`
+13.4 → 2.4 s).
 
 ## Output file
 
@@ -499,7 +586,13 @@ and the file passed as faithful. Before writing, every B-spline face is now writ
 pcurves and read back (0.04 s each); those that come back unable to mesh carry their pcurves in
 every file written (`test12`: 1 face, valid, 0.055 mm from the mesh, 12.4 → 16.5 MB). And a
 region whose new face the mesher can't triangulate at all is refused in the engine, instead of
-passing on the global volume. A
+passing on the global volume. A gap in (u, v) that a vertex's tolerance covers in memory can also
+read back as a pole: on the section of `test18`'s window a 41×36 patch met a circle 7e-3 off it
+whose pcurve ended 0.001 in (u, v) from the next line's - 1.2 µm on the surface, under the 5e-3 the
+file declares as its precision - and the reader closed it with a degenerate edge, a hole of 16 mm²
+with pcurves or without. When the pcurves don't help, the faces to blame have their pcurves' ends
+moved onto one point at each vertex, on a copy (a face left invalid gets its pcurves back), and the
+copy is written if it reads back faithful. A
 degenerate edge on a surface that has no pole there (a plane, a cylinder, a torus with R > r) is
 dropped before writing: the reader made a wire of its own out of one, and a 0.33 mm² face of a
 `test14` spindle torus came back as the whole torus, 36,342 mm².
