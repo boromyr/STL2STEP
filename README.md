@@ -30,8 +30,7 @@ triangles.
 
 ## Installation
 
-Requires Python 3.9 or later. Missing dependencies are checked at startup (`refit.py`, the viewer or
-`python deps.py`) and installed automatically with pip; set `REFIT_NO_AUTOINSTALL=1` to disable that.
+Requires Python 3.9 or later. Missing dependencies are checked at startup (`refit.py` or the viewer) and installed automatically with pip, optional ones included; set `REFIT_NO_AUTOINSTALL=1` to disable that.
 To install them by hand:
 
 ```bash
@@ -96,7 +95,6 @@ runs all the way round a hole).
 | Path | Description |
 | --- | --- |
 | [`refit.py`](refit.py) | Converter. |
-| [`deps.py`](deps.py) | Startup dependency check and automatic install. |
 | [`Refit Viewer.pyw`](Refit%20Viewer.pyw), [`viewer/`](viewer) | Desktop viewer. |
 | [`test/`](test) | Example meshes, some with the original CAD file for comparison. |
 | [`tools/`](tools) | Quality checks and analysis scripts (`qa.py`, `cadcmp.py`, ...). |

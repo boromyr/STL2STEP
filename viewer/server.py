@@ -43,9 +43,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import deps
-
-deps.ensure()
+import refit  # noqa: E402,F401  (runs the dependency check)
 
 import numpy as np
 

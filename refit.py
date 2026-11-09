@@ -569,13 +569,53 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    import deps
 
-    deps.ensure(optional=__name__ == "__main__")
-except ImportError:
-    pass
+
+def ensure_dependencies() -> None:
+    """Startup check: pip-installs every missing package, optional ones too
+    (pymeshlab = mesh repair, pywebview = viewer window). Runs before the first
+    third-party import. REFIT_NO_AUTOINSTALL=1 only reports what is missing."""
+    import importlib.util
+    import subprocess
+
+    required = {"numpy": "numpy", "scipy": "scipy", "OCP": "cadquery-ocp"}
+    optional = {"pymeshlab": "pymeshlab", "webview": "pywebview"}
+
+    def missing(table):
+        return [p for m, p in table.items() if importlib.util.find_spec(m) is None]
+
+    def pip(pkgs):
+        exe = sys.executable
+        if os.path.basename(exe).lower() == "pythonw.exe":  # .pyw: no console
+            exe = os.path.join(os.path.dirname(exe), "python.exe")
+        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+        return subprocess.run([exe, "-m", "pip", "install", *pkgs], creationflags=flags).returncode == 0
+
+    req, opt = missing(required), missing(optional)
+    if not (req or opt):
+        return
+    if os.environ.get("REFIT_NO_AUTOINSTALL"):
+        if req:
+            sys.exit("Missing dependencies: pip install " + " ".join(req))
+        return
+    for group, name in ((req, "required"), (opt, "optional")):
+        if group:
+            print(f"[deps] installing {name} packages: {' '.join(group)}", flush=True)
+            if not pip(group):
+                if name == "required":
+                    sys.exit("Could not install: pip install " + " ".join(group))
+                print("[deps] optional install failed, continuing without", flush=True)
+    importlib.invalidate_caches()
+    if missing(required):
+        sys.exit("Missing dependencies after install: " + " ".join(missing(required)))
+    try:
+        import OCP  # noqa: F401
+    except ImportError as ex:  # installed but DLL load failed: needs VTK
+        if "DLL" in str(ex) and pip(["vtk==9.6.2"]):
+            importlib.invalidate_caches()
+
+
+ensure_dependencies()
 
 import numpy as np
 
