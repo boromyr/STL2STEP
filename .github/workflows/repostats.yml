@@ -1,0 +1,19 @@
+name: github-repo-stats
+
+on:
+  schedule:
+    # ogni giorno alle 23:50 UTC
+    - cron: "50 23 * * *"
+  workflow_dispatch:
+
+jobs:
+  j1:
+    name: github-repo-stats
+    runs-on: ubuntu-latest
+    steps:
+      - name: run-ghrs
+        uses: jgehrcke/github-repo-stats@v1.4.2
+        with:
+          # I dati di traffico richiedono un token con accesso push al repo:
+          # il GITHUB_TOKEN di default non basta. Crea il secret ghrs_github_api_token.
+          ghtoken: ${{ secrets.ghrs_github_api_token }}
