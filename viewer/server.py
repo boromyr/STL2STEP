@@ -42,6 +42,11 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import deps
+
+deps.ensure()
+
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))

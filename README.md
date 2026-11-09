@@ -30,7 +30,9 @@ triangles.
 
 ## Installation
 
-Requires Python 3.9 or later.
+Requires Python 3.9 or later. Missing dependencies are checked at startup (`refit.py`, the viewer or
+`python deps.py`) and installed automatically with pip; set `REFIT_NO_AUTOINSTALL=1` to disable that.
+To install them by hand:
 
 ```bash
 pip install cadquery-ocp numpy scipy pymeshlab
@@ -80,6 +82,8 @@ python viewer/server.py
 The viewer allows selecting a mesh, running the conversion and inspecting the result. The type,
 radius and area of each face are shown on hover.
 
+### Manual face correction
+
 Faces that came out in pieces can be fixed by hand: press **Fix faces** (E) on the STEP, click one
 of the pieces (the selection grows to the pieces like it; Shift+click or Shift+drag paints single
 faces in or out, and only the selection is coloured), choose what they are — Auto, Plane,
@@ -92,6 +96,7 @@ runs all the way round a hole).
 | Path | Description |
 | --- | --- |
 | [`refit.py`](refit.py) | Converter. |
+| [`deps.py`](deps.py) | Startup dependency check and automatic install. |
 | [`Refit Viewer.pyw`](Refit%20Viewer.pyw), [`viewer/`](viewer) | Desktop viewer. |
 | [`test/`](test) | Example meshes, some with the original CAD file for comparison. |
 | [`tools/`](tools) | Quality checks and analysis scripts (`qa.py`, `cadcmp.py`, ...). |
