@@ -2761,7 +2761,7 @@ def face_arrays(shape):
     Data for the planar clustering of ANY shape with planar faces (even
     after phases B/C: curved faces remain their own groups).
     Returns V, lists of vertex indices per face, normals (None if curved),
-    areas, edge map, faces per edge.
+    areas (0 for the curved faces), edge map, faces per edge.
     """
     emap, fmap, e_faces = face_edges_map(shape)
     vmap = TopTools_IndexedMapOfShape()
@@ -2773,8 +2773,12 @@ def face_arrays(shape):
         m = TopTools_IndexedMapOfShape()
         te_MapShapes(f, TopAbs_VERTEX, m)
         fv.append([vmap.FindIndex(m.FindKey(k)) - 1 for k in range(1, _size(m) + 1)])
-        nrm.append(face_plane_normal(f))
-        areas.append(face_area(f))
+        n = face_plane_normal(f)
+        nrm.append(n)
+        # ⚠️ only the planar faces' areas: the curved ones never join a group
+        # (planar_clusters pairs planar faces only) and their area was 14 s
+        # of BRepGProp on test15's B-spline faces, serial, at every Phase A
+        areas.append(face_area(f) if n is not None else 0.0)
     return V, fv, nrm, np.array(areas), emap, fmap, e_faces
 
 
@@ -7552,6 +7556,25 @@ def choose_curve(cands: List[_Curve], P: np.ndarray, tol: float, scale: float = 
 INCREMENTAL_TOPO = True
 
 
+class _LazyAreas(dict):
+    """Topo.areas: a face's area is computed (BRepGProp) the first time it is
+    read. ⚠️ Profiled on test15 (-j 22): computing ALL the areas at every
+    Topo() was 400 s of CPU - every arcs worker rebuilds Topo on each pass,
+    14 times the same B-spline integrations - and most areas are never
+    read. Same value as before, only later."""
+
+    __slots__ = ("faces",)
+
+    def __init__(self, faces):
+        super().__init__()
+        self.faces = faces
+
+    def __missing__(self, i):
+        a = face_area(self.faces[i])
+        self[i] = a
+        return a
+
+
 class Topo:
     """
     Faces, edges, vertices of the shape with integer indices stable as long
@@ -7575,7 +7598,8 @@ class Topo:
         self.nV = _size(vmap)
         self.vpos = np.array([vpos(vmap.FindKey(j)) for j in range(1, self.nV + 1)], dtype=float).reshape(-1, 3)
 
-        self.verts, self.cents, self.norms, self.areas, self.nverts, self.planar = {}, {}, {}, {}, {}, {}
+        self.verts, self.cents, self.norms, self.nverts, self.planar = {}, {}, {}, {}, {}
+        self.areas = _LazyAreas(self.faces)
         self.pverts = {}
         self._tol_v = None
         self._cp_cache: Dict[int, List[Tuple[int, int]]] = {}
@@ -7590,7 +7614,8 @@ class Topo:
                     self.pverts[i] = prev.pverts[k]
                     self.nverts[i] = prev.nverts[k]
                     self.cents[i] = prev.cents[k]
-                    self.areas[i] = prev.areas[k]
+                    if k in prev.areas:
+                        self.areas[i] = prev.areas[k]
                     self.planar[i] = prev.planar[k]
                     self.norms[i] = prev.norms[k]
                     continue
@@ -7602,7 +7627,7 @@ class Topo:
             self.verts[i] = self.pverts[i] = V
             self.nverts[i] = len(idx)
             self.cents[i] = V.mean(axis=0) if len(V) else np.zeros(3)
-            self.areas[i] = face_area(f)
+            self.areas.pop(i, None)
             n = face_plane_normal(f)
             self.planar[i] = n is not None
             self.norms[i] = n if n is not None else np.zeros(3)
@@ -7882,7 +7907,7 @@ class Topo:
             self.pverts[i] = V
             self.nverts[i] = len(idx)
             self.cents[i] = V.mean(axis=0) if len(V) else np.zeros(3)
-            self.areas[i] = face_area(f)
+            self.areas.pop(i, None)
             n = face_plane_normal(f)
             self.planar[i] = n is not None
             self.norms[i] = n if n is not None else np.zeros(3)
@@ -7923,8 +7948,12 @@ class Topo:
         last = self.nF - 1
         if i != last:
             self.faces[i] = self.faces[last]
-            for d in (self.verts, self.pverts, self.cents, self.norms, self.areas, self.nverts, self.planar):
+            for d in (self.verts, self.pverts, self.cents, self.norms, self.nverts, self.planar):
                 d[i] = d[last]
+            if last in self.areas:
+                self.areas[i] = self.areas[last]
+            else:
+                self.areas.pop(i, None)
             for k in self.f_edges[last]:
                 self.e_faces[k] = sorted(i if x == last else x for x in self.e_faces[k])
             self.f_edges[i] = self.f_edges[last]
