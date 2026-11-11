@@ -311,6 +311,41 @@ are reported but left in.
   single B-spline holds (`test17`'s eight windows blend into the bore's floor round in sections a
   plane owns: 200 loose triangles). `test17`: 1,131 → 657 faces; `test18`: 1,212 → 766; `test16`
   874 → 864; `test8` 457 → 452.
+  What the mesh is exact to, and how deep its chords sag, doesn't depend on the tolerance asked.
+  The tapered hexagonal hole of `test12` cut out on its own (`test/test12_foro.stl`, 69 mm across)
+  gets by default a tolerance of 6.9e-4 mm where the whole part has 1.55e-3, and came out with 1,103
+  faces where the same triangles inside the part give 449: a twentieth of that tolerance is two
+  steps of the STL's float32 at those coordinates, so the part's exact cylinders no longer counted
+  as exact. "Exact" is now a twentieth of the tolerance or four float steps at the surface's
+  coordinates, whichever is more, wherever the script asks. The mesh's chord sag is measured on
+  those regions, and an exporter holds its chords to a sag *and* to an angle: the hole's r 0.2
+  rounds turn 15° a facet and sag 1.7e-3, its one r 5.2 cylinder turns 6.7° and sags 8.8e-3 - the
+  chord tolerance, which only a large enough radius can show. Among a dozen small rounds that one
+  region was dropped as an outlier (three times the 90th percentile) whenever one round more
+  counted as exact, and the reference fell fivefold; a sag is now kept whenever its chord turns
+  less than the others do (an outlier is a facet that isn't a chord, and turns more). An edge left
+  as the mesh has it may stand off its new surface by what a facet may sag below it, even when
+  the part's size gives a lower ceiling (small part, coarse mesh). A B-spline patch the engine
+  refuses at its edges - a wall of fine strips ending on a rim cut in 2.6 mm chords took 14×23
+  poles to hold its vertices to 6.9e-4 and swung 0.08 mm off the rim's chords, which lie 0.013
+  off the wall - is fitted again held, weakly, along every side of its facets, at points no
+  farther apart than the facets' own spacing (the first fit sees three midpoints a facet), then
+  on the facets themselves, and last without the few facets whose vertices that fit can't reach:
+  eight of 403 in the corner where the round to the next wall begins, a bend of 0.7 mm radius
+  that isn't the wall's (only then: given to every fit, the side points changed which pieces were
+  left around the patches of `test16`, and two exact r 1 tori went into a patch - four circles
+  fewer, 0.036 mm from the mesh for 0.024). And the band of big triangles a coarsely tessellated wall ends
+  in along its rim - two rows of vertices 3 mm apart, which no seed, fill or merge can take on
+  their own - is fitted in one patch with the free-form face it lies along, by interpolation or on
+  the facets themselves; that fit, once the facets have given the shape, is done again with their
+  points moved onto the surface found, so that the vertices pull it within the tolerance (9.6e-4
+  → 5.7e-4 at 15×21 poles). A small cylinder or cone (under 12 facets) is fitted again with the
+  loose facets around it that lie near it, and keeps those the new surface holds: the sixth of
+  the hole's r 4.5 corner rounds had started as a cylinder exact on four long facets, the five
+  beside it 5e-3 off that cylinder stayed out, and the engine refused a region of four facets
+  among loose ones (`test8`: 452 → 446 faces, same circles and ellipses). The hole alone, default
+  tolerances: 1,103 → 505 faces, its six walls one B-spline each and its six corner rounds one
+  face each, 0.027 mm from the mesh before and after.
   Only the facets the patch would take can make a plane own a section: on `test17`'s slots the
   section of a shoulder (where the slot's r 1.5 round turns) held three big triangles of the r 21.5
   wall it is tangent to, the biggest 26% of the section - "a plane" - and the shoulder was left to
@@ -597,6 +632,24 @@ through them waved (`test13`: its fillets' rails within 6 µm of the CAD's edges
 Before that, a needle triangle left on a rim - two edges between the same two faces running out to
 a tip and back - is collapsed, so the rim runs through as one chain (`test13`: edges 163 → 139, no
 more kinks at the fillets' corners).
+
+Last come the seams between two faces that agree: two patches of one loft, a round and the wall
+it is tangent to. Both surfaces hold the facets on either side of such a border, so it runs
+wherever the segmentation left it - along the mesh's edges, a tooth per facet, turning 60° at
+every vertex: no spline goes through it, and cut at its corners nothing is left. Those chains get
+a smooth curve instead: the chain is smoothed with its ends fixed, points along it are dropped
+onto the two surfaces in turn, and the curve goes through the points halfway between the two
+feet. It is kept only where the two surfaces stand within the tolerance of the edges it replaces,
+both along the curve and over everything that changes face between the chain and the curve;
+where the surfaces part, the facets say which face is which and the polyline stays. These passes
+run after the last one that found an exact curve, so a smooth curve never takes a chain a circle
+could still have had. In them, what a chain taken in pieces left behind - a line or two between
+two curves, never a chain again - is joined with its neighbouring splines into one curve, and a
+circle of at least 10° is tried over the pieces beside it while they stay near it; circles and
+ellipses are never replaced. On the closed section of `test18`'s window: 785 → 539 edges, straight
+ones 611 → 286, the same 118 circles and 3 ellipses, 0.023 mm from the mesh before and after;
+the 13 short parts keep every circle and ellipse (`test16` 2,515 → 2,361 straight edges, `test8`
+808 → 733 with the seams alone). `--no-seams` turns these passes off.
 
 The STEP file is written without pcurves (the edges' 2D curves on the faces), as CAD systems do:
 the reader rebuilds them, and the file is 3-7 times smaller. The output is read back right away
