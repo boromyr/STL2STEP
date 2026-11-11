@@ -631,6 +631,16 @@ def ensure_dependencies() -> None:
             importlib.invalidate_caches()
 
 
+# ⚠️ ONE BLAS THREAD PER PROCESS. numpy's OpenBLAS starts a thread per core
+# for every product and solve, and on this code's small systems (B-spline
+# grids of a few hundred poles) the threads cost more than the arithmetic:
+# a 324x324 solve took 67 ms instead of 0.8, and fit_free's solves were 18 s
+# of test15's serial segmentation. With -j the workers each opened 24 more
+# threads on cores already busy. The parallelism is the worker processes'.
+# Set before numpy is imported (the workers inherit it).
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 ensure_dependencies()
 
 import numpy as np
@@ -9516,6 +9526,7 @@ class Segmenter:
         K = 2 * n
         pos = 0
         n_batch = n_stop = n_spec = n_redo = 0
+        t_pool = t_redo = 0.0
         try:
             while pos < len(pending):
                 batch, j = [], pos
@@ -9537,9 +9548,11 @@ class Segmenter:
                 tasks = [(key, path, taken_b, batch[q::m]) for q in range(m)]
                 try:
                     res = {}
+                    t_ = time.perf_counter()
                     for part in pool.map(_worker_seeds, tasks):
                         for r in part:
                             res[r[0]] = r
+                    t_pool += time.perf_counter() - t_
                 except Exception as ex:
                     Log.warn(f"worker processes unavailable ({type(ex).__name__}: {ex}): continuing on a single core")
                     f2, t2 = self._seed_loop(pending[pos:], tries)
@@ -9569,7 +9582,9 @@ class Segmenter:
                         n_local += 1
                         n_redo += 1
                         tried += 1
+                        t_ = time.perf_counter()
                         res_, _ = self.try_seed(s)
+                        t_redo += time.perf_counter() - t_
                         if res_ is None:
                             tries[s] += 2
                             for i in self.last_dead:
@@ -9599,7 +9614,7 @@ class Segmenter:
                     K = max(n, K // 2)
                     n_stop += 1
         finally:
-            Log.debug(f"Parallel seeds: {n_batch} batches, {n_stop} replays cut short, {n_redo} seeds tried again here, {n_spec} seeds computed for {tried} tried")
+            Log.debug(f"Parallel seeds: {n_batch} batches, {n_stop} replays cut short, {n_redo} seeds tried again here, {n_spec} seeds computed for {tried} tried; {t_pool:.1f}s waiting on the workers, {t_redo:.1f}s on the seeds tried again")
             try:
                 os.unlink(path)
             except OSError:
