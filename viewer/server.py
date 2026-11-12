@@ -765,7 +765,7 @@ def _fit_preview(tris, kind, diag):
     a = np.linalg.norm(n, axis=1)
     norms = n / np.maximum(a, 1e-300)[:, None]
     areas = 0.5 * a
-    tol = max(2e-4, 1e-5 * diag)
+    tol = R.auto_tol(diag) if hasattr(R, "auto_tol") else max(2e-4, 1e-5 * diag)
     with _OCC_lock:
         p = R.fit_hint_quadric(kind, verts, norms, areas, list(range(len(tris))), tol)
     if p is None:

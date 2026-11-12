@@ -311,6 +311,20 @@ are reported but left in.
   single B-spline holds (`test17`'s eight windows blend into the bore's floor round in sections a
   plane owns: 200 loose triangles). `test17`: 1,131 → 657 faces; `test18`: 1,212 → 766; `test16`
   874 → 864; `test8` 457 → 452.
+  The automatic tolerance is the mesh's, not only the bounding box's. Before anything is fitted
+  `analyze_mesh` measures the mesh read (`read_stl`, one log line): its diagonal, the median side of
+  its triangles (density), what its coordinates round to (`coord_eps`), the share of its smooth area
+  that is cut flat, and its roughness - how far a facet's far vertex stands off the plane of the
+  facet next to it over the flattest quarter of that area (zero on a CAD mesh: 35-80% of the test
+  parts is flat; 0.6 times the noise on a noisy one). `mesh_tolerance` starts from the size's
+  (`size_tol`: 1e-5 of the diagonal, the 0.2 micron floor no more than 1e-4 of it, so a file in
+  metres is the same part) and corrects it: up to 5 times the roughness (within 5 times the
+  size's), down to an eighth of the median side, and never below 4 times the coordinate rounding.
+  The factor (`TOL_FACTOR`, passed to the workers in `REFIT_TOL_FACTOR`) applies to every automatic
+  tolerance (`auto_tol`; `--tol` overrides it). On the 19 test meshes it is exactly 1: doubling the
+  tolerance for all had been tried (half the faces on `test15`'s top, but `test8` invalid, 25
+  circles fewer on `test16`), so a clean CAD mesh keeps the size's. Not verified: a conversion of a
+  really noisy mesh end to end.
   What the mesh is exact to, and how deep its chords sag, doesn't depend on the tolerance asked.
   The tapered hexagonal hole of `test12` cut out on its own (`test/test12_foro.stl`, 69 mm across)
   gets by default a tolerance of 6.9e-4 mm where the whole part has 1.55e-3, and came out with 1,103
@@ -346,6 +360,12 @@ are reported but left in.
   among loose ones (`test8`: 452 → 446 faces, same circles and ellipses). The hole alone, default
   tolerances: 1,103 → 505 faces, its six walls one B-spline each and its six corner rounds one
   face each, 0.027 mm from the mesh before and after.
+  A swept band also runs through a sphere or torus that isn't exact, one facet wide and made of
+  flat strips only: the inner walls of `test15`'s engraved "8" and degree sign, closed loops of
+  strips 1 mm tall, had been read as the spheres through their two rims (r 1.93 for rims of r
+  1.87), 0.065 mm off the strips halfway up and refused at their edges - three loops in seventy
+  planes. `test15`: 299 → 232 faces, small planes 105 → 39, 0.008 mm from the mesh before and
+  after.
   Only the facets the patch would take can make a plane own a section: on `test17`'s slots the
   section of a shoulder (where the slot's r 1.5 round turns) held three big triangles of the r 21.5
   wall it is tangent to, the biggest 26% of the section - "a plane" - and the shoulder was left to

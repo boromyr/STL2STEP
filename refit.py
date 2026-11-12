@@ -1378,6 +1378,120 @@ MESH_TURN = None
 # Significant digits of an ASCII STL's coordinates, when coarser than the
 # float32 of a binary one (OpenSCAD writes six: 21.4919): None otherwise.
 MESH_DIGITS: Optional[int] = None
+# What the mesh says of itself before anything is fitted (analyze_mesh, set
+# by read_stl), and what that makes of the automatic tolerances: a factor on
+# the one the size alone gives (auto_tol).
+MESH_INFO: Optional[dict] = None
+try:
+    TOL_FACTOR = float(os.environ.get("REFIT_TOL_FACTOR", "1") or 1.0)  # (the environment: the worker processes read it too)
+except ValueError:
+    TOL_FACTOR = 1.0
+
+
+def size_tol(diag: float) -> float:
+    """
+    The vertex-surface tolerance the size alone gives: 1e-5 of the diagonal,
+    what a CAD kernel holds its own faces to at that size - and no less than
+    0.2 microns on a part in millimetres, but never more than 1e-4 of the
+    diagonal (the same file in metres or inches is the same part: an
+    absolute floor would be a thousandth of it).
+    """
+    return max(min(2e-4, 1e-4 * diag), 1e-5 * diag)
+
+
+def auto_tol(diag: float) -> float:
+    """The automatic vertex-surface tolerance: size_tol, as the mesh's own analysis corrects it (mesh_tolerance)."""
+    return size_tol(diag) * TOL_FACTOR
+
+
+def analyze_mesh(P, T, eps: Optional[float] = None) -> Optional[dict]:
+    """
+    ⚠️ THE MESH BEFORE ANYTHING IS FITTED: what its tolerances can be asked.
+    P vertices (n x 3), T triangles (m x 3 indices). Returns
+      diag   : the bounding box's diagonal;
+      eps    : how far a vertex can be off a surface it is exactly on
+               (coord_eps: float32, or an ASCII file's digits);
+      edge   : the median side of its triangles (the density);
+      flat   : the share of its smooth area (facets within 30 degrees of
+               each other) where a facet's far vertex is within 2 eps of the
+               plane of the one next to it: the faces a CAD mesh has cut
+               flat, 35-80% of the test parts, none of a mesh with noise;
+      rough  : how far that vertex stands off that plane over the flattest
+               quarter of the smooth area: zero on a CAD mesh (its flat
+               share is more than a quarter), 0.6 times the noise of a
+               noisy one.
+    None with nothing to measure.
+    """
+    P = np.asarray(P, dtype=float)
+    T = np.asarray(T, dtype=np.int64)
+    if len(P) < 4 or len(T) < 4:
+        return None
+    diag = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+    if not diag > 0.0:
+        return None
+    if eps is None:
+        eps = coord_eps(float(np.abs(P).max()))
+    N = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
+    ar = np.linalg.norm(N, axis=1)
+    ok = ar > 0.0
+    N[ok] /= ar[ok, None]
+    E = np.vstack([T[:, [0, 1]], T[:, [1, 2]], T[:, [2, 0]]])
+    opp = np.concatenate([T[:, 2], T[:, 0], T[:, 1]])
+    fi = np.tile(np.arange(len(T)), 3)
+    el = np.linalg.norm(P[E[:, 0]] - P[E[:, 1]], axis=1)
+    info = dict(diag=diag, eps=float(eps), edge=float(np.median(el)), triangles=int(len(T)), flat=1.0, rough=0.0)
+    key = np.sort(E, axis=1)
+    k = key[:, 0] * len(P) + key[:, 1]
+    o = np.argsort(k, kind="stable")
+    same = np.nonzero(k[o][1:] == k[o][:-1])[0]
+    a, b = o[same], o[same + 1]
+    m = ok[fi[a]] & ok[fi[b]]
+    a, b = a[m], b[m]
+    if not len(a):
+        return info
+    fa, fb = fi[a], fi[b]
+    smooth = np.einsum("ij,ij->i", N[fa], N[fb]) > math.cos(math.radians(30.0))
+    if not smooth.any():
+        return info
+    off = np.abs(np.einsum("ij,ij->i", P[opp[b]] - P[key[a, 0]], N[fa]))[smooth]
+    w = (ar[fa] + ar[fb])[smooth]
+    info["flat"] = float(w[off <= 2.0 * eps].sum() / max(float(w.sum()), 1e-300))
+    oo = np.argsort(off)
+    cw = np.cumsum(w[oo])
+    info["rough"] = float(off[oo][min(int(np.searchsorted(cw, 0.25 * cw[-1])), len(off) - 1)])
+    return info
+
+
+def mesh_tolerance(info: dict) -> Tuple[float, str]:
+    """
+    ⚠️ THE TOLERANCE IS THE MESH'S, NOT ONLY THE BOX'S. The size gives what
+    a clean CAD mesh is asked (size_tol: on the 19 test parts nothing below
+    changes it, and twice as much was tried on all of them - half the faces
+    on test15's sculpted top, test8 invalid, 25 circles fewer on test16).
+    The mesh corrects it where the size is wrong about it:
+      roughness : vertices that are off the surface they came from (a scan,
+                  a remeshed or decimated part) can't be held to less than
+                  that: 5 times analyze_mesh's rough (3-4 times the noise),
+                  within 5 times the size's - a sculpted part with no flat
+                  face reads as rough too, and it is not;
+      density   : no more than an eighth of the median side: a tolerance
+                  near the facets' own size fits anything to anything (a
+                  big part in very small triangles);
+      grid      : no less than 4 times what the coordinates round to (a
+                  small part far from the origin, an ASCII file with few
+                  digits): below that the vertices of an exact face are
+                  not on it.
+    Returns (tolerance, which of them set it).
+    """
+    tol, why = size_tol(info["diag"]), "size"
+    r = min(5.0 * info["rough"], 5.0 * tol)
+    if r > tol:
+        tol, why = r, "roughness"
+    if info["edge"] > 0.0 and tol > info["edge"] / 8.0:
+        tol, why = info["edge"] / 8.0, "density"
+    if tol < 4.0 * info["eps"]:
+        tol, why = 4.0 * info["eps"], "coordinate grid"
+    return tol, why
 
 
 def coord_eps(m: float) -> float:
@@ -1774,6 +1888,23 @@ def read_stl(path: str):
         Log.info(f"ASCII STL with {MESH_DIGITS} significant digits: vertices count as exact within {coord_eps(float(np.abs(_tri_arrays(tri)[0]).max())):.1e} mm")
     P, T = _tri_arrays(tri)
     P2, T2, _ = mesh_precheck(P, T, os.path.basename(path))
+    global MESH_INFO, TOL_FACTOR
+    MESH_INFO, TOL_FACTOR = None, 1.0
+    try:
+        MESH_INFO = analyze_mesh(P2, T2)
+    except Exception as ex:
+        Log.debug(f"mesh analysis failed: {ex}")
+    if MESH_INFO is not None:
+        i_ = MESH_INFO
+        t_, why_ = mesh_tolerance(i_)
+        TOL_FACTOR = t_ / size_tol(i_["diag"])
+        i_["tol"], i_["tol_from"] = t_, why_
+        Log.info(
+            f"Mesh: diagonal {i_['diag']:.1f} mm · median side {i_['edge']:.3g} mm · coordinates exact to {i_['eps']:.1e} mm · "
+            f"flat {100.0 * i_['flat']:.0f}% of the smooth area · roughness {i_['rough']:.1e} mm -> automatic tolerance {t_:.1e} mm (from its {why_}"
+            + (f": {TOL_FACTOR:.2g} times the size's" if abs(TOL_FACTOR - 1.0) > 1e-9 else "") + ")"
+        )
+    os.environ["REFIT_TOL_FACTOR"] = repr(TOL_FACTOR)
     if P2 is not P or T2.shape != T.shape or not np.array_equal(T2, T):
         tri = _tri_from_arrays(P2, T2)
     mk = _BRepBuilderAPI.BRepBuilderAPI_MakeShapeOnMesh(tri)
@@ -3340,7 +3471,8 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
         work = copy_shape(originale) if base_ok else originale
         V, fv, nrm, areas, emap, fmap, e_faces = face_arrays(work)
         diag = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if len(V) else 1.0
-        lt = lin_tol if lin_tol is not None else max(1e-5, 2e-6 * diag)
+        # (a fifth of the vertex tolerance: with it where the mesh raises it)
+        lt = lin_tol if lin_tol is not None else max(1e-5, 2e-6 * diag) * max(1.0, TOL_FACTOR)
         bar = texture_barrier(V, fv, nrm, areas, e_faces) if use_barrier else None
         lab = planar_clusters(V, fv, nrm, areas, e_faces, lt, barrier=bar)
         cen = np.array([V[idx].mean(axis=0) if len(idx) else np.zeros(3) for idx in fv])
@@ -7781,7 +7913,7 @@ class Topo:
         own = set(idx)
         # (the tolerance the phases will use, as run_phase sets it)
         if self._tol_v is None:
-            self._tol_v = max(2e-4, 1e-5 * float(np.linalg.norm(self.vpos.max(axis=0) - self.vpos.min(axis=0)))) if len(self.vpos) else 2e-4
+            self._tol_v = auto_tol(float(np.linalg.norm(self.vpos.max(axis=0) - self.vpos.min(axis=0)))) if len(self.vpos) else 2e-4
         tol_v = self._tol_v
         rows: List[np.ndarray] = []
         changed = False
@@ -12020,6 +12152,43 @@ class Segmenter:
             Log.debug(f"Rim bands: {n_f} loose facets along {n_b} free-form patches taken into them")
         return regions
 
+    def _own_chords(self, g, regions) -> float:
+        """
+        ⚠️ A NEARLY FLAT FACE IS CUT IN BIG TRIANGLES, AND THEY SAG DEEPER
+        THAN ANY ROUND'S. An exporter holding its chords to an angle (see
+        _measure_mesh_turn) cuts a face bending on 400 mm in triangles 7 mm
+        across: 0.015 mm deep, where the same part's r 2-5 rounds - all the
+        exact regions there are to measure - sag 0.002, and the cap for a
+        radius counts up to four times the largest one seen. The two faces
+        the arm of test15 springs from, saddles of 350-950 mm radius in 13
+        and 29 triangles, were refused every fill for that and stayed as
+        many planes. But the facets tell it themselves: side by side they
+        turn no more than the exporter's chords do.
+        Returns what the facets of a loose group may sag for that reason:
+        1.5 times what a chord as long as its longest side sags when turning
+        as much as its facets turn against each other at most - if that is
+        no more than 1.5 times the angle the exact regions' chords turn
+        (2.9 degrees on test15); 0 otherwise, or with no such angle measured.
+        """
+        topo = self.topo
+        mt = MESH_TURN if MESH_TURN is not None else _measure_mesh_turn(regions, self.tol_fit)
+        if mt is None or mt[0] is None or not mt[0] > 0.0:
+            return 0.0
+        a_ref = 2.0 * math.acos(max(-1.0, 1.0 - min(float(mt[0]), 1.0)))
+        gs = set(g)
+        turn = L = 0.0
+        for i in gs:
+            V = topo.verts[i]
+            if len(V) < 3:
+                return 0.0
+            L = max(L, float(np.linalg.norm(V - np.roll(V, -1, axis=0), axis=1).max()))
+            for j in topo.adj[i]:
+                if j in gs and j > i:
+                    turn = max(turn, math.acos(min(1.0, max(-1.0, float(topo.norms[i] @ topo.norms[j])))))
+        if turn <= 0.0 or turn > 1.5 * a_ref:
+            return 0.0
+        return 1.5 * L * turn / 8.0
+
     def _fill_late(self, regions):
         """
         ⚠️ FILLED LAST, OR THE REST CHANGES. The loose groups no B-spline
@@ -12052,7 +12221,11 @@ class Segmenter:
         for G, ctol in todo:
             free = {i for i in G if i not in owned and topo.verts[i].size}
             for g in _face_groups(free, topo.adj):
-                for pr, G2 in filler.pieces(g, ctol, cap):
+                own_ = self._own_chords(g, regions)
+                cap_ = cap if cap is None or own_ <= 0.0 else max(cap, own_ + 2.0 * self.tol_fit)
+                for pr, G2 in filler.pieces(g, max(ctol, own_ + 2.0 * self.tol_fit) if own_ > 0.0 else ctol, cap_):
+                    if own_ > 0.0 and cap_ is not None:
+                        pr.chord_ok = cap_
                     regions.append(describe_region(pr, topo, G2))
                     owned |= set(G2)
                     n_p += 1
@@ -12080,7 +12253,11 @@ class Segmenter:
                 pl_ = fit_plane(Pg)
                 if pl_ is not None and float(np.abs(pl_.dist(Pg)).max()) <= 3.0 * self.tol_fit:
                     continue
-                for pr, G2 in filler.pieces(g, ms, cap):
+                own_ = self._own_chords(g, regions)
+                cap_ = cap if own_ <= 0.0 else max(cap, own_ + 2.0 * self.tol_fit)
+                for pr, G2 in filler.pieces(g, max(ms, own_ + 2.0 * self.tol_fit) if own_ > 0.0 else ms, cap_):
+                    if own_ > 0.0:
+                        pr.chord_ok = cap_
                     regions.append(describe_region(pr, topo, G2))
                     owned |= set(G2)
                     n_p += 1
@@ -13210,6 +13387,23 @@ class Segmenter:
             k
             for k, R in enumerate(regions)
             if R.prim.kind == AXIAL and abs(R.prim.slope) < 1e-3 and getattr(R.prim, "ball", None) is None and R.rms > _exact_lim(R, self.tol_fit, 0.1)
+        }
+        # ⚠️ AND THE SPHERES THROUGH A WALL'S TWO RIMS. The inner walls of
+        # test15's engraved "8" and of its degree sign are closed loops of
+        # strips 1 mm tall, not quite circles: two rims that close to equal
+        # circles 1 mm apart lie on a sphere (r 1.93 for rims of r 1.87), and
+        # the seeds made spheres of them - 92, 59, 31 strips, 2-3
+        # tolerances off the vertices, standing 0.065 off the strips halfway
+        # up - which the engine refused at their edges: three loops left in
+        # seventy planes, where the outer walls of the same letters are
+        # swept faces. A sphere or torus that isn't exact, one facet wide
+        # (_one_wide: no vertex inside it, nothing said across) and all flat
+        # strips is soft too.
+        soft |= {
+            k
+            for k, R in enumerate(regions)
+            if R.prim.kind in (SPHERE, TORUS) and getattr(R.prim, "ball", None) is None and R.rms > _exact_lim(R, self.tol_fit, 0.1)
+            and all(topo.planar[i] and 3 <= len(topo.verts[i]) <= 4 for i in R.faces) and self._one_wide(R.faces)
         }
         cand = [i for i in range(topo.nF) if (i not in claimed or owner[i] in soft) and topo.planar[i] and len(topo.verts[i]) >= 3]
         cset = set(cand)
@@ -16118,6 +16312,27 @@ class Engine:
         rf = [topo.face_index(f) for f in R.fobjs]
         if any(i < 0 for i in rf):
             return False, "region's faces no longer present"
+        # ⚠️ ONE FACE, ONE PIECE. A region whose facets aren't all joined by
+        # their sides (others took the ones between, or a merge joined them
+        # across a vertex) closes into an outer ring and a second one beside
+        # it, not inside: read as a hole, InvalidImbricationOfWires. A
+        # 223-facet patch of test15, holding every vertex to 4e-4, was
+        # refused for a 3-facet island 0.07 mm off it and stayed strips. The
+        # largest piece is the region and the others are left to whoever
+        # comes next - of a patch only, and if they are a twentieth of it at
+        # most: a surface of revolution closed on itself comes here in
+        # pieces by right (test16: three regions of 226, 295 and 102 facets,
+        # 129 faces more and 8 circles fewer when halved this way).
+        if len(rf) >= 4 and prim.kind == FREE:
+            big_ = largest_component(sorted(rf), topo.adj)
+            if len(big_) < len(rf) and 20 * (len(rf) - len(big_)) <= len(rf) and len(big_) >= max(3, self.min_faces_hint):
+                bs_ = set(big_)
+                if self.verbose:
+                    Log.debug(f"    in {len(_face_groups(set(rf), topo.adj))} pieces: the largest, {len(big_)} of {len(rf)} facets, converted")
+                R.left_fobjs = list(getattr(R, "left_fobjs", None) or []) + [f for f, i in zip(R.fobjs, rf) if i not in bs_]
+                R.fobjs = [f for f, i in zip(R.fobjs, rf) if i in bs_]
+                rf = [i for i in rf if i in bs_]
+                R.faces = list(rf)
         rset = set(rf)
         self._rset = rset
         self._rf = rf
@@ -16538,6 +16753,7 @@ class Engine:
         # be flipped.
         flip = R.concave
         self._etol_backup = {}
+        self._own_edges = []
         wires = self._build_wires(F, sp, loops, new_edges, seam, flip)
         if isinstance(wires, str):
             self._restore_all(vtol_backup)
@@ -16576,6 +16792,25 @@ class Engine:
         if getattr(R, "forced", None) is not None:
             tol_cap = max(tol_cap, 1.5 * (R.max_res + R.sag) + self.tol_fit)
         worst_edge_tol = max(t for _, _, t in wires) if wires else 0.0
+        # ⚠️ ...AND A LONG STRAIGHT EDGE BY ITS OWN LENGTH. Where a finely
+        # tessellated round ends against a nearly flat face cut in big
+        # triangles, its end is one of their sides: the 387-facet round at
+        # the root of test15's arm ends on mesh edges 4.7 and 2.1 mm long,
+        # 0.05 off a patch that holds every facet of its own to 5e-4 - the
+        # sag of a chord that long, which an exporter holding its chords to
+        # an angle leaves (see Segmenter._own_chords: on that part they turn
+        # 2.9 degrees; 4.7 mm at 1.5 times that is 0.045 deep) - and was
+        # refused for it, its facets left as strips. A straight edge may
+        # stand off by 1.5 times the sag of a chord of its length turning
+        # 1.5 times what the exact regions' chords turn, within the same
+        # hard limit; the others, and all of them with no such angle
+        # measured, by the ceiling above.
+        if worst_edge_tol > tol_cap and self.sag_turn is not None and self.sag_turn[0] is not None and self.sag_turn[0] > 0.0 and self._own_edges:
+            a_ref_ = 2.0 * math.acos(max(-1.0, 1.0 - min(float(self.sag_turn[0]), 1.0)))
+            lim_ = lambda ln: max(tol_cap, min(1.2 * 1.5 * ln * 1.5 * a_ref_ / 8.0, 5.0 * self.max_edge_tol))
+            if all(t <= lim_(ln) for t, ln, _ in self._own_edges) and worst_edge_tol <= max(t for t, _, _ in self._own_edges) + 1e-12:
+                tol_cap = worst_edge_tol
+        over_edges = [k for t, _, k in self._own_edges if k >= 0 and t > tol_cap]
         if worst_edge_tol > tol_cap:
             bnd = self._wire_samples(F) if prim.kind == FREE and not getattr(R, "_bnd_refit", False) else None
             bnd_chk = self._wire_samples(F, 0.1, 17, 257) if bnd is not None else None
@@ -16611,6 +16846,41 @@ class Engine:
                                 pass
                         else:
                             R.left_fobjs = was_[2]
+            # ⚠️ ONE SHORT EDGE IS NOT THE PATCH. A 264-facet patch of test18
+            # held every facet to 8e-4 and was refused for one edge 0.86 mm
+            # long, 0.023 off it at a corner (ceiling 0.020); no refit moved
+            # it, and 264 facets stayed strips. The facets of the region on
+            # the edges over the ceiling are let go (a twentieth of it at
+            # most, the rest in one piece) and the rest converted - three
+            # times at most: without that facet the same patch had the next
+            # edge along at 0.0201.
+            if prim.kind == FREE and over_edges and getattr(R, "_edge_trim", 0) < 3:
+                try:
+                    drop_ = {i for k in over_edges for i in topo.e_faces[k] if i in rset}
+                except Exception:
+                    drop_ = set()
+                keep_ = [j for j, i in enumerate(rf) if i not in drop_]
+                if drop_ and 20 * len(drop_) <= len(rf) and len(keep_) >= max(3, self.min_faces_hint) and len(largest_component([rf[j] for j in keep_], topo.adj)) == len(keep_):
+                    was_ = (R.faces, R.fobjs, getattr(R, "left_fobjs", None))
+                    ks_ = set(keep_)
+                    R.left_fobjs = list(was_[2] or []) + [R.fobjs[j] for j in range(len(rf)) if j not in ks_]
+                    R.faces = [R.faces[j] for j in keep_]
+                    R.fobjs = [R.fobjs[j] for j in keep_]
+                    R._edge_trim = getattr(R, "_edge_trim", 0) + 1
+                    ok2, why2 = self._convert(R, strict_hole, analytic_planes, analytic_curved, fitted_curves)
+                    R._edge_trim -= 1
+                    if self.verbose:
+                        Log.debug(f"    without the {len(drop_)} facets on its {len(over_edges)} edges over the ceiling: {'ok' if ok2 else why2}")
+                    if ok2:
+                        return ok2, why2
+                    R.faces, R.fobjs = was_[0], was_[1]
+                    if was_[2] is None:
+                        try:
+                            del R.left_fobjs
+                        except AttributeError:
+                            pass
+                    else:
+                        R.left_fobjs = was_[2]
             return False, (f"polygonal edge tolerance {worst_edge_tol:.1e} > ceiling {tol_cap:.1e}")
 
         det = check_detail(F)
@@ -17345,6 +17615,13 @@ class Engine:
                     # doesn't remove it, it only removes another exact
                     # surface.
                     worst_own = max(worst_own, 1.2 * dev + 1e-7)
+                    # (each edge's own deviation and, if it is a straight
+                    # one, its length: see convert's ceiling)
+                    try:
+                        ln_ = edge_length(e) if BRepAdaptor_Curve(e).GetType() == GeomAbs_Line else 0.0
+                    except Exception:
+                        ln_ = 0.0
+                    self._own_edges.append((1.2 * dev + 1e-7, ln_, key - 1 if key > 0 else -1))
                     if self.verbose and tol_e > self.max_edge_tol:
                         Log.debug(
                             f"      edge beyond the ceiling: tol {tol_e:.2e} "
@@ -20287,7 +20564,7 @@ def run_phase(
 
     topo = Topo(shape)
     diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0)))
-    tol_fit = tol if (tol and tol > 0) else max(2e-4, 1e-5 * diag)
+    tol_fit = tol if (tol and tol > 0) else auto_tol(diag)
     tol_grow = min(10.0 * tol_fit, 1e-3 * diag)
     if max_edge_tol is None or max_edge_tol <= 0:
         max_edge_tol = max(20.0 * tol_fit, 2e-4 * diag)
@@ -20386,6 +20663,41 @@ def run_phase(
                 n_p, n_q = _refill(eng, R, min_faces, is_b, split_parts)
                 if n_q:
                     Log.debug(f"  {R.label()} filled again in {n_q} pieces: {n_p} converted")
+            # ⚠️ A QUADRIC THAT IS NOT THE SURFACE SAGS BY WHAT IT MISSES. The
+            # r 2.1 rounds at the root of test15's arm change radius along
+            # their edge: the seeds made cylinders of them, 66 and 67 facets
+            # over 50 degrees (too many and too wide for the merges of weak
+            # regions), 3-4 tolerances off their vertices, and the engine
+            # refused them for facets sagging 5.1e-3 and 5.6e-3 where the
+            # mesh's chords may sag 4.8e-3 - the misfit, not the chords: 133
+            # facets left as strips. A cylinder, cone, torus or sphere that
+            # isn't exact and is refused for that is filled instead on its
+            # own facets (one patch, by interpolation or on the facets), held
+            # to that same cap, and converted at once.
+            if (not ok and allow_free and not is_b and "the facets sag" in why and R.prim.kind in (AXIAL, TORUS, SPHERE) and eng.sag_cap is not None
+                    and getattr(R, "forced", None) is None and R.rms > _exact_lim(R, eng.tol_fit) and len(R.fobjs) >= 2 * min_faces):
+                rf_ = [topo.face_index(f) for f in R.fobjs]
+                if all(i >= 0 for i in rf_):
+                    # (one patch or none - on the facets themselves if need be: a
+                    # round's vertices come in rows - not pieces of it)
+                    fl_ = PatchFiller(topo, eng.tol_fit, min_faces)
+                    a_ = fl_.whole_args(sorted(rf_))
+                    pr_ = fit_fill(*a_, eng.sag_cap, chords="rim") if a_ is not None else None
+                    got_ = [(pr_, [topo.faces[i] for i in sorted(rf_)])] if fl_.whole_ok(sorted(rf_), pr_, eng.sag_cap, eng.sag_cap) else []
+                    n_p = 0
+                    for pr, fo in got_:
+                        tp_ = eng.topo
+                        G = [tp_.face_index(f) for f in fo]
+                        if any(i < 0 for i in G):
+                            continue
+                        Q = describe_region(pr, tp_, G)
+                        Q.fobjs = fo
+                        Q.repeated = R.repeated
+                        Q.note = "filled in place of a quadric off its facets"
+                        if eng.convert(Q, strict_hole=is_b)[0]:
+                            n_p += 1
+                        split_parts.append(Q)
+                    Log.debug(f"  {R.label()} filled on its facets instead: {'no patch holds' if not got_ else 'converted' if n_p else 'refused'}")
             # ⚠️ A MERGED PATCH REFUSED AT ITS COARSE EDGE: HALVES BEFORE PIECES.
             # test17's bore-floor corners meet the floor's exact circle along
             # facets 3.7 mm long, the circle a chord's sag (0.13) off the patch
@@ -20837,6 +21149,9 @@ def main(argv=None) -> int:
     MESH_SAG = None
     MESH_TURN = None
     MESH_DIGITS = None
+    global MESH_INFO, TOL_FACTOR
+    MESH_INFO, TOL_FACTOR = None, 1.0
+    os.environ["REFIT_TOL_FACTOR"] = "1.0"
     MESH_REPAIR = not args.no_mesh_repair
     MESH_CLOSE_HOLES = max(0, int(args.close_holes))
 
@@ -20954,7 +21269,7 @@ def main(argv=None) -> int:
         _V = Topo(shape).vpos
         _diag = float(np.linalg.norm(_V.max(axis=0) - _V.min(axis=0))) if len(_V) else 1.0
         _tolA = args.arc_tol if args.arc_tol and args.arc_tol > 0 else (
-            args.tol if args.tol and args.tol > 0 else max(2e-4, 1e-5 * _diag))
+            args.tol if args.tol and args.tol > 0 else auto_tol(_diag))
         # ⚠️ AGAIN, while it finds something: a chain is judged with its
         # neighbors as they are, and once theirs have become curves it can
         # pass (a second pass: test9 -118 edges, 42 of them exact
