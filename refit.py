@@ -2966,15 +2966,78 @@ def texture_barrier(V, fv, nrm, areas, e_faces, size_cut: float = 1.5, ang_min_d
     siz = np.array([face_scale(V, idx) for idx in fv])
     N = np.array([n if n is not None else np.zeros(3) for n in nrm])
     cmin = math.cos(math.radians(ang_min_deg))
+    # ⚠️ ...AND A TANGENT EDGE BETWEEN TWO CURVED FACES CAN BE FLAT. Where a
+    # blend leaves a cylinder tangent, the first triangles of the blend's
+    # grid lie in the plane of the cylinder's strip beside them - no angle
+    # at all - and were merged with it: one polygon, half strip and half
+    # grid, that the cylinder then owned whole, its border with the blend
+    # notched by them (test17's window blends, three triangles each). Flat
+    # together, but not of one face: a strip (four times longer than wide,
+    # with a neighbour it turns from by half a degree to thirty: a chord of
+    # a curved face) and a facet that is not a strip at all,
+    # that turns from a neighbour like itself ACROSS the strip's length:
+    # a piece of the same strip, cut short by something, turns from its
+    # neighbours along it like the strip does (a rule without that left 14
+    # faces more on test17: strips in two halves).
+    elong = np.zeros(len(fv))
+    for i, idx in enumerate(fv):
+        if 3 <= len(idx) <= 4:
+            P = V[idx]
+            L = np.linalg.norm(np.roll(P, -1, axis=0) - P, axis=1)
+            if float(L.min()) > 0.0:
+                elong[i] = float(L.max() / L.min())
+        elif len(idx) > 4:
+            # (a few triangles of a grid already merged with each other:
+            # how long the polygon is for its width)
+            P = V[idx] - V[idx].mean(axis=0)
+            w = np.sqrt(np.maximum(np.linalg.eigvalsh(P.T @ P)[1:], 0.0))
+            if float(w[0]) > 0.0:
+                elong[i] = float(w[1] / w[0])
+    c_lo, c_hi, c_any = math.cos(math.radians(30.0)), math.cos(math.radians(0.5)), math.cos(math.radians(0.05))
+    chord = np.zeros(len(fv), dtype=bool)
+    nbr = defaultdict(list)
+    for fs in e_faces:
+        if len(fs) == 2:
+            c = abs(float(N[fs[0]] @ N[fs[1]]))
+            if c_lo < c < c_hi:
+                chord[fs[0]] = chord[fs[1]] = True
+            if c_lo < c < c_any:
+                nbr[fs[0]].append(fs[1])
+                nbr[fs[1]].append(fs[0])
+
+    def bent_across(o, s) -> bool:
+        P = V[fv[s]]
+        S = np.roll(P, -1, axis=0) - P
+        L = np.linalg.norm(S, axis=1)
+        d_s = S[int(np.argmax(L))] / float(L.max())
+        so = set(int(v) for v in fv[o])
+        for y in nbr[o]:
+            sh = [v for v in fv[y] if int(v) in so]
+            # (and of its own kind: the end of a strip turns from the face
+            # the strip ends on, and that is no grid it belongs to)
+            if y == s or len(sh) != 2 or not 0.0 < elong[y] < 2.5 or abs(math.log2(max(siz[o], 1e-12) / max(siz[y], 1e-12))) >= 0.75:
+                continue
+            d = V[sh[1]] - V[sh[0]]
+            n = float(np.linalg.norm(d))
+            if n > 0.0 and abs(float(d @ d_s)) / n < 0.9:
+                return True
+        return False
+
     for k, fs in enumerate(e_faces):
         if len(fs) != 2:
             continue
         a, b = fs
         if np.linalg.norm(N[a]) < 0.5 or np.linalg.norm(N[b]) < 0.5:
             continue
-        if abs(math.log2(max(siz[a], 1e-12) / max(siz[b], 1e-12))) <= size_cut:
-            continue
+        jump = abs(math.log2(max(siz[a], 1e-12) / max(siz[b], 1e-12))) > size_cut
         if abs(float(N[a] @ N[b])) < cmin:
+            if jump:
+                bar[k] = True
+            continue
+        if elong[a] <= 0.0 or elong[b] <= 0.0:
+            continue
+        s, o = (a, b) if elong[a] >= elong[b] else (b, a)
+        if elong[s] >= 4.0 and len(fv[s]) <= 4 and chord[s] and elong[o] < 2.5 and bent_across(o, s):
             bar[k] = True
     return bar
 
@@ -10639,6 +10702,7 @@ class Segmenter:
             regions = self._merge_free(regions, only=only)
         regions = self._small_rounds(regions)
         regions = self._rim_bands(regions)
+        regions = self._pattern_borders(regions)
         regions = self._close_free(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
@@ -12068,6 +12132,187 @@ class Segmenter:
             n_f += len(cand)
         if n_r:
             Log.debug(f"Small rounds: {n_f} loose facets taken by {n_r} cylinders and cones fitted again with them")
+        return regions
+
+    def _pattern_borders(self, regions):
+        """
+        ⚠️ THE MESH STILL SHOWS WHERE THE CAD'S EDGES WERE. A tessellator
+        works one CAD face at a time, each in its own pattern: a cylinder in
+        strips as long as the face, all one way; a blend in a grid of small
+        triangles. Where two faces meet tangent the edge between them is as
+        plain to the eye as a sharp one - the pattern changes on it - and
+        geometry alone can't place it: the facets beside it lie on both
+        surfaces to the tolerance, whoever grew first took them, and the
+        border came out in steps across the pattern (test17's window
+        blends: grid triangles left in the cylinders beside them, the edge
+        notched where the CAD's is one line).
+        So a facet of 3-4 vertices on the border of its region goes to the
+        region across it when the pattern says it is that one's: every
+        neighbour it has in its own region is unlike it (2.8 times its size,
+        or strips against a grid, or strips running another way), one in the
+        other is like it, and the other's surface holds it as it holds any
+        facet (within). Layer by layer, while any moves; a region is never
+        cut in two nor left under four facets.
+        """
+        topo = self.topo
+        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
+        memo = {}
+        self.verbose_dbg = bool(os.environ.get("REFIT_DBG_PATTERN"))
+
+        def pat(i):
+            if i not in memo:
+                V = topo.verts[i]
+                if not 3 <= len(V) <= 4:
+                    memo[i] = None
+                else:
+                    S = np.roll(V, -1, axis=0) - V
+                    L = np.linalg.norm(S, axis=1)
+                    d = np.linalg.norm(V[:, None, :] - V[None, :, :], axis=2)
+                    d = d[d > 0]
+                    if not d.size or float(L.min()) <= 0.0:
+                        memo[i] = None
+                    else:
+                        j = int(np.argmax(L))
+                        memo[i] = (float(np.median(d)), float(L[j] / L.min()), S[j] / L[j])
+            return memo[i]
+
+        def like(a, b):
+            if abs(math.log2(a[0] / b[0])) >= 0.75:
+                return False
+            if a[1] < 2.5 and b[1] < 2.5:
+                return True
+            return a[1] >= 2.5 and b[1] >= 2.5 and abs(float(a[2] @ b[2])) > 0.94
+
+        def unlike(a, b):
+            if abs(math.log2(a[0] / b[0])) > 1.5:
+                return True
+            if (a[1] >= 4.0 and b[1] < 2.0) or (b[1] >= 4.0 and a[1] < 2.0):
+                return True
+            return a[1] >= 4.0 and b[1] >= 4.0 and abs(float(a[2] @ b[2])) < 0.8
+
+        sets = {k: set(R.faces) for k, R in enumerate(regions)}
+        changed = set()
+        n_m = n_c = n_no = n_fit = 0
+        newp = {}
+        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, self.tol_fit)
+        cap = None if ms is None else 2.0 * ms + 2.0 * self.tol_fit
+        filler = PatchFiller(topo, self.tol_fit, self.min_faces)
+        for _ in range(6):
+            done = 0
+            for k in list(sets):
+                F = sets[k]
+                if len(F) < 5 or regions[k].prim is None or regions[k].prim.kind == PLANE:
+                    continue
+                # the region's facets, in pieces of one pattern: joined
+                # across every side that isn't a change of pattern
+                seen, comps = set(), []
+                for i0 in F:
+                    if i0 in seen:
+                        continue
+                    comp, stack = [i0], [i0]
+                    seen.add(i0)
+                    while stack:
+                        i = stack.pop()
+                        a = pat(i)
+                        for j in topo.adj[i]:
+                            if j in F and j not in seen and (a is None or pat(j) is None or not unlike(a, pat(j))):
+                                seen.add(j)
+                                comp.append(j)
+                                stack.append(j)
+                    comps.append(comp)
+                if len(comps) < 2:
+                    continue
+                comps.sort(key=len, reverse=True)
+                for comp in comps[1:]:
+                    if 4 * len(comp) > len(F) or any(pat(i) is None for i in comp):
+                        continue
+                    cs = set(comp)
+                    votes = Counter()
+                    for i in comp:
+                        for j in topo.adj[i]:
+                            kj = owner.get(j)
+                            if kj is not None and kj != k and pat(j) is not None and like(pat(i), pat(j)):
+                                votes[kj] += 1
+                    if not votes:
+                        continue
+                    n_c += 1
+                    for kb, _n in votes.most_common(2):
+                        pb = newp.get(kb, regions[kb].prim)
+                        # (into a patch only: between two quadrics the
+                        # facets on the border are each one's by right of
+                        # fit - moved by pattern, test13 lost two circles
+                        # and test16 seven, with 23 faces more)
+                        if pb is None or pb.kind != FREE:
+                            continue
+                        try:
+                            ok_ = all(self.within(pb, i) and abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) >= 0.94 for i in comp)
+                        except Exception:
+                            ok_ = False
+                        # (a patch was fitted without them: a few tolerances
+                        # off it and turned as it is, it is fitted again with
+                        # them - as a rim band is - and takes them if it then
+                        # holds the lot)
+                        if not ok_ and pb.kind == FREE and len(sets[kb]) + len(comp) <= 1200:
+                            try:
+                                near_ = all(float(np.abs(pb.dist(topo.verts[i])).max()) <= 4.0 * self.tol_fit and abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) >= 0.94 for i in comp)
+                            except Exception:
+                                near_ = False
+                            if near_:
+                                union = sorted(sets[kb] | cs)
+                                a_ = filler.whole_args(union)
+                                ctol = 2.0 * float(regions[kb].sag) + 2.0 * self.tol_fit
+                                try:
+                                    pr = fit_fill(*a_, ctol, chords="rim") if a_ is not None else None
+                                except Exception:
+                                    pr = None
+                                if pr is not None and filler.whole_ok(union, pr, ctol, cap):
+                                    pr.fill = None
+                                    pr.merged = (ctol, cap)
+                                    newp[kb] = pr
+                                    ok_ = True
+                                    n_fit += 1
+                        if not ok_:
+                            n_no += 1
+                            if self.verbose_dbg:
+                                try:
+                                    c_ = np.mean([topo.cents[i] for i in comp], axis=0)
+                                    d_ = max(float(np.abs(pb.dist(topo.verts[i])).max()) for i in comp)
+                                    t_ = max(self.face_tol(pb, i) for i in comp)
+                                    n_ = min(abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) for i in comp)
+                                    Log.debug(f"    piece of {len(comp)} facets at [{c_[0]:.2f} {c_[1]:.2f} {c_[2]:.2f}] in {regions[k].label()} not held by {regions[kb].label()}: off {d_:.1e} (may {t_:.1e}), normals {n_:.3f}")
+                                except Exception:
+                                    pass
+                            continue
+                        rest = sets[k] - cs
+                        if len(rest) < 4 or len(largest_component(sorted(rest), topo.adj)) != len(rest):
+                            break
+                        sets[k] = rest
+                        F = rest
+                        sets[kb] |= cs
+                        for i in comp:
+                            owner[i] = kb
+                        changed.update((k, kb))
+                        done += len(comp)
+                        break
+            n_m += done
+            if not done:
+                break
+        if n_c:
+            Log.debug(f"Pattern borders: {n_c} pieces of another pattern at the borders, {n_no} not held by the surface across, {n_fit} patches fitted again with theirs")
+        for k in changed:
+            R = regions[k]
+            try:
+                R2 = describe_region(newp.get(k, R.prim), topo, sorted(sets[k]))
+            except Exception:
+                continue
+            for a_ in ("note", "repeated", "fallback", "forced"):
+                if hasattr(R, a_):
+                    setattr(R2, a_, getattr(R, a_))
+            if k in newp:
+                R2.fallback = [R]
+            regions[k] = R2
+        if n_m:
+            Log.debug(f"Pattern borders: {n_m} facets moved to the region whose pattern they are in, {len(changed)} regions changed")
         return regions
 
     def _rim_bands(self, regions):
