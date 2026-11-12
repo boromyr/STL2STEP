@@ -1095,10 +1095,29 @@ def face_area(face) -> float:
     return abs(float(g.Mass()))
 
 
+_VOL_MEMO: list = []  # [(shape, volume)], most recent last
+
+
 def shape_volume(shape) -> float:
+    # ⚠️ THE SAME SOLID WAS MEASURED OVER AND OVER: a phase's volume after
+    # is the next one's before, the Engine's vol0, the arcs' v0 - on
+    # test15 four to five seconds each, 39 s in all. The last few results
+    # are kept, matched by IsEqual (same TShape, location and orientation).
+    # (What is edited in place - vertex tolerances, pcurves added to new
+    # edges - doesn't move the integral; a real change goes through
+    # ReShape, which makes a new solid. The test: the same STEP.)
+    for s, v in _VOL_MEMO:
+        try:
+            if s.IsEqual(shape):
+                return v
+        except Exception:
+            pass
     g = GProp_GProps()
     gp_Volume(shape, g)
-    return float(g.Mass())
+    v = float(g.Mass())
+    _VOL_MEMO.append((shape, v))
+    del _VOL_MEMO[:-6]
+    return v
 
 
 def edge_length(edge) -> float:
@@ -4317,6 +4336,8 @@ class FreeForm:
     def height(self, u, v) -> np.ndarray:
         u = np.atleast_1d(np.asarray(u, float))
         v = np.atleast_1d(np.asarray(v, float))
+        if _ff_height_nb is not None:
+            return _ff_height_nb(u, v, self.poles, self.ku, self.kv, _BS_DEG)
         Bu = _bs_basis(u, self.ku, self.poles.shape[0])
         Bv = _bs_basis(v, self.kv, self.poles.shape[1])
         return np.einsum("ni,ij,nj->n", Bu, self.poles, Bv)
@@ -5146,6 +5167,186 @@ def _occ_knots(kk: np.ndarray):
     return ka, ma
 
 
+# ⚠️ SplineSurf's projection IS COMPILED (numba) WHEN AVAILABLE. test15's
+# tube_patches spent 13 s of serial time in uv(): Newton steps on a few
+# thousand points, each one a dozen small numpy calls (local basis,
+# einsum) - interpreter overhead. Same steps here (same local basis, same
+# lockstep stopping rule on the largest step of all the points), point by
+# point: the parameters agree to the last few bits. REFIT_NO_NUMBA=1 or no
+# numba: the numpy code runs.
+_ss_uv_nb = _ss_eval_nb = _ff_height_nb = None
+if not os.environ.get("REFIT_NO_NUMBA"):
+    try:
+        import numba as _nb
+
+        @_nb.njit(cache=True)
+        def _nb_span(t, kv, n, deg):
+            lo, hi = 0, kv.shape[0]
+            while lo < hi:  # searchsorted(side="right")
+                mid = (lo + hi) // 2
+                if kv[mid] <= t:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            k = lo - 1
+            if k < deg:
+                k = deg
+            if k > n - 1:
+                k = n - 1
+            return k
+
+        @_nb.njit(cache=True)
+        def _nb_tri(t, kv, k, p, B, left, right):
+            for j in range(p + 1):
+                B[j] = 0.0
+                left[j] = 0.0
+                right[j] = 0.0
+            B[0] = 1.0
+            for j in range(1, p + 1):
+                left[j] = t - kv[k + 1 - j]
+                right[j] = kv[k + j] - t
+                saved = 0.0
+                for r in range(j):
+                    den = right[r + 1] + left[j - r]
+                    tmp = B[r] / den if den != 0 else 0.0
+                    B[r] = saved + right[r + 1] * tmp
+                    saved = left[j - r] * tmp
+                B[j] = saved
+
+        @_nb.njit(cache=True)
+        def _nb_local(t, kv, n, deg, B, dB, L, left, right):
+            if t < kv[0]:
+                t = kv[0]
+            if t > kv[-1]:
+                t = kv[-1]
+            k = _nb_span(t, kv, n, deg)
+            _nb_tri(t, kv, k, deg, B, left, right)
+            _nb_tri(t, kv, k, deg - 1, L, left, right)
+            for r in range(deg + 1):
+                i = k - deg + r
+                val = 0.0
+                if r >= 1:
+                    d1 = kv[i + deg] - kv[i]
+                    if d1 > 0:
+                        val += L[r - 1] / d1
+                if r <= deg - 1:
+                    d2 = kv[i + deg + 1] - kv[i + 1]
+                    if d2 > 0:
+                        val -= L[r] / d2
+                dB[r] = deg * val
+            return k - deg
+
+        @_nb.njit(cache=True)
+        def _nb_point(u, v, poles, ku, kv, deg, Bu, dBu, Bv, dBv, L, left, right, S, Su, Sv):
+            nu, nv = poles.shape[0], poles.shape[1]
+            iu = _nb_local(u, ku, nu, deg, Bu, dBu, L, left, right)
+            iv = _nb_local(v, kv, nv, deg, Bv, dBv, L, left, right)
+            for c in range(3):
+                s = 0.0
+                su = 0.0
+                sv = 0.0
+                for a in range(deg + 1):
+                    ra = 0.0
+                    rv = 0.0
+                    for b in range(deg + 1):
+                        p = poles[iu + a, iv + b, c]
+                        ra += p * Bv[b]
+                        rv += p * dBv[b]
+                    s += Bu[a] * ra
+                    su += dBu[a] * ra
+                    sv += Bu[a] * rv
+                S[c] = s
+                Su[c] = su
+                Sv[c] = sv
+
+        @_nb.njit(cache=True)
+        def _ss_eval_nb(u, v, poles, ku, kv, deg):
+            m = u.shape[0]
+            S = np.empty((m, 3))
+            Su = np.empty((m, 3))
+            Sv = np.empty((m, 3))
+            Bu = np.empty(deg + 1)
+            dBu = np.empty(deg + 1)
+            Bv = np.empty(deg + 1)
+            dBv = np.empty(deg + 1)
+            L = np.empty(deg + 1)
+            left = np.empty(deg + 1)
+            right = np.empty(deg + 1)
+            for q in range(m):
+                _nb_point(u[q], v[q], poles, ku, kv, deg, Bu, dBu, Bv, dBv, L, left, right, S[q], Su[q], Sv[q])
+            return S, Su, Sv
+
+        @_nb.njit(cache=True)
+        def _ss_uv_nb(P, u, v, poles, ku, kv, deg, iters):
+            m = P.shape[0]
+            Bu = np.empty(deg + 1)
+            dBu = np.empty(deg + 1)
+            Bv = np.empty(deg + 1)
+            dBv = np.empty(deg + 1)
+            L = np.empty(deg + 1)
+            left = np.empty(deg + 1)
+            right = np.empty(deg + 1)
+            S = np.empty(3)
+            Su = np.empty(3)
+            Sv = np.empty(3)
+            u0, u1, v0, v1 = ku[0], ku[-1], kv[0], kv[-1]
+            for _ in range(iters):
+                big = 0.0
+                for q in range(m):
+                    _nb_point(u[q], v[q], poles, ku, kv, deg, Bu, dBu, Bv, dBv, L, left, right, S, Su, Sv)
+                    a11 = a12 = a22 = b1 = b2 = 0.0
+                    for c in range(3):
+                        r = P[q, c] - S[c]
+                        a11 += Su[c] * Su[c]
+                        a12 += Su[c] * Sv[c]
+                        a22 += Sv[c] * Sv[c]
+                        b1 += Su[c] * r
+                        b2 += Sv[c] * r
+                    det = a11 * a22 - a12 * a12
+                    if abs(det) < 1e-300:
+                        det = 1e-300
+                    du = (a22 * b1 - a12 * b2) / det
+                    dv = (a11 * b2 - a12 * b1) / det
+                    if abs(du) > big:
+                        big = abs(du)
+                    if abs(dv) > big:
+                        big = abs(dv)
+                    uu = u[q] + du
+                    vv = v[q] + dv
+                    u[q] = u0 if uu < u0 else (u1 if uu > u1 else uu)
+                    v[q] = v0 if vv < v0 else (v1 if vv > v1 else vv)
+                if big < 1e-13:
+                    break
+            return u, v
+        @_nb.njit(cache=True)
+        def _ff_height_nb(u, v, poles, ku, kv, deg):
+            # FreeForm.height: the same Cox-de Boor values, only the deg+1
+            # that don't vanish (pcurves on height fields: 9 s on test15)
+            m = u.shape[0]
+            nu, nv = poles.shape[0], poles.shape[1]
+            out = np.empty(m)
+            Bu = np.empty(deg + 1)
+            dBu = np.empty(deg + 1)
+            Bv = np.empty(deg + 1)
+            dBv = np.empty(deg + 1)
+            L = np.empty(deg + 1)
+            left = np.empty(deg + 1)
+            right = np.empty(deg + 1)
+            for q in range(m):
+                iu = _nb_local(u[q], ku, nu, deg, Bu, dBu, L, left, right)
+                iv = _nb_local(v[q], kv, nv, deg, Bv, dBv, L, left, right)
+                s = 0.0
+                for a in range(deg + 1):
+                    r = 0.0
+                    for b in range(deg + 1):
+                        r += poles[iu + a, iv + b] * Bv[b]
+                    s += Bu[a] * r
+                out[q] = s
+            return out
+    except Exception:  # numba missing or broken: numpy
+        _ss_uv_nb = _ss_eval_nb = _ff_height_nb = None
+
+
 class SplineSurf:
     """
     Cubic tensor B-spline with 3D poles (nu, nv, 3) and clamped knots: a
@@ -5176,6 +5377,9 @@ class SplineSurf:
         v = np.atleast_1d(np.asarray(v, float))
         nu, nv = self.poles.shape[:2]
         if getattr(self, "local", False):
+            if _ss_eval_nb is not None:
+                S, Su, Sv = _ss_eval_nb(u, v, self.poles, self.ku, self.kv, _BS_DEG)
+                return (S, Su, Sv) if der else S
             iu, Bu, dBu = _bs_local_d1(u, self.ku, nu)
             iv, Bv, dBv = _bs_local_d1(v, self.kv, nv)
             r_ = np.arange(_BS_DEG + 1)
@@ -5202,6 +5406,8 @@ class SplineSurf:
             self._tree = cKDTree(self._gp)
         _, k = self._tree.query(P)
         u, v = self._gu[k].copy(), self._gv[k].copy()
+        if getattr(self, "local", False) and _ss_uv_nb is not None:
+            return _ss_uv_nb(np.ascontiguousarray(P), u, v, self.poles, self.ku, self.kv, _BS_DEG, iters)
         for _ in range(iters):
             S, Su, Sv = self._eval(u, v)
             r = P - S
@@ -9685,31 +9891,24 @@ class Segmenter:
     def _seed_loop_parallel(self, order, tries, pool) -> Tuple[list, int]:
         """
         The SAME search as _seed_loop, on several processes, with the SAME
-        result.
-
-        ⚠️ THE RESULT USED TO DEPEND ON -j. Each process ran its own greedy
-        pass on a slice of the seeds, against a snapshot of the claimed
-        facets, and the regions were reconciled afterwards: the growth order
-        changed, and with it the part. test8 came out with 1,150 faces with
-        eight processes and 1,083 with one; test9 1,901 and 1,942. Since the
-        default is 22 processes, the suite (-j 1) wasn't even measuring what
-        the user gets.
-        Now it's speculative execution with an in-order replay. The
-        processes compute a batch of the next seeds, each one as a pure
-        function of the same snapshot, recording which facets the search
-        went through (_use). The main process then replays the batch in the
-        sequential order, exactly as _seed_loop would: a seed already
-        claimed or dead is skipped, and a result is accepted only if none of
-        the facets it used has been claimed since the snapshot - otherwise
-        the replay stops there and the next batch starts from that seed,
-        with the updated snapshot (so the first seed of a batch is always
-        valid, and the loop always moves forward). Same decisions, in the
-        same order: the same regions as -j 1.
+        result: speculative execution with an in-order replay. PIPELINED:
+        the workers never wait for a whole batch to be replayed. Every seed
+        goes out on its own, with the claimed facets as they are at that
+        moment and a version number (how many regions were claimed so far);
+        the replay takes the results in the sequential order, and a result
+        is good if none of the facets its search went through (_use) was
+        claimed after its version - the search is a pure function of those
+        facets. Meanwhile the next seeds are already being computed. A
+        stale one is tried again here; three stale in a row and everything
+        computed on an older version is sent out again on the current one.
+        Same decisions, in the same order: the same regions as -j 1.
         """
         import pickle
         import tempfile
+        from concurrent.futures import FIRST_COMPLETED, wait
 
         topo = self.topo
+        nF = len(self.taken)
         found: List[Tuple["Prim", List[int]]] = []
         tried = 0
         fd, path = tempfile.mkstemp(suffix=".refit.pkl")
@@ -9718,98 +9917,129 @@ class Segmenter:
         key = os.path.basename(path)
         pending = [s for s in order if topo.planar[s]]
         n = max(1, _POOL_N or self.threads)
-        K = 2 * n
-        pos = 0
-        n_batch = n_stop = n_spec = n_redo = 0
-        t_pool = t_redo = 0.0
+        INF = 1 << 60
+        claimed_at = np.full(nF, INF, dtype=np.int64)
+        tk = np.fromiter((1 if t else 0 for t in self.taken), dtype=np.uint8, count=nF)
+        st = dict(ver=0, snap=None, snap_v=-1, sub=0, pos=0, L=4 * n, n_task=0)
+
+        def packed():
+            if st["snap_v"] != st["ver"]:
+                st["snap"] = (np.packbits(tk).tobytes(), nF)
+                st["snap_v"] = st["ver"]
+            return st["snap"]
+
+        res = {}  # seed -> (version, prim, keep, dead, used)
+        fut_of = {}  # future -> seed
+        inflight = {}  # seed -> future
+
+        def send(s):
+            f = pool.submit(_worker_seeds_v, (key, path, packed(), [s], st["ver"]))
+            fut_of[f] = s
+            inflight[s] = f
+            st["n_task"] += 1
+
+        def topup():
+            ahead = len(inflight) + len(res)
+            while st["sub"] < len(pending) and ahead < st["L"]:
+                s = pending[st["sub"]]
+                st["sub"] += 1
+                if self.taken[s] or tries[s] >= 2 or s in inflight or s in res:
+                    continue
+                send(s)
+                ahead += 1
+
+        def collect(f):
+            s = fut_of.pop(f)
+            if inflight.get(s) is f:
+                del inflight[s]
+            if f.cancelled():
+                return
+            for r in f.result():
+                res[r[0]] = r[1:]
+
+        n_flush = n_redo = n_stale = 0
+        t_wait = t_redo = 0.0
+        streak = ok_run = 0
         try:
-            while pos < len(pending):
-                batch, j = [], pos
-                while j < len(pending) and len(batch) < K:
-                    s = pending[j]
-                    if not self.taken[s] and tries[s] < 2:
-                        batch.append(s)
-                    j += 1
-                if not batch:
-                    break
-                if len(batch) < 4:
-                    # the tail: not worth a round trip
-                    f2, t2 = self._seed_loop(pending[pos:], tries)
-                    return found + f2, tried + t2
-                taken_b = bytes(1 if t else 0 for t in self.taken)
-                n_batch += 1
-                n_spec += len(batch)
-                m = min(n, len(batch))
-                tasks = [(key, path, taken_b, batch[q::m]) for q in range(m)]
-                try:
-                    res = {}
+            while st["pos"] < len(pending):
+                pos = st["pos"]
+                s = pending[pos]
+                if self.taken[s] or tries[s] >= 2:
+                    res.pop(s, None)
+                    st["pos"] = pos + 1
+                    continue
+                if st["sub"] <= pos:
+                    st["sub"] = pos
+                topup()
+                if s not in res and s not in inflight:
+                    send(s)
+                t_ = time.perf_counter()
+                while s not in res:
+                    done, _ = wait(list(fut_of), return_when=FIRST_COMPLETED)
+                    for f in done:
+                        collect(f)
+                t_wait += time.perf_counter() - t_
+                v, prim, keep, dead, used = res.pop(s)
+                tried += 1
+                stale = False
+                if v < st["ver"] and len(used):
+                    u = claimed_at[np.asarray(used, dtype=np.int64)]
+                    stale = bool(((u > v) & (u < INF)).any())
+                if stale:
+                    n_stale += 1
+                    streak += 1
+                    ok_run = 0
+                    if streak >= 3:
+                        # a run of stale ones: everything computed on an
+                        # older version goes out again on the current one
+                        n_flush += 1
+                        streak = 0
+                        st["L"] = max(n, st["L"] // 2)
+                        for q in [q for q, r in res.items() if r[0] < st["ver"]]:
+                            del res[q]
+                        for f in list(fut_of):
+                            if f.cancel():
+                                q = fut_of.pop(f)
+                                if inflight.get(q) is f:
+                                    del inflight[q]
+                        st["sub"] = pos + 1
+                    n_redo += 1
                     t_ = time.perf_counter()
-                    for part in pool.map(_worker_seeds, tasks):
-                        for r in part:
-                            res[r[0]] = r
-                    t_pool += time.perf_counter() - t_
-                except Exception as ex:
-                    Log.warn(f"worker processes unavailable ({type(ex).__name__}: {ex}): continuing on a single core")
-                    f2, t2 = self._seed_loop(pending[pos:], tries)
-                    return found + f2, tried + t2
-                newly: set = set()
-                stop = None
-                n_local = 0
-                for s in batch:
-                    if self.taken[s] or tries[s] >= 2:
-                        continue  # the sequential loop would skip it too
-                    _, prim, keep, dead, used = res[s]
-                    if newly and not newly.isdisjoint(used):
-                        # computed on a state that no longer exists. ⚠️ NOT
-                        # THE WHOLE REST OF THE BATCH: this one seed is
-                        # tried again here, on the state as it is now -
-                        # exactly what _seed_loop does - and the replay goes
-                        # on with the others, each still checked against
-                        # everything claimed since the snapshot. Only past a
-                        # few of them is the batch cut (a whole run of seeds
-                        # gone stale: cheaper to send it out again). With
-                        # twenty-two processes the batches grow to 350 seeds
-                        # and most of each was thrown away at the first
-                        # conflict.
-                        if n_local >= 3:
-                            stop = s
-                            break
-                        n_local += 1
-                        n_redo += 1
-                        tried += 1
-                        t_ = time.perf_counter()
-                        res_, _ = self.try_seed(s)
-                        t_redo += time.perf_counter() - t_
-                        if res_ is None:
-                            tries[s] += 2
-                            for i in self.last_dead:
-                                tries[i] = 2
-                            continue
-                        pk_, keep_ = res_
-                        for i in keep_:
-                            self.taken[i] = True
-                        newly.update(keep_)
-                        found.append((pk_, keep_))
-                        continue
-                    tried += 1
-                    if prim is None:
-                        tries[s] += 2
-                        for i in dead:
-                            tries[i] = 2
-                        continue
+                    r_, _ = self.try_seed(s)
+                    t_redo += time.perf_counter() - t_
+                    if r_ is None:
+                        prim, keep, dead = None, [], list(self.last_dead)
+                    else:
+                        prim, keep, dead = r_[0], r_[1], []
+                else:
+                    streak = 0
+                    ok_run += 1
+                    if ok_run >= 4 * n:
+                        ok_run = 0
+                        st["L"] = min(16 * n, 2 * st["L"])
+                if prim is None:
+                    tries[s] += 2
+                    for i in dead:
+                        tries[i] = 2
+                else:
+                    st["ver"] += 1
                     for i in keep:
                         self.taken[i] = True
-                    newly.update(keep)
+                    ki = np.asarray(keep, dtype=np.int64)
+                    tk[ki] = 1
+                    claimed_at[ki] = st["ver"]
                     found.append((prim, keep))
-                if stop is None:
-                    pos = j
-                    K = min(2 * K, 16 * n)
-                else:
-                    pos = pending.index(stop, pos)
-                    K = max(n, K // 2)
-                    n_stop += 1
+                st["pos"] = pos + 1
+        except Exception as ex:
+            Log.warn(f"worker processes unavailable ({type(ex).__name__}: {ex}): continuing on a single core")
+            for f in fut_of:
+                f.cancel()
+            f2, t2 = self._seed_loop(pending[st["pos"]:], tries)
+            return found + f2, tried + t2
         finally:
-            Log.debug(f"Parallel seeds: {n_batch} batches, {n_stop} replays cut short, {n_redo} seeds tried again here, {n_spec} seeds computed for {tried} tried; {t_pool:.1f}s waiting on the workers, {t_redo:.1f}s on the seeds tried again")
+            for f in fut_of:
+                f.cancel()
+            Log.debug(f"Parallel seeds (pipelined): {st['n_task']} seeds sent out for {tried} tried, {n_stale} stale ({n_flush} flushes), {n_redo} tried again here; {t_wait:.1f}s waiting on the workers, {t_redo:.1f}s on the seeds tried again")
             try:
                 os.unlink(path)
             except OSError:
@@ -15331,7 +15561,7 @@ def _worker_seeds(task):
         _W_SEG = Segmenter(lite, **kw)
         _W_KEY = key
     seg = _W_SEG
-    seg.taken = [b != 0 for b in taken_b]
+    seg.taken = (taken_b != 0).tolist() if isinstance(taken_b, np.ndarray) else [b != 0 for b in taken_b]
     out = []
     for s in seeds:
         seg._used = set()
@@ -15347,6 +15577,15 @@ def _worker_seeds(task):
         else:
             out.append((s, res[0], res[1], [], used))
     return out
+
+
+def _worker_seeds_v(task):
+    """_worker_seeds with the claimed facets bit-packed and a version
+    number carried along (see Segmenter._seed_loop_parallel)."""
+    key, path, (pk, nF), seeds, ver = task
+    tb = np.unpackbits(np.frombuffer(pk, dtype=np.uint8), count=nF)
+    out = _worker_seeds((key, path, tb, seeds))
+    return [(r[0], ver) + tuple(r[1:]) for r in out]
 
 
 def _w_segmenter(key, path) -> "Segmenter":
@@ -15468,7 +15707,7 @@ def segment_curved(
     only_cyl: bool = False,
     threads: int = 1,
 ) -> List[Region]:
-    return Segmenter(
+    seg = Segmenter(
         topo,
         tol_fit,
         tol_grow,
@@ -15483,7 +15722,110 @@ def segment_curved(
         allow_free=allow_free,
         only_cyl=only_cyl,
         threads=threads,
-    ).run()
+    )
+    path = _seg_cache_path(seg)
+    if path is not None:
+        regs = _seg_cache_load(path)
+        if regs is not None:
+            Log.debug(f"Segmentation from the cache: {len(regs)} regions ({os.path.basename(path)})")
+            return regs
+    regs = seg.run()
+    if path is not None:
+        _seg_cache_save(path, regs)
+    return regs
+
+
+# ⚠️ THE SEGMENTATION IS CACHED BETWEEN RUNS. It is a pure function of the
+# facets it is handed, of the Segmenter's settings and of this file (the
+# result doesn't depend on -j): the key is a hash of exactly those - the
+# TopoLite the workers get, plus the edge tables, the settings, the
+# module's simple upper-case globals (MESH_DIGITS, HINTS...) and the
+# source. Anything different is another key: a stale entry can't be read.
+# Converting the same mesh again with other output options (-o, --pcurves,
+# --report, -j) skips the 100 s of test15's segmentation. REFIT_CACHE=0
+# turns it off, REFIT_CACHE=<dir> moves it (default: the temp folder).
+# Entries older than 30 days are dropped when a new one is written.
+_CODE_HASH = None
+
+
+def _seg_cache_dir() -> Optional[str]:
+    v = os.environ.get("REFIT_CACHE", "")
+    if v == "0":
+        return None
+    if v:
+        return v
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), "refit-cache")
+
+
+def _seg_cache_path(seg) -> Optional[str]:
+    global _CODE_HASH
+    d = _seg_cache_dir()
+    if d is None:
+        return None
+    try:
+        import hashlib
+        import pickle
+
+        if _CODE_HASH is None:
+            with open(os.path.abspath(__file__), "rb") as fh:
+                _CODE_HASH = hashlib.sha256(fh.read()).hexdigest()
+        topo = seg.topo
+        h = hashlib.sha256()
+        h.update(_CODE_HASH.encode())
+        h.update(pickle.dumps(TopoLite(topo), protocol=pickle.HIGHEST_PROTOCOL))
+        for name in ("f_edges", "e_faces", "e_verts"):
+            x = getattr(topo, name, None)
+            try:
+                h.update(pickle.dumps([x[i] for i in range(len(x))], protocol=pickle.HIGHEST_PROTOCOL))
+            except Exception:
+                h.update(repr(type(x)).encode())
+        h.update(repr(sorted(seg._kw.items())).encode())
+        g = globals()
+        simple = (int, float, str, bool, type(None), tuple, list, dict, frozenset)
+        # (the private ones are caches - _VOL_MEMO, _ALIVE - and anything
+        # printed with a memory address would change the key at every run)
+        gl = sorted((k, repr(g[k])) for k in g if k.isupper() and not k.startswith("_") and isinstance(g[k], simple))
+        h.update(repr([kv for kv in gl if " at 0x" not in kv[1]]).encode())
+        return os.path.join(d, h.hexdigest()[:32] + ".seg.pkl")
+    except Exception as ex:
+        Log.debug(f"segmentation cache unavailable: {type(ex).__name__}: {ex}")
+        return None
+
+
+def _seg_cache_load(path: str):
+    import pickle
+
+    try:
+        with open(path, "rb") as fh:
+            regs = pickle.load(fh)
+        os.utime(path)
+        return regs
+    except Exception:
+        return None
+
+
+def _seg_cache_save(path: str, regs) -> None:
+    import pickle
+
+    try:
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        tmp = path + f".{os.getpid()}.tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(regs, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+        now = time.time()
+        for fn in os.listdir(d):
+            p = os.path.join(d, fn)
+            try:
+                if fn.endswith(".seg.pkl") and now - os.path.getmtime(p) > 30 * 86400:
+                    os.unlink(p)
+            except OSError:
+                pass
+    except Exception as ex:
+        Log.debug(f"segmentation cache not written: {type(ex).__name__}: {ex}")
 
 
 # =============================================================================
@@ -18407,13 +18749,24 @@ class _ArcSurf:
         self.periodic_u = bool(surf.IsUPeriodic())
         self.periodic_v = bool(surf.IsVPeriodic())
         self._pr = _m("GeomAPI").GeomAPI_ProjectPointOnSurf()
+        self._ready = False
 
     def uv(self, P):
+        # ⚠️ INITIALIZED ONCE, NOT PER POINT. Init(P, S) rebuilds the
+        # extrema grid of the whole surface for every point: on test15's
+        # arm (B-spline faces of a couple of hundred poles) the pcurves of
+        # the arcs spent 27 s of serial time there. Init(S, bounds) once and
+        # Perform(P) per point is the same projection (same bounds, same
+        # algorithm; the grid search starts from the last solution, so the
+        # parameters can differ in the last bits).
         P = np.atleast_2d(P)
         u = np.empty(len(P))
         v = np.empty(len(P))
+        if not self._ready:
+            self._pr.Init(self.s, *self.s.Bounds())
+            self._ready = True
         for i, q in enumerate(P):
-            self._pr.Init(_mk_pnt(q), self.s)
+            self._pr.Perform(_mk_pnt(q))
             if self._pr.NbPoints() < 1:
                 u[i] = v[i] = np.nan
             else:
