@@ -277,7 +277,12 @@ are reported but left in.
   `test11`'s exact r 3 cylinder and a 4-facet r 3.35 piece beside it made a patch and three
   ellipses went) - whose vertices come in rows (the widest gap from a facet's
   inner point to the nearest vertex six times the vertices' spacing or more: 6 to 14 on those
-  rounds, 1.5 for the median region). Everywhere, it held unions the interpolation had refused for
+  rounds, 1.5 for the median region). Such unions come last, after every merge the interpolation
+  holds: tried from the first step, they took pieces that were no round's - `test17`'s fans under
+  the slots (cylinders r 10 and r 22-24 of three to thirteen facets on the r 21.5 wall) and the
+  r 2 slices at a slot's end before its U round had gathered them - and each became a B-spline of
+  its own: the U in two faces, the slot's lower contour in a dozen slivers (348 faces on 3/11, 380
+  after; 284 with the order restored, deviation unchanged, the 13-part suite identical). Everywhere, it held unions the interpolation had refused for
   good reason - a round against a flat, the curvature jumping across - and exact pieces went
   (`test8`: 452 → 384 faces, but 38 more polylines, 33 circles and 7 ellipses fewer; `test6` 4 mm³
   of volume). And the rows no farther apart than sixteen spacings: the gap between a round's rows
@@ -543,8 +548,8 @@ are reported but left in.
   facets at an arch are 0.3-0.6 mm; at half the side the pair of slivers where an arch's slope meets
   its knee came apart and stayed two grey triangles, at 0.35 it goes) - loose, or the part of a
   small region in the band if the rest holds together (taken only whole, a sliver beside a window
-  stayed between the wall and a torus r 11 of four fan facets and four of the side round's), two
-  facets or more. The
+  stayed between the wall and a torus r 11 of four fan facets and four of the side round's), or of
+  a patch fitted on the facets as slices of a round (under 40 facets), two facets or more. The
   wall then met the flange along the cutters' points, between the polygon and the circle: the exact
   circle stood off them and 105 segments stayed polylines. Last of all, on three segments or more,
   an exact curve may stand off the vertices as far as the edges it replaces stand off the faces

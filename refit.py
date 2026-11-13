@@ -1089,10 +1089,29 @@ def face_vertices(face) -> np.ndarray:
     return np.array([vpos(v) for v in explore(face, TopAbs_VERTEX)], dtype=float)
 
 
+# ⚠️ AN AREA IS MEASURED ONCE PER FACE. Every Topo has its own lazy areas,
+# and a new Topo is made for every pass of the arcs, every phase, the
+# segmentation's TopoLite: the same faces measured again - on test15 a
+# third of the 86,000 areas, 7 s of the arm's B-spline integrations (all
+# 50,000 repeats on test15 and test18 gave the same bits). Matched by
+# IsSame (same TShape and location: the area ignores the orientation); a
+# face edited in place keeps its integral (the edges' tolerances; a new
+# edge's pcurves go on the new face). Emptied past 200,000 faces.
+_AREA_MEMO: dict = {}  # hash(face) -> [(face, area)]
+
+
 def face_area(face) -> float:
+    h = hash(face)
+    for f_, a_ in _AREA_MEMO.get(h, ()):
+        if f_.IsSame(face):
+            return a_
     g = GProp_GProps()
     gp_Surface(face, g)
-    return abs(float(g.Mass()))
+    a = abs(float(g.Mass()))
+    if len(_AREA_MEMO) > 200000:
+        _AREA_MEMO.clear()
+    _AREA_MEMO.setdefault(h, []).append((face, a))
+    return a
 
 
 _VOL_MEMO: list = []  # [(shape, volume)], most recent last
@@ -1255,6 +1274,21 @@ def is_valid(shape) -> bool:
         return bool(BRepCheck_Analyzer(shape).IsValid())
     except Exception:
         return False
+
+
+# ⚠️ A SOLID JUST CHECKED ISN'T CHECKED AGAIN. run_phase ends by checking
+# its result whole, and the Phase A that follows began by checking the same
+# solid again (4.5 s of test15, the arm's B-splines). The verdict is handed
+# over with the very object (identity, not IsEqual: a solid edited in place
+# - tolerances, pcurves - is the same TShape and could check differently)
+# and taken once; nothing between the two touches it (main only passes it
+# on).
+_CHECKED_VALID: list = [None]
+
+
+def _valid_handed_over(shape) -> bool:
+    s, _CHECKED_VALID[0] = _CHECKED_VALID[0], None
+    return s is not None and s is shape
 
 
 def _face_groups(ids, adj) -> List[set]:
@@ -2985,78 +3019,15 @@ def texture_barrier(V, fv, nrm, areas, e_faces, size_cut: float = 1.5, ang_min_d
     siz = np.array([face_scale(V, idx) for idx in fv])
     N = np.array([n if n is not None else np.zeros(3) for n in nrm])
     cmin = math.cos(math.radians(ang_min_deg))
-    # ⚠️ ...AND A TANGENT EDGE BETWEEN TWO CURVED FACES CAN BE FLAT. Where a
-    # blend leaves a cylinder tangent, the first triangles of the blend's
-    # grid lie in the plane of the cylinder's strip beside them - no angle
-    # at all - and were merged with it: one polygon, half strip and half
-    # grid, that the cylinder then owned whole, its border with the blend
-    # notched by them (test17's window blends, three triangles each). Flat
-    # together, but not of one face: a strip (four times longer than wide,
-    # with a neighbour it turns from by half a degree to thirty: a chord of
-    # a curved face) and a facet that is not a strip at all,
-    # that turns from a neighbour like itself ACROSS the strip's length:
-    # a piece of the same strip, cut short by something, turns from its
-    # neighbours along it like the strip does (a rule without that left 14
-    # faces more on test17: strips in two halves).
-    elong = np.zeros(len(fv))
-    for i, idx in enumerate(fv):
-        if 3 <= len(idx) <= 4:
-            P = V[idx]
-            L = np.linalg.norm(np.roll(P, -1, axis=0) - P, axis=1)
-            if float(L.min()) > 0.0:
-                elong[i] = float(L.max() / L.min())
-        elif len(idx) > 4:
-            # (a few triangles of a grid already merged with each other:
-            # how long the polygon is for its width)
-            P = V[idx] - V[idx].mean(axis=0)
-            w = np.sqrt(np.maximum(np.linalg.eigvalsh(P.T @ P)[1:], 0.0))
-            if float(w[0]) > 0.0:
-                elong[i] = float(w[1] / w[0])
-    c_lo, c_hi, c_any = math.cos(math.radians(30.0)), math.cos(math.radians(0.5)), math.cos(math.radians(0.05))
-    chord = np.zeros(len(fv), dtype=bool)
-    nbr = defaultdict(list)
-    for fs in e_faces:
-        if len(fs) == 2:
-            c = abs(float(N[fs[0]] @ N[fs[1]]))
-            if c_lo < c < c_hi:
-                chord[fs[0]] = chord[fs[1]] = True
-            if c_lo < c < c_any:
-                nbr[fs[0]].append(fs[1])
-                nbr[fs[1]].append(fs[0])
-
-    def bent_across(o, s) -> bool:
-        P = V[fv[s]]
-        S = np.roll(P, -1, axis=0) - P
-        L = np.linalg.norm(S, axis=1)
-        d_s = S[int(np.argmax(L))] / float(L.max())
-        so = set(int(v) for v in fv[o])
-        for y in nbr[o]:
-            sh = [v for v in fv[y] if int(v) in so]
-            # (and of its own kind: the end of a strip turns from the face
-            # the strip ends on, and that is no grid it belongs to)
-            if y == s or len(sh) != 2 or not 0.0 < elong[y] < 2.5 or abs(math.log2(max(siz[o], 1e-12) / max(siz[y], 1e-12))) >= 0.75:
-                continue
-            d = V[sh[1]] - V[sh[0]]
-            n = float(np.linalg.norm(d))
-            if n > 0.0 and abs(float(d @ d_s)) / n < 0.9:
-                return True
-        return False
-
     for k, fs in enumerate(e_faces):
         if len(fs) != 2:
             continue
         a, b = fs
         if np.linalg.norm(N[a]) < 0.5 or np.linalg.norm(N[b]) < 0.5:
             continue
-        jump = abs(math.log2(max(siz[a], 1e-12) / max(siz[b], 1e-12))) > size_cut
+        if abs(math.log2(max(siz[a], 1e-12) / max(siz[b], 1e-12))) <= size_cut:
+            continue
         if abs(float(N[a] @ N[b])) < cmin:
-            if jump:
-                bar[k] = True
-            continue
-        if elong[a] <= 0.0 or elong[b] <= 0.0:
-            continue
-        s, o = (a, b) if elong[a] >= elong[b] else (b, a)
-        if elong[s] >= 4.0 and len(fv[s]) <= 4 and chord[s] and elong[o] < 2.5 and bent_across(o, s):
             bar[k] = True
     return bar
 
@@ -3535,7 +3506,7 @@ def phase_a(shape, lin_tol: Optional[float] = None, ang_tol_deg: float = 0.005, 
     before = shape_stats(shape)
     Log.info(f"Input    : {before['faces']:,} faces · {before['edges']:,} edges · {before['verts']:,} vertices · {before['solids']} solid")
     free0 = count_free_edges(shape)
-    base_ok = is_valid(shape)
+    base_ok = _valid_handed_over(shape) or is_valid(shape)
     originale = shape
     t0 = time.perf_counter()
     stato: Dict[str, object] = {}
@@ -5365,12 +5336,33 @@ class SplineSurf:
         # SurfParam reads a frame for FREE; only FreeForm's uv() uses it
         self.C = self.poles.reshape(-1, 3).mean(axis=0)
         self.X, self.Y, self.Z = np.eye(3)
+        self._grid()
+
+    def _grid(self):
+        nu, nv = self.poles.shape[:2]
         gu = np.linspace(self.ku[0], self.ku[-1], max(4 * nu, 24))
         gv = np.linspace(self.kv[0], self.kv[-1], max(6 * nv, 60))
         GU, GV = np.meshgrid(gu, gv, indexing="ij")
         self._gu, self._gv = GU.ravel(), GV.ravel()
         self._gp = self.point(self._gu, self._gv)
         self._tree = None
+
+    # ⚠️ PICKLED WITHOUT ITS PROJECTION GRID. The grid uv() starts from
+    # (tens of thousands of samples) and the KD-tree over it were 17 of the
+    # 28 MB of test15's segmentation in the cache - 70 MB an entry on
+    # test15 and test18, 700 MB of cache in a day - and went through the
+    # pipes of fit_fill's workers too. They are rebuilt from the poles and
+    # knots by the same calls as __init__ (nothing changes those after it):
+    # the same bits, in a few milliseconds.
+    def __getstate__(self):
+        d = dict(self.__dict__)
+        for k in ("_gu", "_gv", "_gp", "_tree"):
+            d.pop(k, None)
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        self._grid()
 
     def _eval(self, u, v, der: bool = True):
         u = np.atleast_1d(np.asarray(u, float))
@@ -7995,7 +7987,7 @@ class Topo:
 
     __slots__ = ("shape", "faces", "fmap", "nF", "verts", "norms", "areas", "cents", "nverts", "edges", "emap", "nE", "e_faces", "f_edges", "e_verts", "v_edges", "vmap", "nV", "vpos", "adj", "planar", "pverts", "_tol_v", "_cp_cache")
 
-    def __init__(self, shape, prev: Optional["Topo"] = None):
+    def __init__(self, shape, prev: Optional["Topo"] = None, chord_pairs: Optional[dict] = None):
         self.shape = shape
         fmap = TopTools_IndexedMapOfShape()
         te_MapShapes(shape, TopAbs_FACE, fmap)
@@ -8013,7 +8005,9 @@ class Topo:
         self.areas = _LazyAreas(self.faces)
         self.pverts = {}
         self._tol_v = None
-        self._cp_cache: Dict[int, List[Tuple[int, int]]] = {}
+        # (chord_pairs: those of another Topo of this very shape - the
+        # vertices are numbered alike, see run_phase)
+        self._cp_cache: Dict[int, List[Tuple[int, int]]] = dict(chord_pairs) if chord_pairs else {}
         fresh: Dict[int, list] = {}
         for i, f in enumerate(self.faces):
             # ⚠️ faces untouched by the last replacement are the same
@@ -8079,9 +8073,11 @@ class Topo:
         """The mesh's polyline at the chord's end a, coming from v: the
         edge of a that goes on straightest, as (turning angle in radians,
         unit direction), or None."""
+        # (sqrt(x.dot(x)): what np.linalg.norm does with a vector, the same
+        # bits without its checks - 350,000 calls on test16's Topo)
         pa = self.vpos[a]
         d = pa - self.vpos[v]
-        n = float(np.linalg.norm(d))
+        n = math.sqrt(float(d.dot(d)))
         if n <= 0.0:
             return None
         d /= n
@@ -8092,7 +8088,7 @@ class Topo:
             if w == v:
                 continue
             e = self.vpos[w] - pa
-            m = float(np.linalg.norm(e))
+            m = math.sqrt(float(e.dot(e)))
             if m <= 0.0:
                 continue
             e = e / m
@@ -8119,6 +8115,13 @@ class Topo:
         # (the very same numpy operations as before, to the last bit: a
         # vertex on a straight CAD edge sits at the float threshold, and the
         # same sums in another order moved test5's volume by 1e-3 mm3)
+        # ⚠️ ...BUT NOT THE SAME CALLS. np.cross and np.stack on three
+        # numbers were 13 s of test18's 17 s of Topo (call overhead): the
+        # cross product is written out as numpy's own cross does it (each
+        # product rounded, then the difference: no fused multiply-add in
+        # Python either), its norm is linalg.norm's own sqrt(x.dot(x)), the
+        # largest coordinate a max of the same nine numbers - the same bits.
+        av = [abs(x) for x in pv.tolist()]
         for qa in range(len(ends)):
             for qb in range(qa + 1, len(ends)):
                 a, b = ends[qa], ends[qb]
@@ -8127,10 +8130,15 @@ class Topo:
                 L2 = float(ab @ ab)
                 if L2 <= 0.0:
                     continue
-                t = float((pv - pb) @ ab) / L2
+                w = pv - pb
+                t = float(w @ ab) / L2
                 if not 0.0 < t < 1.0:
                     continue
-                if float(np.linalg.norm(np.cross(pv - pb, ab))) > 4.0 * coord_eps(float(np.abs(np.stack((pa, pb, pv))).max())) * math.sqrt(L2):
+                w0, w1, w2 = w.tolist()
+                b0, b1, b2 = ab.tolist()
+                c = np.array((w1 * b2 - w2 * b1, w2 * b0 - w0 * b2, w0 * b1 - w1 * b0))
+                m = max(max(abs(x) for x in pa.tolist()), max(abs(x) for x in pb.tolist()), max(av))
+                if math.sqrt(float(c.dot(c))) > 4.0 * coord_eps(m) * math.sqrt(L2):
                     continue
                 out.append((a, b))
         cache[v] = out
@@ -8213,8 +8221,9 @@ class Topo:
             # B-spline corner in 20 little cylinders, 49 faces -> 87).
             if hit is not None:
                 pa, pb = self.vpos[hit[0]], self.vpos[hit[1]]
-                L = float(np.linalg.norm(pa - pb))
-                t = float(np.linalg.norm(pv - pb)) / max(L, 1e-30)
+                d_, w_ = pa - pb, pv - pb
+                L = math.sqrt(float(d_.dot(d_)))
+                t = math.sqrt(float(w_.dot(w_))) / max(L, 1e-30)
                 oa, ob = self._onward(hit[0], v), self._onward(hit[1], v)
                 arc = oa is not None and ob is not None
                 if arc:
@@ -10932,7 +10941,6 @@ class Segmenter:
             regions = self._merge_free(regions, only=only)
         regions = self._small_rounds(regions)
         regions = self._rim_bands(regions)
-        regions = self._pattern_borders(regions)
         regions = self._close_free(regions)
         regions.sort(key=lambda R: -sum(topo.areas[i] for i in R.faces))
         Log.info(f"Seeds tried {tried:,} · curved regions found {len(regions)} · facets involved {sum(len(R.faces) for R in regions):,} / {nF:,}")
@@ -12146,125 +12154,143 @@ class Segmenter:
                     return False
             return any(regions[q].prim.kind != FREE for q in qs)
 
+        # ⚠️ SLICES OF A ROUND ONLY WHERE NOTHING ELSE HOLDS. Fitted on the
+        # facets from the first step (8/11), the union of two "slices" -
+        # quadrics a twenty-fifth apart in radius - took pieces that were no
+        # round's: on test17 the fans under the slots (long facets of the
+        # r 21.5 outer wall, which the seeds cut into cylinders r 10 and
+        # r 22-24 of 3-13 facets) and the r 2 slices at a slot's end, before
+        # the slot's U round had gathered them. Each became a B-spline of its
+        # own that nothing took back: the U in two faces, the slot's lower
+        # contour in a dozen slivers - 348 faces on 3/11, 380 after. So the
+        # merges go in two passes: the first without such unions (the U
+        # takes its slices, as before), the second with them, for what is
+        # left (test18's window rounds: no union without chords holds them).
+        # A wall's fan merged so is still the wall's (_close_walls: chords).
         prims = {}
         by_chords = set()  # (the groups a fit on the facets merged: logged)
         cos_s = math.cos(math.radians(15.0))
         tried, n_try = set(), 0
         budget = min(1500, 300 + 2 * len(cand))
-        for k in sorted(cand, key=lambda q: (-len(regions[q].faces), q)):
-            if k not in groups:
-                continue
-            while n_try < budget:
-                nb = Counter()
-                for i in groups[k]:
-                    for j in topo.adj[i]:
-                        q = owner.get(j)
-                        if q is None or q not in rep_of or j in groups[k]:
+        for pass_ in (0, 1):
+            for k in sorted(cand, key=lambda q: (-len(regions[q].faces), q)):
+                if k not in groups:
+                    continue
+                while n_try < budget:
+                    nb = Counter()
+                    for i in groups[k]:
+                        for j in topo.adj[i]:
+                            q = owner.get(j)
+                            if q is None or q not in rep_of or j in groups[k]:
+                                continue
+                            if float(topo.norms[i] @ topo.norms[j]) > cos_s:
+                                nb[rep_of[q]] += 1
+                    merged = False
+                    # ⚠️ THE STEP'S CANDIDATES FITTED ALL AT ONCE, TAKEN IN ORDER. A
+                    # merge is one B-spline fit of the union (fit_fill, 0.1-0.3 s),
+                    # and a step tries the group's neighbours one after the other
+                    # until one holds: on a closed section of test18's window, 766
+                    # fits, 618 that didn't hold, 160 s - a third of the whole
+                    # segmentation. Nothing a union reads (the groups, the facets
+                    # already absorbed) changes until a merge, which ends the step:
+                    # so every candidate's union is built first, the fits go to the
+                    # workers together (fit_fill is a pure function of its arrays),
+                    # and the results are read in the same order as before - the
+                    # first that holds is the merge, the fits after it are thrown
+                    # away unread (not "tried", not counted). Same merges as on one
+                    # core, at the time of the slowest fit up to the one that holds.
+                    todo = []
+                    for r, _ in sorted(nb.items(), key=lambda x: (-len(groups[x[0]]), x[0])):
+                        key = (frozenset(members[k]), frozenset(members[r]))
+                        if r == k or key in tried:
                             continue
-                        if float(topo.norms[i] @ topo.norms[j]) > cos_s:
-                            nb[rep_of[q]] += 1
-                merged = False
-                # ⚠️ THE STEP'S CANDIDATES FITTED ALL AT ONCE, TAKEN IN ORDER. A
-                # merge is one B-spline fit of the union (fit_fill, 0.1-0.3 s),
-                # and a step tries the group's neighbours one after the other
-                # until one holds: on a closed section of test18's window, 766
-                # fits, 618 that didn't hold, 160 s - a third of the whole
-                # segmentation. Nothing a union reads (the groups, the facets
-                # already absorbed) changes until a merge, which ends the step:
-                # so every candidate's union is built first, the fits go to the
-                # workers together (fit_fill is a pure function of its arrays),
-                # and the results are read in the same order as before - the
-                # first that holds is the merge, the fits after it are thrown
-                # away unread (not "tried", not counted). Same merges as on one
-                # core, at the time of the slowest fit up to the one that holds.
-                todo = []
-                for r, _ in sorted(nb.items(), key=lambda x: (-len(groups[x[0]]), x[0])):
-                    key = (frozenset(members[k]), frozenset(members[r]))
-                    if r == k or key in tried:
-                        continue
-                    if only is not None and not any(q in only for q in members[k] + members[r]):
-                        continue
-                    union = groups[k] | groups[r]
-                    union |= holes(union)
-                    # (late, the loose facets in its notches too - two sides
-                    # on it: a test17 window bottom and the strip along its
-                    # slot edge held at 44x23 with them, at no grid without)
-                    if only is not None:
-                        for _ in range(3):
-                            nt = {j for i in union for j in topo.adj[i] if j not in union and j not in owner and j not in absorbed
-                                  and topo.planar[j] and 3 <= len(topo.verts[j]) <= 4 and sum(1 for q in topo.adj[j] if q in union) >= 2}
-                            if not nt:
-                                break
-                            union |= nt
-                    todo.append((r, key, union, 2.0 * max(sag_r[k], sag_r[r]) + 2.0 * tol, one_round(members[k] + members[r]) or osculating(members[k] + members[r])))
-                ahead = [None] * len(todo)
-                if pool is not None and len(todo) > 1:
+                        if only is not None and not any(q in only for q in members[k] + members[r]):
+                            continue
+                        union = groups[k] | groups[r]
+                        union |= holes(union)
+                        # (late, the loose facets in its notches too - two sides
+                        # on it: a test17 window bottom and the strip along its
+                        # slot edge held at 44x23 with them, at no grid without)
+                        if only is not None:
+                            for _ in range(3):
+                                nt = {j for i in union for j in topo.adj[i] if j not in union and j not in owner and j not in absorbed
+                                      and topo.planar[j] and 3 <= len(topo.verts[j]) <= 4 and sum(1 for q in topo.adj[j] if q in union) >= 2}
+                                if not nt:
+                                    break
+                                union |= nt
+                        rnd_ = one_round(members[k] + members[r]) and not osculating(members[k] + members[r])
+                        if pass_ == 0 and rnd_:
+                            continue
+                        ch_ = rnd_ or osculating(members[k] + members[r])
+                        todo.append((r, key, union, 2.0 * max(sag_r[k], sag_r[r]) + 2.0 * tol, ch_))
+                    ahead = [None] * len(todo)
+                    if pool is not None and len(todo) > 1:
+                        for q, (r, key, union, ctol, ch_) in enumerate(todo):
+                            if self.min_faces <= len(union) <= 1200:
+                                G_ = sorted(union)
+                                a_ = filler.whole_args(G_)
+                                fu_ = None
+                                if a_ is not None:
+                                    try:
+                                        fu_ = pool.submit(fit_fill, *a_, ctol, chords=ch_)
+                                    except Exception:
+                                        fu_ = None
+                                ahead[q] = (G_, a_, fu_)
                     for q, (r, key, union, ctol, ch_) in enumerate(todo):
-                        if self.min_faces <= len(union) <= 1200:
-                            G_ = sorted(union)
-                            a_ = filler.whole_args(G_)
-                            fu_ = None
+                        tried.add(key)
+                        if len(union) > 1200:
+                            continue
+                        n_try += 1
+                        if ahead[q] is None:
+                            got = filler.pieces(sorted(union), ctol, cap, depth=7, chords=ch_)
+                        else:
+                            G_, a_, fu_ = ahead[q]
+                            pr_ = None
                             if a_ is not None:
                                 try:
-                                    fu_ = pool.submit(fit_fill, *a_, ctol, chords=ch_)
+                                    pr_ = fu_.result() if fu_ is not None else fit_fill(*a_, ctol, chords=ch_)
                                 except Exception:
-                                    fu_ = None
-                            ahead[q] = (G_, a_, fu_)
-                for q, (r, key, union, ctol, ch_) in enumerate(todo):
-                    tried.add(key)
-                    if len(union) > 1200:
-                        continue
-                    n_try += 1
-                    if ahead[q] is None:
-                        got = filler.pieces(sorted(union), ctol, cap, depth=7, chords=ch_)
-                    else:
-                        G_, a_, fu_ = ahead[q]
-                        pr_ = None
-                        if a_ is not None:
-                            try:
-                                pr_ = fu_.result() if fu_ is not None else fit_fill(*a_, ctol, chords=ch_)
-                            except Exception:
-                                pr_ = fit_fill(*a_, ctol, chords=ch_)
-                        got = [(pr_, G_)] if filler.whole_ok(G_, pr_, ctol, cap) else []
-                    if not got:
-                        continue
-                    pr = got[0][0]
-                    # ⚠️ ONE FACE, NOT A HEAVIER ONE. On test15 the late pass
-                    # merged a 6-facet corner into a 5x11 thread patch: 18x48
-                    # poles, and the phases after it came out with four faces
-                    # more. Two free-form patches go together late only if the
-                    # union needs no more than half again the poles of the two
-                    # (test17's window bottom: 54x27 for 32x41 and 12x12). (A
-                    # quadric's piece is no measure: held to it, test16's torus
-                    # r 23 osculating a blend stayed, 0.032 off between its
-                    # vertices.)
-                    if only is not None:
-                        fa_ = getattr(prims.get(k, regions[k].prim), "free", None)
-                        fb_ = getattr(prims.get(r, regions[r].prim), "free", None)
-                        if fa_ is not None and fb_ is not None:
-                            n_poles = lambda f_: int(np.prod(f_.poles.shape[:2]))
-                            if n_poles(pr.free) > 1.5 * (n_poles(fa_) + n_poles(fb_)):
-                                continue
-                    pr.fill = None
-                    pr.merged = (ctol, cap)
-                    absorbed |= union - groups[k] - groups[r]
-                    groups[k] = union
-                    members[k] += members[r]
-                    sag_r[k] = max(sag_r[k], sag_r[r])
-                    prims[k] = pr
-                    if getattr(pr, "chords", False) or r in by_chords:
-                        by_chords.add(k)
-                    for q in members[r]:
-                        rep_of[q] = k
-                    del groups[r]
-                    prims.pop(r, None)
-                    merged = True
-                    break
-                for a_ in ahead:
-                    if a_ is not None and a_[2] is not None:
-                        a_[2].cancel()
-                if not merged:
-                    break
+                                    pr_ = fit_fill(*a_, ctol, chords=ch_)
+                            got = [(pr_, G_)] if filler.whole_ok(G_, pr_, ctol, cap) else []
+                        if not got:
+                            continue
+                        pr = got[0][0]
+                        # ⚠️ ONE FACE, NOT A HEAVIER ONE. On test15 the late pass
+                        # merged a 6-facet corner into a 5x11 thread patch: 18x48
+                        # poles, and the phases after it came out with four faces
+                        # more. Two free-form patches go together late only if the
+                        # union needs no more than half again the poles of the two
+                        # (test17's window bottom: 54x27 for 32x41 and 12x12). (A
+                        # quadric's piece is no measure: held to it, test16's torus
+                        # r 23 osculating a blend stayed, 0.032 off between its
+                        # vertices.)
+                        if only is not None:
+                            fa_ = getattr(prims.get(k, regions[k].prim), "free", None)
+                            fb_ = getattr(prims.get(r, regions[r].prim), "free", None)
+                            if fa_ is not None and fb_ is not None:
+                                n_poles = lambda f_: int(np.prod(f_.poles.shape[:2]))
+                                if n_poles(pr.free) > 1.5 * (n_poles(fa_) + n_poles(fb_)):
+                                    continue
+                        pr.fill = None
+                        pr.merged = (ctol, cap)
+                        absorbed |= union - groups[k] - groups[r]
+                        groups[k] = union
+                        members[k] += members[r]
+                        sag_r[k] = max(sag_r[k], sag_r[r])
+                        prims[k] = pr
+                        if getattr(pr, "chords", False) or r in by_chords:
+                            by_chords.add(k)
+                        for q in members[r]:
+                            rep_of[q] = k
+                        del groups[r]
+                        prims.pop(r, None)
+                        merged = True
+                        break
+                    for a_ in ahead:
+                        if a_ is not None and a_[2] is not None:
+                            a_[2].cancel()
+                    if not merged:
+                        break
         if not prims:
             return regions
         out = [R for q, R in enumerate(regions) if q not in rep_of or (rep_of[q] == q and q not in prims)]
@@ -12362,187 +12388,6 @@ class Segmenter:
             n_f += len(cand)
         if n_r:
             Log.debug(f"Small rounds: {n_f} loose facets taken by {n_r} cylinders and cones fitted again with them")
-        return regions
-
-    def _pattern_borders(self, regions):
-        """
-        ⚠️ THE MESH STILL SHOWS WHERE THE CAD'S EDGES WERE. A tessellator
-        works one CAD face at a time, each in its own pattern: a cylinder in
-        strips as long as the face, all one way; a blend in a grid of small
-        triangles. Where two faces meet tangent the edge between them is as
-        plain to the eye as a sharp one - the pattern changes on it - and
-        geometry alone can't place it: the facets beside it lie on both
-        surfaces to the tolerance, whoever grew first took them, and the
-        border came out in steps across the pattern (test17's window
-        blends: grid triangles left in the cylinders beside them, the edge
-        notched where the CAD's is one line).
-        So a facet of 3-4 vertices on the border of its region goes to the
-        region across it when the pattern says it is that one's: every
-        neighbour it has in its own region is unlike it (2.8 times its size,
-        or strips against a grid, or strips running another way), one in the
-        other is like it, and the other's surface holds it as it holds any
-        facet (within). Layer by layer, while any moves; a region is never
-        cut in two nor left under four facets.
-        """
-        topo = self.topo
-        owner = {i: k for k, R in enumerate(regions) for i in R.faces}
-        memo = {}
-        self.verbose_dbg = bool(os.environ.get("REFIT_DBG_PATTERN"))
-
-        def pat(i):
-            if i not in memo:
-                V = topo.verts[i]
-                if not 3 <= len(V) <= 4:
-                    memo[i] = None
-                else:
-                    S = np.roll(V, -1, axis=0) - V
-                    L = np.linalg.norm(S, axis=1)
-                    d = np.linalg.norm(V[:, None, :] - V[None, :, :], axis=2)
-                    d = d[d > 0]
-                    if not d.size or float(L.min()) <= 0.0:
-                        memo[i] = None
-                    else:
-                        j = int(np.argmax(L))
-                        memo[i] = (float(np.median(d)), float(L[j] / L.min()), S[j] / L[j])
-            return memo[i]
-
-        def like(a, b):
-            if abs(math.log2(a[0] / b[0])) >= 0.75:
-                return False
-            if a[1] < 2.5 and b[1] < 2.5:
-                return True
-            return a[1] >= 2.5 and b[1] >= 2.5 and abs(float(a[2] @ b[2])) > 0.94
-
-        def unlike(a, b):
-            if abs(math.log2(a[0] / b[0])) > 1.5:
-                return True
-            if (a[1] >= 4.0 and b[1] < 2.0) or (b[1] >= 4.0 and a[1] < 2.0):
-                return True
-            return a[1] >= 4.0 and b[1] >= 4.0 and abs(float(a[2] @ b[2])) < 0.8
-
-        sets = {k: set(R.faces) for k, R in enumerate(regions)}
-        changed = set()
-        n_m = n_c = n_no = n_fit = 0
-        newp = {}
-        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, self.tol_fit)
-        cap = None if ms is None else 2.0 * ms + 2.0 * self.tol_fit
-        filler = PatchFiller(topo, self.tol_fit, self.min_faces)
-        for _ in range(6):
-            done = 0
-            for k in list(sets):
-                F = sets[k]
-                if len(F) < 5 or regions[k].prim is None or regions[k].prim.kind == PLANE:
-                    continue
-                # the region's facets, in pieces of one pattern: joined
-                # across every side that isn't a change of pattern
-                seen, comps = set(), []
-                for i0 in F:
-                    if i0 in seen:
-                        continue
-                    comp, stack = [i0], [i0]
-                    seen.add(i0)
-                    while stack:
-                        i = stack.pop()
-                        a = pat(i)
-                        for j in topo.adj[i]:
-                            if j in F and j not in seen and (a is None or pat(j) is None or not unlike(a, pat(j))):
-                                seen.add(j)
-                                comp.append(j)
-                                stack.append(j)
-                    comps.append(comp)
-                if len(comps) < 2:
-                    continue
-                comps.sort(key=len, reverse=True)
-                for comp in comps[1:]:
-                    if 4 * len(comp) > len(F) or any(pat(i) is None for i in comp):
-                        continue
-                    cs = set(comp)
-                    votes = Counter()
-                    for i in comp:
-                        for j in topo.adj[i]:
-                            kj = owner.get(j)
-                            if kj is not None and kj != k and pat(j) is not None and like(pat(i), pat(j)):
-                                votes[kj] += 1
-                    if not votes:
-                        continue
-                    n_c += 1
-                    for kb, _n in votes.most_common(2):
-                        pb = newp.get(kb, regions[kb].prim)
-                        # (into a patch only: between two quadrics the
-                        # facets on the border are each one's by right of
-                        # fit - moved by pattern, test13 lost two circles
-                        # and test16 seven, with 23 faces more)
-                        if pb is None or pb.kind != FREE:
-                            continue
-                        try:
-                            ok_ = all(self.within(pb, i) and abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) >= 0.94 for i in comp)
-                        except Exception:
-                            ok_ = False
-                        # (a patch was fitted without them: a few tolerances
-                        # off it and turned as it is, it is fitted again with
-                        # them - as a rim band is - and takes them if it then
-                        # holds the lot)
-                        if not ok_ and pb.kind == FREE and len(sets[kb]) + len(comp) <= 1200:
-                            try:
-                                near_ = all(float(np.abs(pb.dist(topo.verts[i])).max()) <= 4.0 * self.tol_fit and abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) >= 0.94 for i in comp)
-                            except Exception:
-                                near_ = False
-                            if near_:
-                                union = sorted(sets[kb] | cs)
-                                a_ = filler.whole_args(union)
-                                ctol = 2.0 * float(regions[kb].sag) + 2.0 * self.tol_fit
-                                try:
-                                    pr = fit_fill(*a_, ctol, chords="rim") if a_ is not None else None
-                                except Exception:
-                                    pr = None
-                                if pr is not None and filler.whole_ok(union, pr, ctol, cap):
-                                    pr.fill = None
-                                    pr.merged = (ctol, cap)
-                                    newp[kb] = pr
-                                    ok_ = True
-                                    n_fit += 1
-                        if not ok_:
-                            n_no += 1
-                            if self.verbose_dbg:
-                                try:
-                                    c_ = np.mean([topo.cents[i] for i in comp], axis=0)
-                                    d_ = max(float(np.abs(pb.dist(topo.verts[i])).max()) for i in comp)
-                                    t_ = max(self.face_tol(pb, i) for i in comp)
-                                    n_ = min(abs(float(pb.normal_at(topo.cents[i][None, :])[0] @ topo.norms[i])) for i in comp)
-                                    Log.debug(f"    piece of {len(comp)} facets at [{c_[0]:.2f} {c_[1]:.2f} {c_[2]:.2f}] in {regions[k].label()} not held by {regions[kb].label()}: off {d_:.1e} (may {t_:.1e}), normals {n_:.3f}")
-                                except Exception:
-                                    pass
-                            continue
-                        rest = sets[k] - cs
-                        if len(rest) < 4 or len(largest_component(sorted(rest), topo.adj)) != len(rest):
-                            break
-                        sets[k] = rest
-                        F = rest
-                        sets[kb] |= cs
-                        for i in comp:
-                            owner[i] = kb
-                        changed.update((k, kb))
-                        done += len(comp)
-                        break
-            n_m += done
-            if not done:
-                break
-        if n_c:
-            Log.debug(f"Pattern borders: {n_c} pieces of another pattern at the borders, {n_no} not held by the surface across, {n_fit} patches fitted again with theirs")
-        for k in changed:
-            R = regions[k]
-            try:
-                R2 = describe_region(newp.get(k, R.prim), topo, sorted(sets[k]))
-            except Exception:
-                continue
-            for a_ in ("note", "repeated", "fallback", "forced"):
-                if hasattr(R, a_):
-                    setattr(R2, a_, getattr(R, a_))
-            if k in newp:
-                R2.fallback = [R]
-            regions[k] = R2
-        if n_m:
-            Log.debug(f"Pattern borders: {n_m} facets moved to the region whose pattern they are in, {len(changed)} regions changed")
         return regions
 
     def _rim_bands(self, regions):
@@ -13874,11 +13719,44 @@ class Segmenter:
         # swept faces. A sphere or torus that isn't exact, one facet wide
         # (_one_wide: no vertex inside it, nothing said across) and all flat
         # strips is soft too.
+        # ⚠️ ...IF THE WHOLE OF IT IS A SWEPT WALL. The narrow ring under
+        # test17's top rim is such a torus too, one facet wide - but a ring
+        # round an axis, its strips leaning in: soft, the bands took the
+        # stretch of it whose creases happened to run within three degrees
+        # of each other, and what was one face between two circles came out
+        # in four, the circle r 14.56 in four arcs of four radii and a lens
+        # of a face across it. A wall of a letter is swept along ONE
+        # direction: every crease between its strips runs along it and every
+        # strip's normal is square to it (the bands' own rule, asked here of
+        # the region whole).
+        cos3_, sin3_ = math.cos(math.radians(3.0)), math.sin(math.radians(3.0))
+
+        def swept_whole(faces) -> bool:
+            fs = set(faces)
+            dd = []
+            for i in fs:
+                for j in topo.adj[i]:
+                    if j > i and j in fs:
+                        c = np.cross(topo.norms[i], topo.norms[j])
+                        n = float(np.linalg.norm(c))
+                        if n > math.sin(math.radians(0.3)):
+                            dd.append(c / n)
+            if len(dd) < 2:
+                return False
+            D = np.array(dd)
+            D = D * np.where(D @ D[0] >= 0.0, 1.0, -1.0)[:, None]
+            d = D.mean(axis=0)
+            n = float(np.linalg.norm(d))
+            if n <= 0.0:
+                return False
+            d /= n
+            return bool((np.abs(D @ d) >= cos3_).all()) and all(abs(float(topo.norms[i] @ d)) <= sin3_ for i in fs)
+
         soft |= {
             k
             for k, R in enumerate(regions)
             if R.prim.kind in (SPHERE, TORUS) and getattr(R.prim, "ball", None) is None and R.rms > _exact_lim(R, self.tol_fit, 0.1)
-            and all(topo.planar[i] and 3 <= len(topo.verts[i]) <= 4 for i in R.faces) and self._one_wide(R.faces)
+            and all(topo.planar[i] and 3 <= len(topo.verts[i]) <= 4 for i in R.faces) and self._one_wide(R.faces) and swept_whole(R.faces)
         }
         cand = [i for i in range(topo.nF) if (i not in claimed or owner[i] in soft) and topo.planar[i] and len(topo.verts[i]) >= 3]
         cset = set(cand)
@@ -14929,7 +14807,7 @@ class Segmenter:
                 ok = False
                 k = owner.get(j)
                 V = topo.verts[j]
-                if (k is None or (k != w and len(regions[k].faces) < 16)) and topo.planar[j] and len(V) >= 3:
+                if (k is None or (k != w and (len(regions[k].faces) < 16 or (getattr(regions[k].prim, "chords", False) and len(regions[k].faces) < 40)))) and topo.planar[j] and len(V) >= 3:
                     d = p.dist(V)
                     za = V @ p.axis
                     ok = (
@@ -15744,8 +15622,40 @@ def segment_curved(
 # Converting the same mesh again with other output options (-o, --pcurves,
 # --report, -j) skips the 100 s of test15's segmentation. REFIT_CACHE=0
 # turns it off, REFIT_CACHE=<dir> moves it (default: the temp folder).
-# Entries older than 30 days are dropped when a new one is written.
+# The source counts by its syntax tree, without comments and docstrings:
+# editing a note doesn't throw the entries away (an edit of the code
+# does). The versions of numpy, scipy, numba and OpenCascade count too, and
+# whether numba is in use (the compiled kernels agree with numpy only to
+# the last bits). The folder is kept under REFIT_CACHE_MB megabytes
+# (default 1024): when a new entry is written the ones read longest ago go
+# first, and anything older than 30 days.
 _CODE_HASH = None
+
+
+def _code_hash() -> str:
+    import ast
+    import hashlib
+
+    with open(os.path.abspath(__file__), "rb") as fh:
+        src = fh.read()
+    try:
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list):
+                for s in body:
+                    if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str):
+                        s.value.value = ""
+        txt = ast.dump(tree).encode()
+    except Exception:
+        txt = src
+    h = hashlib.sha256(txt)
+    vers = [f"py{sys.version_info[:3]}", f"np{np.__version__}", f"numba{_ss_eval_nb is not None}{_ff_height_nb is not None}"]
+    for mod in ("scipy", "numba", "OCP", "OCC"):
+        m = sys.modules.get(mod)
+        vers.append(f"{mod}{getattr(m, '__version__', None) if m is not None else '-'}")
+    h.update(repr(vers).encode())
+    return h.hexdigest()
 
 
 def _seg_cache_dir() -> Optional[str]:
@@ -15769,8 +15679,7 @@ def _seg_cache_path(seg) -> Optional[str]:
         import pickle
 
         if _CODE_HASH is None:
-            with open(os.path.abspath(__file__), "rb") as fh:
-                _CODE_HASH = hashlib.sha256(fh.read()).hexdigest()
+            _CODE_HASH = _code_hash()
         topo = seg.topo
         h = hashlib.sha256()
         h.update(_CODE_HASH.encode())
@@ -15817,13 +15726,28 @@ def _seg_cache_save(path: str, regs) -> None:
             pickle.dump(regs, fh, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
         now = time.time()
+        try:
+            cap = float(os.environ.get("REFIT_CACHE_MB", "1024")) * 1e6
+        except ValueError:
+            cap = 1024e6
+        ents = []
         for fn in os.listdir(d):
             p = os.path.join(d, fn)
             try:
-                if fn.endswith(".seg.pkl") and now - os.path.getmtime(p) > 30 * 86400:
-                    os.unlink(p)
+                if fn.endswith(".seg.pkl") or (fn.endswith(".tmp") and now - os.path.getmtime(p) > 86400):
+                    st_ = os.stat(p)
+                    ents.append((st_.st_mtime, st_.st_size, p))
             except OSError:
                 pass
+        ents.sort(reverse=True)  # the last read first
+        tot = 0.0
+        for mt, sz, p in ents:
+            tot += sz
+            if p != path and (now - mt > 30 * 86400 or tot > cap or p.endswith(".tmp")):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
     except Exception as ex:
         Log.debug(f"segmentation cache not written: {type(ex).__name__}: {ex}")
 
@@ -16456,7 +16380,7 @@ class Loop:
 
 
 class Engine:
-    def __init__(self, shape, tol_fit: float, diag: float, max_edge_tol: float, allow_polyline: bool = True, verbose: bool = False):
+    def __init__(self, shape, tol_fit: float, diag: float, max_edge_tol: float, allow_polyline: bool = True, verbose: bool = False, chord_pairs: Optional[dict] = None):
         self.shape = shape
         self.tol_fit = tol_fit
         self.tol_curve = 4.0 * tol_fit
@@ -16466,7 +16390,7 @@ class Engine:
         self.verbose = verbose
         self.registry = TopTools_IndexedMapOfShape()  # analytic curved faces
         self.analytic: Dict[int, "Prim"] = {}  # registry id -> Prim
-        self.topo = Topo(shape)
+        self.topo = Topo(shape, chord_pairs=chord_pairs)
         self.free0 = count_free_edges(shape)
         self.vol0 = shape_volume(shape)
         self.n_ok = 0
@@ -17372,8 +17296,18 @@ class Engine:
         # chords sagging 8.8e-3) had two 80-facet patches refused for one
         # 11.8 mm side at 1.45e-2 and a cylinder for 2.2e-2 against 2.0e-2,
         # where the whole part (ceiling 3.1e-2) takes them. Same hard limit.
+        # ⚠️ ...FOR THE MESH'S OWN SIDES ONLY. A circle or a spline fitted
+        # along the boundary is not a chord left as it was: it sags nothing,
+        # and what it stands off the surface is the surface missing its own
+        # rim. On test17 (chords sagging 6.3e-2: the ceiling went from 3e-2
+        # to 1.5e-1) a 177-facet patch was taken with an r 8.5 arc 0.11 off
+        # it - its border a hump 0.1 mm high where the mesh has a straight
+        # line - where before it was refused and fitted again to its edges.
+        # With a curved edge over the ceiling above, that ceiling stands.
         if self.sag_cap is not None:
-            tol_cap = max(tol_cap, min(1.2 * self.sag_cap, 5.0 * self.max_edge_tol))
+            cap_s = max(tol_cap, min(1.2 * self.sag_cap, 5.0 * self.max_edge_tol))
+            if not any(ln <= 0.0 and t > tol_cap for t, ln, _ in self._own_edges):
+                tol_cap = cap_s
         # (a hand fix: its boundary stands off the surface the user chose by
         # what that surface misses the facets by - reported when it was fitted)
         if getattr(R, "forced", None) is not None:
@@ -18757,8 +18691,12 @@ class _ArcSurf:
         # arm (B-spline faces of a couple of hundred poles) the pcurves of
         # the arcs spent 27 s of serial time there. Init(S, bounds) once and
         # Perform(P) per point is the same projection (same bounds, same
-        # algorithm; the grid search starts from the last solution, so the
-        # parameters can differ in the last bits).
+        # algorithm; the parameters can differ from Init(P, S)'s in the last
+        # bits). A point's projection doesn't depend on the ones before it
+        # (17,920 points on test15's and test18's 448 surfaces, the same
+        # bits as a projector of their own): snap_arcs keeps one per face
+        # for the whole pass, the first Perform builds the grid (up to 4 ms
+        # on the arm's B-splines, once per chain and face before).
         P = np.atleast_2d(P)
         u = np.empty(len(P))
         v = np.empty(len(P))
@@ -19809,6 +19747,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
         return shape, 0
     diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0))) if topo.nV else 1.0
     fprim: Dict[int, Optional[Prim]] = {}
+    arcsurf: Dict[int, "_ArcSurf"] = {}  # face -> its projector (see _ArcSurf.uv)
 
     def prim_of(fi):
         if fi not in fprim:
@@ -20103,7 +20042,9 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
                 Log.debug(f"  arc: {where}: the new edge isn't in face {fi}'s wire")
                 buono = False
                 break
-            sp = _ArcSurf(_st(BRep_Tool, "Surface")(topo.faces[fi]))
+            sp = arcsurf.get(fi)
+            if sp is None:
+                sp = arcsurf[fi] = _ArcSurf(_st(BRep_Tool, "Surface")(topo.faces[fi]))
             placed = False
             for anc in anchors:
                 up, vp = anc if anc is not None else (None, None)
@@ -21161,6 +21102,12 @@ def run_phase(
     res.vol_before = shape_volume(shape)
 
     topo = Topo(shape)
+    # ⚠️ THE ENGINE'S TOPO IS OF THE SAME SHAPE: the pairs of vertices whose
+    # chord each vertex lies on (_chord_pairs, a third of a Topo: 4 s of
+    # test18's) are the same, vertex by vertex - the map is filled by the
+    # constructor, and a change of the mesh gives the Topo a new one, never
+    # touches this one.
+    chord_pairs = topo._cp_cache
     diag = float(np.linalg.norm(topo.vpos.max(axis=0) - topo.vpos.min(axis=0)))
     tol_fit = tol if (tol and tol > 0) else auto_tol(diag)
     tol_grow = min(10.0 * tol_fit, 1e-3 * diag)
@@ -21198,7 +21145,7 @@ def run_phase(
         res.seconds = time.perf_counter() - t_all
         return res
 
-    eng = Engine(shape, tol_fit, diag, max_edge_tol, allow_polyline=not is_b, verbose=(Log.level <= 10))
+    eng = Engine(shape, tol_fit, diag, max_edge_tol, allow_polyline=not is_b, verbose=(Log.level <= 10), chord_pairs=chord_pairs)
     # ⚠️ A FACET IS A CHORD OF ITS SURFACE, NEVER MORE. A disc planed flat on
     # top of a test14 boss (r2.5, ringed by a torus fillet) has vertices only
     # on its rim: a r21 sphere goes through all of them and through the
@@ -21380,7 +21327,10 @@ def run_phase(
     # the STEP writer wrote an EMPTY file. Repaired on a copy, kept only if
     # it leaves fewer invalid faces, the same faces, no new free edge and the
     # same volume.
-    if not is_valid(res.shape):
+    _CHECKED_VALID[0] = None
+    if is_valid(res.shape):
+        _CHECKED_VALID[0] = res.shape  # (for the Phase A after: see _valid_handed_over)
+    else:
         nbad = lambda sh: sum(1 for f in explore(sh, TopAbs_FACE) if check_detail(td_Face(f)))
         b0, f0, v0 = nbad(res.shape), count_free_edges(res.shape), shape_volume(res.shape)
 
