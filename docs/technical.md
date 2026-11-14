@@ -565,6 +565,33 @@ are reported but left in.
   fewer between curved faces, but the bore floor's last merges then left a plane bounded by two
   lines on top of each other, a face no reader meshes; a big patch taking a cylinder's teeth only,
   `test16` 801 → 833.)
+- **A round's first row is the round's, not the wall's.** Along the slanted sides of `test17`'s
+  window arches the r 1.5 round leaves the 47-gon wall tangentially, and it is no cylinder: a
+  rolling ball along a slope on a curved wall, its ends on the cylinder to 1e-4, the middle of its
+  wall side 0.012 off. So the cylinder held every row but the first - two slivers the side's length,
+  one vertex 0.011 inside the wall - and that row lay in the wall's chord band: the wall took it, as
+  a strip in `-c`, as a fan after Phase A (`_close_walls`), and the round's edge with the wall ran
+  diagonally across the row, 0.09 mm off the mesh's contour at mid-length, where no hand fix could
+  move it (the row was the wall's). A chord's points inside the circle are on no other surface; the
+  row's are on the round's cylinder to 1e-4. Now a group of facets whose vertices off a coarse
+  wall all lie on a curved region beside it that holds its facets without being exact (within the
+  tolerance, over the exact threshold: a vertical side round exported exactly, its fan facets
+  touching it, stays the wall's - kept from it, 14 faces more) isn't the wall's: the round and the
+  row are refitted as one B-spline (on the facets: the rows are full-length facets with no vertex
+  inside), flagged so the walls leave it alone, the round as it was its fallback; a row no B-spline
+  holds with its round goes back to the wall as before (left loose, the top's rim came out a dozen
+  planes of mesh). Such a patch keeps the mesh's edges against the wall: tangent there, a curve
+  through the chain's vertices or the surfaces' intersection lands anywhere within its yardstick -
+  on the window at 140 degrees a circle r 3.24 ended 0.004 off the corner, a gap only the vertex's
+  tolerance closed, and the face read back from STEP got a degenerated edge there and meshed at
+  nothing finer than 0.05 mm (a hole in `tools/qa.py`'s mesh, 0.99 mm off). And a region whose new
+  face the mesher refuses tries once more with no new edge anywhere (a corner patch of the window
+  at -20 degrees, 184 facets, met the side round along a generic intersection 0.017 off the chain:
+  56 planes of mesh, its twins whole). `test17`: default sequence 284 → 234 faces (window rows of
+  mesh gone), `-a -c -a 0.005` 488 → 488, `-c` unchanged, deviation 0.0615/0.0562 → 0.0591/0.0562,
+  circles 185 → 171 (the slanted rounds' end arcs, now B-spline sections); edge length off the mesh's
+  contours by up to a facet (`tools/contours.py --step`) 267.7 → 250.8 mm, at each window about
+  halved; the 13-part suite unchanged.
 - **Five windows, one bottom each.** `test17`'s five windows are copies of one mesh, and their
   bottoms still came out three ways. On two of them a strip one facet wide across the bottom fitted
   a sphere to 2.3e-5 (r 2.08 on one, 2.45 on the other, a torus on the rest): every vertex on one
@@ -732,6 +759,16 @@ dropped before writing: the reader made a wire of its own out of one, and a 0.33
   - [`tools/cadcmp.py`](../tools/cadcmp.py) — compares an output face by face with the CAD file the mesh
     came from: faces reproduced one to one, split or of the wrong type, radii and angles, mesh left
     over, polylines where the CAD has a curve. `python tools/cadcmp.py test/test10_original.step test/test10.step -v`
+  - [`tools/contours.py`](../tools/contours.py) — the CAD's edges read from the mesh alone (creases,
+    jumps in facet size, changes of the tessellation's pattern: also between tangent faces, where no
+    angle shows), closed into a network, the triangles between them grouped into faces. With
+    `--cad ORIG.step` measured against the true CAD; with `--step OUT.step` it checks that a
+    conversion's every edge lies on a contour - "moved" (a contour within a facet, the edge not on
+    it: a row of facets given to the neighbour) or "unseen" (no contour there) - and lists the strong
+    contours no edge covers (a face across a crease); `--near X,Y,Z,R`, `--png` (contours red on the
+    mesh or on the output's faces by kind), `--json`. Importable: `Contours(topo)`, `.polylines()`,
+    `.faces()`, `.follow(shape)`.
+    `python tools/contours.py test/test17.STL --step test/test17.step --near 20.2,-7.35,7.5,4 --png c.png`
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
     used during development.

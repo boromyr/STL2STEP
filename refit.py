@@ -2137,43 +2137,59 @@ def _fragile_faces(shape, defl: float) -> Set[int]:
     out: Set[int] = set()
     if not cand:
         return out
-    import tempfile
-
-    fd, tmp = tempfile.mkstemp(suffix=".refit.step")
-    os.close(fd)
-    msg = _m("Message").Message.DefaultMessenger_s()
-    P = msg.Printers()
-    printers = [P.Value(k) for k in range(1, P.Length() + 1)]
-    for p in printers:
-        msg.RemovePrinter(p)
-    try:
+    with _QuietStep() as q:
         for i in cand:
             f = faces[i]
             if not _face_meshes(f, defl):
                 continue  # (not the file's doing)
-            w = STEPControl_Writer()
-            _iface_set("write.step.schema", "AP214IS")
-            _iface_set("write.step.unit", "MM")
-            _iface_set("write.precision.mode", "0")
-            _iface_set("write.surfacecurve.mode", "0")
-            w.Transfer(f, STEPControl_AsIs)
-            if w.Write(tmp) != IFSelect_RetDone:
+            back = q.round_trip(f, pcurves=False)
+            if back is None:
                 continue
-            r = STEPControl_Reader()
-            if r.ReadFile(tmp) != IFSelect_RetDone:
-                continue
-            r.TransferRoots()
-            back = [td_Face(g) for g in explore(r.OneShape(), TopAbs_FACE)]
             if len(back) != 1 or not _face_meshes(back[0], defl):
                 out.add(i)
-    finally:
-        for p in printers:
-            msg.AddPrinter(p)
+    return out
+
+
+class _QuietStep:
+    """A face written alone to a scratch STEP file and read back, OpenCascade's
+    printers silenced meanwhile (with: ... as q: q.round_trip(face, pcurves))."""
+
+    def __enter__(self):
+        import tempfile
+
+        fd, self.tmp = tempfile.mkstemp(suffix=".refit.step")
+        os.close(fd)
+        self.msg = _m("Message").Message.DefaultMessenger_s()
+        P = self.msg.Printers()
+        self.printers = [P.Value(k) for k in range(1, P.Length() + 1)]
+        for p in self.printers:
+            self.msg.RemovePrinter(p)
+        return self
+
+    def round_trip(self, f, pcurves: bool = False):
+        """the faces read back, or None if the file couldn't be written or read"""
+        w = STEPControl_Writer()
+        _iface_set("write.step.schema", "AP214IS")
+        _iface_set("write.step.unit", "MM")
+        _iface_set("write.precision.mode", "0")
+        _iface_set("write.surfacecurve.mode", "1" if pcurves else "0")
+        w.Transfer(f, STEPControl_AsIs)
+        if w.Write(self.tmp) != IFSelect_RetDone:
+            return None
+        r = STEPControl_Reader()
+        if r.ReadFile(self.tmp) != IFSelect_RetDone:
+            return None
+        r.TransferRoots()
+        return [td_Face(g) for g in explore(r.OneShape(), TopAbs_FACE)]
+
+    def __exit__(self, *exc):
+        for p in self.printers:
+            self.msg.AddPrinter(p)
         try:
-            os.remove(tmp)
+            os.remove(self.tmp)
         except OSError:
             pass
-    return out
+        return False
 
 
 def _strip_pcurves(shape, keep: Set[int]):
@@ -10864,6 +10880,19 @@ class Segmenter:
         # as deep as the facet's longest side does on its ball.
         is_ball = lambda p: p.kind == FREE and getattr(p, "ball", None) is not None
         curved = sorted({owner_f[j] for i in loose_f for j in topo.adj[i] if j in owner_f and (regions[owner_f[j]].prim.kind not in (PLANE, FREE) or is_ball(regions[owner_f[j]].prim))})
+        rims = {}  # the rows of a round kept from a wall (_rim_of_other)
+        rim_k = []  # (the region that would have taken them, the group)
+        wall_memo = {}
+
+        def is_wall(k):
+            # (a coarse polygon cylinder, as _close_walls has them: the rule
+            # is for its chord band only - on a sphere at test17's top it
+            # left a dozen facets of mesh)
+            if k not in wall_memo:
+                R_ = regions[k]
+                p_ = R_.prim
+                wall_memo[k] = bool(p_ is not None and p_.kind == AXIAL and abs(p_.slope) < 1e-9 and len(R_.faces) >= 50 and self._deep_chords(R_.faces, p_, ring=False))
+            return wall_memo[k]
         for k in curved:
             p = regions[k].prim
             # the loose facets near the surface, a few rings out (a strip's
@@ -10899,6 +10928,11 @@ class Segmenter:
                     continue
                 if not on_chords(p, G, k):
                     continue
+                q_ = self._rim_of_other(G, k, regions, owner_f) if is_wall(k) else None
+                if q_ is not None:
+                    rims.setdefault(q_, set()).update(G)
+                    rim_k.append((k, G))
+                    continue
                 new = sorted(kset | set(G))
                 if Engine.region_loops(eng_like, new)[0] is None:
                     continue
@@ -10913,6 +10947,23 @@ class Segmenter:
                 for i in G:
                     owner_f[i] = k
                 n_strip += len(G)
+        n_rim, back = self._rims_to_rounds(rims, regions, owner_f)
+        n_strip += n_rim
+        for k, G in rim_k:
+            G = [i for i in G if i in back and i not in owner_f]
+            if not G:
+                continue
+            new = sorted(set(regions[k].faces) | set(G))
+            if Engine.region_loops(eng_like, new)[0] is None:
+                continue
+            bare = regions[k].bare if regions[k].bare is not None else regions[k]
+            p = regions[k].prim
+            regions[k] = describe_region(p, topo, new)
+            if is_ball(p):
+                regions[k].bare = bare
+            for i in G:
+                owner_f[i] = k
+            n_strip += len(G)
         if n_strip:
             Log.debug(f"Wide strips on curved regions: {n_strip} loose facets taken in")
         regions = self._helical_bands(regions)
@@ -14749,6 +14800,105 @@ class Segmenter:
             Log.debug(f"Free-form patches closed: {n_add} facets in slits and holes taken by {n_reg} patches ({n_moved} of them from the patch next to it, {len(gone_regs)} small patches taken whole)")
         return [R for R in regions if R.faces]
 
+    def _rim_of_other(self, G, k, regions, owner) -> Optional[int]:
+        """
+        ⚠️ A FACET OFF ONE SURFACE AND ON THE ROUND BESIDE IT IS THE ROUND'S.
+        Along the slanted sides of test17's window arches the r 1.5 round
+        leaves the 47-gon wall tangentially, and its first row of facets -
+        two slivers the arch's length, one vertex 0.011 inside the wall -
+        lies in the wall's chord band: the wall took it, as a strip (-c) or
+        as a fan (_close_walls, after Phase A), and the round's contour
+        moved a row inward, off the mesh's - no hand fix could give it back,
+        the row was the wall's. A chord's points inside the circle are on
+        no other surface; that row's are on the round's cylinder to 1e-4.
+        The round there is no cylinder (a rolling ball along the arch's
+        slope on a curved wall: its middle bulges 0.012 off the cylinder
+        where it meets the wall, the cylinder holds the other rows at 0.9 of
+        the tolerance), so the row goes to the round as one B-spline with it
+        (_rims_to_rounds). The index of that round - not exact, holding its
+        facets, every vertex of G off region k's surface on it, next to G -
+        or None. (An exact one stays out of it: under test17's windows the
+        side rounds' r 1.5 cylinders, on their vertices to 1e-7, have fan
+        facets touching them too, and keeping those from the wall left 14
+        faces more.)
+        """
+        topo = self.topo
+        tol = self.tol_fit
+        p = regions[k].prim
+        vid = sorted({a for i in G for e in topo.f_edges[i] for a in topo.e_verts[e]})
+        V = topo.vpos[vid]
+        try:
+            off = np.abs(p.dist(V)) > tol
+        except Exception:
+            return None
+        if not off.any():
+            return None
+        for q in sorted({owner[j] for i in G for j in topo.adj[i] if j in owner and owner[j] != k}):
+            R_ = regions[q]
+            if R_.prim is None or R_.prim.kind not in (AXIAL, TORUS, SPHERE) or len(R_.faces) < 8:
+                continue
+            if R_.rms > tol or R_.rms <= _exact_lim(R_, tol):
+                continue
+            try:
+                if float(np.abs(R_.prim.dist(V[off])).max()) <= tol:
+                    return q
+            except Exception:
+                continue
+        return None
+
+    def _rims_to_rounds(self, rims, regions, owner):
+        """
+        The rows _rim_of_other kept from a wall ({round: facets}), each
+        round refitted with its row as one B-spline (fit_fill, held as
+        _merge_free holds a merge: vertices within the tolerance, the facets
+        within twice the round's own sag) - the round's previous self its
+        fallback. Returns (facets placed, the facets of the rows no B-spline
+        holds with their round): those go back to the wall, as before (left
+        loose, test17's top rim came out a dozen planes of mesh).
+        """
+        if not rims:
+            return 0, set()
+        if not self.allow_free:
+            return 0, {j for G in rims.values() for j in G if j not in owner}
+        topo = self.topo
+        tol = self.tol_fit
+        ms = MESH_SAG if MESH_SAG is not None else _measure_mesh_sag(regions, tol)
+        cap = None if ms is None else 2.0 * ms + 2.0 * tol
+        filler = PatchFiller(topo, tol, self.min_faces)
+        n = 0
+        back = set()
+        for q in sorted(rims):
+            R_ = regions[q]
+            G = {j for j in rims[q] if j not in owner}
+            if not G:
+                continue
+            if not R_.faces:
+                back |= G
+                continue
+            union = sorted(set(R_.faces) | G)
+            ctol = 2.0 * float(R_.sag) + 2.0 * tol
+            got = filler.pieces(union, ctol, cap, depth=7)
+            if len(got) != 1 or len(got[0][1]) != len(union):
+                got = filler.pieces(union, ctol, cap, depth=7, chords=True)
+            if len(got) != 1 or len(got[0][1]) != len(union):
+                Log.debug(f"  rim of a round given back to the wall: {len(G)} facets at {np.round(topo.cents[min(G)], 2)}, no B-spline holds them with the {R_.prim.kind} beside them")
+                back |= G
+                continue
+            pr = got[0][0]
+            pr.fill = None
+            pr.merged = (ctol, cap)
+            # (fitted on the facets, it is no fan's patch: the walls leave it
+            # alone - see _close_walls)
+            pr.rim = True
+            R2 = describe_region(pr, topo, union)
+            R2.fallback = [R_]
+            regions[q] = R2
+            for j in G:
+                owner[j] = q
+            n += len(G)
+            Log.debug(f"  rim of a round: {len(G)} facets at {np.round(topo.cents[min(G)], 2)} kept from the wall, the {R_.prim.kind} ({len(R_.faces)} facets, {R_.rms / tol:.2f} of the tolerance) and they one B-spline")
+        return n, back
+
     def _close_walls(self, regions):
         """
         ⚠️ UNDER A WINDOW THE COARSE WALL IS A FAN, NOT A CHORD. test17's
@@ -14779,6 +14929,9 @@ class Segmenter:
         cmin = math.cos(math.radians(30.0))
         n_take = n_regs = 0
         self._walls_cut = []  # the regions left with the rest of their facets
+        rims = {}  # the rows of a round kept from the walls (_rim_of_other)
+        if not hasattr(self, "_rim_back"):
+            self._rim_back = set()
         for w, R in enumerate(regions):
             p = R.prim
             if p is None or p.kind != AXIAL or abs(p.slope) >= 1e-9 or len(R.faces) < 50:
@@ -14807,7 +14960,7 @@ class Segmenter:
                 ok = False
                 k = owner.get(j)
                 V = topo.verts[j]
-                if (k is None or (k != w and (len(regions[k].faces) < 16 or (getattr(regions[k].prim, "chords", False) and len(regions[k].faces) < 40)))) and topo.planar[j] and len(V) >= 3:
+                if (k is None or (k != w and (len(regions[k].faces) < 16 or (getattr(regions[k].prim, "chords", False) and not getattr(regions[k].prim, "rim", False) and len(regions[k].faces) < 40)))) and topo.planar[j] and len(V) >= 3:
                     d = p.dist(V)
                     za = V @ p.axis
                     ok = (
@@ -14817,6 +14970,11 @@ class Segmenter:
                         and float(za.max() - za.min()) >= 0.35 * side
                         and abs(float(p.normal_at(topo.cents[j][None, :])[0] @ topo.norms[j])) >= cmin
                     )
+                    if ok and j not in self._rim_back:
+                        q_ = self._rim_of_other([j], w, regions, owner)
+                        if q_ is not None:
+                            rims.setdefault(q_, set()).add(j)
+                            ok = False
                 memo[j] = ok
                 return ok
 
@@ -14886,6 +15044,18 @@ class Segmenter:
             for j in add:
                 owner[j] = w
             n_take += len(add)
+        _, back = self._rims_to_rounds(rims, regions, owner)
+        if back and not self._rim_back:
+            # (the rows no B-spline holds with their round: the walls take
+            # them as before, in a pass of their own)
+            cut1 = self._walls_cut
+            self._rim_back = back
+            try:
+                regions = self._close_walls([R for R in regions if R.faces])
+            finally:
+                self._rim_back = set()
+            self._walls_cut = cut1 + self._walls_cut
+            return regions
         if n_take:
             Log.debug(f"Coarse walls closed: {n_take} facets of their fans taken back ({n_regs} small regions on them dissolved, {len(self._walls_cut)} cut)")
         return [R for R in regions if R.faces]
@@ -16803,6 +16973,19 @@ class Engine:
             if ok4:
                 ok, why = ok4, why4
                 R.note += " · approximated boundaries left polygonal"
+        # ⚠️ FIFTH STRATEGY: A FACE THE MESHER CAN'T LAY IS ITS CONTOUR'S
+        # FAULT. A corner patch of test17's window at -20 degrees (184
+        # facets) met the window's side round along a generic intersection
+        # standing 0.017 off the chain's vertices - inside its loose
+        # yardstick, twice the chain's segments - and BRepMesh gave up on
+        # the face: 56 planes of mesh where its two twins, polygonal there,
+        # came out whole. The same region with no new edge anywhere (the
+        # third strategy's contour) before it's left as mesh.
+        if not ok and not strict_hole and "triangulate" in why:
+            ok5, why5 = self._safe(R, strict_hole, analytic_planes=False, analytic_curved=False)
+            if ok5:
+                ok, why = ok5, why5
+                R.note += " · contour left polygonal (the mesher refused it)"
         if self.verbose:
             mt1 = max_tolerance(self.shape)
             if mt1 > max(mt0 * 1.5, self.max_edge_tol):
@@ -17111,12 +17294,26 @@ class Engine:
                     # vertices is taken instead: it's consistent with the
                     # input, and the edge's tolerance measures its true
                     # deviation.
-                    if cv is None and fitted_curves and len(ch.verts) >= 4:
+                    # (not for a round refitted with the row the wall had
+                    # taken: see below - against the wall it's tangent to)
+                    rim_ = getattr(prim, "rim", False)
+                    if cv is None and fitted_curves and len(ch.verts) >= 4 and not rim_:
                         Pq = P[:-1] if ch.closed else P
                         cv = fit_curve(Pq, self.tol_curve, arc_tol=max(self.tol_curve, 2.0 * R.sag))
                     # ⚠️ CURVED neighbor already converted and no analytic
                     # curve: generic intersection of the two surfaces (B-spline)
-                    if cv is None and nbp.kind != PLANE and not ch.closed and len(ch.verts) >= 3:
+                    # ⚠️ NOT FOR A ROUND REFITTED WITH ITS ROW. Tangent to the
+                    # wall along its whole side (Segmenter._rim_of_other), a
+                    # curve through the chain's vertices or the surfaces'
+                    # intersection lands anywhere within its yardstick: on
+                    # test17's 140-degree window a circle r 3.24 through the
+                    # four vertices on the wall ended 0.004 off the corner, a
+                    # gap only the vertex's tolerance closed - read back from
+                    # STEP, which carries none, the face got a degenerated
+                    # edge there and meshed at nothing finer than 0.05 mm (a
+                    # hole in qa's mesh, 0.99 mm off). The mesh's own edges
+                    # are the contour the face was made for.
+                    if cv is None and nbp.kind != PLANE and not ch.closed and len(ch.verts) >= 3 and not rim_:
                         # ⚠️ the mesh's boundary between two regions is a
                         # STAIRCASE of facets: interior vertices sit up to
                         # a facet away from the true curve. Only the
