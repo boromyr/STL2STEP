@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["viewer/server.py", "--serve"],
       "port": 8765
+    },
+    {
+      "name": "viewer-test",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["viewer/server.py", "--serve", "--port", "8777"],
+      "port": 8777
     }
   ]
 }

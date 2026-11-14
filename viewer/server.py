@@ -1143,6 +1143,9 @@ class NativeApi:
     def set_title(self, title):
         self._window.set_title(title)
 
+    def toggle_fullscreen(self):
+        self._window.toggle_fullscreen()
+
 
 def _dark_title_bar(window):
     """Windows 10/11: the title bar follows the page's dark theme."""
@@ -1212,6 +1215,7 @@ def run_window(url):
                 MenuAction("X", js("refitUI.section('x')")),
                 MenuAction("Y", js("refitUI.section('y')")),
                 MenuAction("Z", js("refitUI.section('z')")),
+                MenuAction("Box (B)", js("refitUI.section('box')")),
                 MenuAction("Flip", js("refitUI.flipSection()")),
                 MenuAction("Off", js("refitUI.section(null)")),
             ]),
@@ -1219,8 +1223,10 @@ def run_window(url):
             MenuAction("Input (1)", js("refitUI.tab('input')")),
             MenuAction("STEP (2)", js("refitUI.tab('output')")),
             MenuAction("Original CAD (3)", js("refitUI.tab('cad')")),
+            MenuAction("Compare mesh / STEP (C)", js("refitUI.compare()")),
             MenuSeparator(),
             MenuAction("Log (L)", js("refitUI.log()")),
+            MenuAction("Full screen (F11)", js("refitUI.fullscreen()")),
         ]),
         Menu("Help", [
             MenuAction("README", lambda: os.startfile(os.path.join(ROOT, "README.md")) if os.name == "nt" else None),

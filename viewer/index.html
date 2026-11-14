@@ -67,6 +67,19 @@ button, input, select { font: inherit; color: inherit; }
 #secbox button:hover { color: var(--text); background: #2a2e37; }
 #gizmo { position: absolute; left: 14px; bottom: 14px; width: 96px; height: 96px; pointer-events: none; }
 
+/* compare: input on the left of the divider, the STEP on the right; drag the line or its knob */
+#cmpline { position: absolute; top: 0; bottom: 0; width: 18px; margin-left: -9px; display: none; z-index: 2; cursor: ew-resize; touch-action: none; }
+#cmpline.show { display: block; }
+/* (our own look: a dashed accent rule and a slim grip, not a round knob) */
+#cmpline::before { content: ""; position: absolute; left: 8px; top: 0; bottom: 0; width: 0; border-left: 1.5px dashed rgba(111,214,191,.75); }
+#cmpline .knob { position: absolute; left: 50%; top: 50%; width: 14px; height: 64px; margin: -32px 0 0 -7px; border-radius: 4px; background: #15181d; border: 1.5px solid var(--accent); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; box-shadow: 0 2px 10px rgba(0,0,0,.55); user-select: none; }
+#cmpline .knob i { display: block; width: 6px; height: 1.5px; background: var(--accent); border-radius: 1px; }
+#cmpline:hover .knob, #cmpline.drag .knob { background: var(--accent); }
+#cmpline:hover .knob i, #cmpline.drag .knob i { background: var(--accent-ink); }
+#cmpline .lb { position: absolute; top: 50%; margin-top: -10px; padding: 2px 7px; border-radius: 4px; color: var(--accent); font: 600 10.5px/16px var(--mono); letter-spacing: .12em; white-space: nowrap; pointer-events: none; background: rgba(13,15,18,.85); }
+#cmpline .lb.l { right: 22px; } #cmpline .lb.r { left: 22px; }
+#cmpbtn.on { background: var(--accent); color: var(--accent-ink); }
+
 /* hand fixes: pick the pieces, choose what they are */
 #fixmenu { position: absolute; right: 18px; top: 64px; display: none; flex-direction: column; gap: 4px; padding: 8px 10px 10px; background: rgba(17,19,23,.96); border: 1px solid #2f6f63; border-radius: 12px; z-index: 6; box-shadow: 0 8px 28px rgba(0,0,0,.45); }
 #fixmenu.show { display: flex; }
@@ -208,6 +221,8 @@ table.stats tr.gap td { padding-top: 10px; }
         <button data-tab="input" disabled>Input</button>
         <button data-tab="output" disabled>STEP</button>
         <button data-tab="cad" disabled title="&lt;name&gt;_original.step">Original CAD</button>
+        <span class="sep"></span>
+        <button id="cmpbtn" disabled title="Compare: the mesh on the left of a sliding line, the STEP on the right (C)">Mesh ⇆ STEP</button>
       </div>
       <span class="grow"></span>
       <div class="seg" id="views">
@@ -225,11 +240,15 @@ table.stats tr.gap td { padding-top: 10px; }
           <button data-axis="y"><span class="ax" style="background:#6fd65c">Y</span>Along Y</button>
           <button data-axis="z"><span class="ax" style="background:#5a8cf0">Z</span>Along Z</button>
           <hr>
+          <button id="secmbox" title="Show only what lies inside a box; drag its six arrows (B)"><span class="ax" style="background:#6fd6bf">▣</span>Box</button>
+          <hr>
           <button id="secmflip">⇅ Flip side</button>
           <button id="secmoff">✕ Off</button>
         </div>
         <span class="sep"></span>
         <button id="fixbtn" title="Fix faces by hand: click a face, choose what it is (E)" disabled>Fix faces</button>
+        <span class="sep"></span>
+        <button id="fsbtn" title="Full screen (F11)">⛶</button>
       </div>
     </div>
     <div id="fixmenu">
@@ -266,6 +285,7 @@ table.stats tr.gap td { padding-top: 10px; }
       <button data-color="plain">Plain</button>
     </div>
     <div class="seg" id="logtoggle"><button id="logbtn" title="Log (L)">Log</button></div>
+    <div id="cmpline" title="Drag: mesh on the left, STEP on the right"><span class="lb l" id="cmpl">STL</span><div class="knob"><i></i><i></i><i></i></div><span class="lb r" id="cmpr">STEP</span></div>
     <canvas id="gizmo" width="192" height="192"></canvas>
     <div id="tip"></div>
     <div id="pivot"></div>
@@ -336,7 +356,7 @@ table.stats tr.gap td { padding-top: 10px; }
       <h3>Hand fixes</h3>
       <div id="fixlist"></div>
       <div class="checks" style="grid-template-columns:1fr"><label title="--hints &lt;name&gt;.hints.json"><input type="checkbox" id="o_hints" checked> Use them when converting</label></div>
-      <div class="fixbtns"><button class="btn" id="fixbuild" title="Convert again with the hand fixes">Build</button><button class="btn" id="fixclear" title="Forget every hand fix of this mesh">Clear</button></div>
+      <div class="fixbtns"><button class="btn" id="fixbuild" title="Convert again with the hand fixes">Build</button><button class="btn" id="fixundo" title="Take back the last hand fix (Ctrl+Z)">Undo</button><button class="btn" id="fixclear" title="Forget every hand fix of this mesh">Clear</button></div>
     </div>
 
     <h3 id="stattitle">Model</h3>
@@ -668,19 +688,28 @@ function makeStencil(m) {
   g.userData.stencil = true;
   return g;
 }
-// every material of a model is cut by the section plane, or none
+// every material of a model is cut by the section plane, by the box's six
+// planes (kept: what is inside all of them), or by nothing. The box has no
+// cap: with several planes the stencil count no longer tells inside from out.
 function applyClip(m) {
   if (!m) return;
-  const want = SEC.axis ? 1 : 0;
-  if (want && !m.stencil) { m.stencil = makeStencil(m); m.group.add(m.stencil); }
-  if (m.stencil) m.stencil.visible = !!want;
+  const planes = !SEC.axis ? null : SEC.axis === "box" ? BOX_PLANES : SEC_PLANES;
+  const cap = planes === SEC_PLANES;
+  if (cap && !m.stencil) { m.stencil = makeStencil(m); m.group.add(m.stencil); }
+  if (m.stencil) m.stencil.visible = cap;
   m.group.traverse((o) => {
     if (o.parent?.userData.stencil) return;
     const mat = o.material;
-    if (!mat || (mat.clippingPlanes?.length || 0) === want) return;
-    mat.clippingPlanes = want ? [secPlane] : null;
+    if (!mat || (mat.clippingPlanes || null) === planes) return;
+    mat.clippingPlanes = planes;
     mat.needsUpdate = true;
   });
+}
+// a point the section / box leaves visible
+function kept(p) {
+  if (!SEC.axis) return true;
+  if (SEC.axis === "box") return BOX_PLANES.every((pl) => pl.distanceToPoint(p) >= 0);
+  return secPlane.distanceToPoint(p) >= 0;
 }
 function setFlat(on) {
   S.flat = on;
@@ -790,7 +819,8 @@ function applyDisplay(m) {
     m.group.add(m.wire);
   }
   if (m.wire) {
-    m.wire.visible = S.disp.mesh;
+    // compare: the triangles only on the mesh side, the STEP stays clean
+    m.wire.visible = S.disp.mesh && !(cmpLeft() && m === S.models[S.tab]);
     m.wire.material.opacity = S.disp.shaded ? 0.85 : 1;
   }
   applyClip(m);
@@ -805,10 +835,14 @@ function setTab(tab) {
   }
   S.tab = tab;
   S.hover = -1;
+  if (tab === "input" && CMP.on) CMP.on = false;   // the input against itself: nothing to compare
   const m = S.models[tab];
   scene.add(m.group);
   recolor(m);
   applyDisplay(m);
+  const L = cmpLeft();
+  if (L) { scene.add(L.group); recolor(L); applyDisplay(L); }
+  updateCmpUI();
   if (SEC.axis) updateSection();
   if (S.fitted !== S.paths.input) { fit(m, "iso"); S.fitted = S.paths.input; }
   $$("#tabs button").forEach((b) => b.classList.toggle("on", b.dataset.tab === tab));
@@ -822,7 +856,78 @@ function refreshTabs() {
     b.title = S.paths[t] || (t === "cad" ? "no <name>_original.step" : t === "output" ? "not converted yet" : "");
   });
   $("#tabs button[data-tab=output]").textContent = "STEP";
+  $("#cmpbtn").disabled = !canCompare();
 }
+
+// ---------------------------------------------------------------- compare (mesh ⇆ STEP)
+// One camera, two models: the input left of a vertical line, the STEP shown
+// (the conversion, or the original CAD) right of it, each drawn in its own
+// scissor rectangle of the same frame. Drag the line to wipe from one to the other.
+const CMP = { on: false, x: 0.5 };
+try { CMP.x = THREE.MathUtils.clamp(+localStorage.getItem("refit.cmpx") || 0.5, 0.02, 0.98); } catch {}
+const canCompare = () => !!(S.paths.input && (S.paths.output || S.paths.cad));
+const cmpLeft = () => (CMP.on && S.tab !== "input" ? S.models.input : null);
+async function setCompare(on) {
+  on = !!on && canCompare();
+  if (on) {
+    const right = S.tab !== "input" && S.paths[S.tab] ? S.tab : S.paths.output ? "output" : "cad";
+    await loadTab("input", false);
+    if (!S.models[right]) await loadTab(right, false);
+    if (!S.models.input || !S.models[right]) on = false;
+    else { CMP.on = true; setTab(right); return; }
+  }
+  CMP.on = false;
+  if (S.models[S.tab]) setTab(S.tab); else updateCmpUI();
+}
+function updateCmpUI() {
+  const L = cmpLeft();
+  $("#cmpbtn").classList.toggle("on", !!L);
+  $("#cmpline").classList.toggle("show", !!L);
+  $("#cmpline").style.left = (CMP.x * 100) + "%";
+  if (L) {
+    $("#cmpl").textContent = L.kind === "stl" ? "MESH" : "INPUT";
+    $("#cmpr").textContent = S.tab === "cad" ? "ORIGINAL CAD" : "STEP";
+  }
+  updateStatus();
+}
+// the model under a screen point: left of the line it's the input's
+function modelAt(clientX) {
+  const L = cmpLeft();
+  if (L) {
+    const r = canvas.getBoundingClientRect();
+    if (clientX - r.left < CMP.x * r.width) return L;
+  }
+  return S.models[S.tab];
+}
+{
+  const el = $("#cmpline");
+  let drag = false;
+  el.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    drag = true;
+    el.classList.add("drag");
+    el.setPointerCapture(e.pointerId);
+  });
+  el.addEventListener("pointermove", (e) => {
+    if (!drag) return;
+    const r = $("#view").getBoundingClientRect();
+    CMP.x = THREE.MathUtils.clamp((e.clientX - r.left) / r.width, 0.02, 0.98);
+    el.style.left = (CMP.x * 100) + "%";
+  });
+  const up = (e) => {
+    if (!drag) return;
+    drag = false;
+    el.classList.remove("drag");
+    try { el.releasePointerCapture(e.pointerId); } catch {}
+    try { localStorage.setItem("refit.cmpx", String(CMP.x)); } catch {}
+  };
+  el.addEventListener("pointerup", up);
+  el.addEventListener("pointercancel", up);
+  // the wheel over the line zooms the view as anywhere else
+  el.addEventListener("wheel", (e) => controls._wheel(e), { passive: false });
+}
+$("#cmpbtn").addEventListener("click", () => setCompare(!CMP.on));
 async function loadTab(tab, show = true, force = false) {
   const p = S.paths[tab];
   if (!p) return;
@@ -879,13 +984,15 @@ let lastMove = null;
 canvas.addEventListener("pointermove", (e) => { lastMove = e; });
 canvas.addEventListener("pointerleave", () => { lastMove = null; setHover(-1); $("#tip").style.display = "none"; });
 function pick(e) {
-  const m = S.models[S.tab];
+  const m = modelAt(e.clientX);
   if (!m || !m.mesh.visible) return null;
   const r = canvas.getBoundingClientRect();
   ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(ndc, camera);
-  // skip what the section cut away
-  return ray.intersectObject(m.mesh, false).find((h) => !SEC.axis || secPlane.distanceToPoint(h.point) >= 0) || null;
+  // skip what the section / box cut away
+  const h = ray.intersectObject(m.mesh, false).find((h) => kept(h.point)) || null;
+  if (h) h.m = m;   // (compare: the input's, left of the line)
+  return h;
 }
 function setHover(i) {
   const m = S.models[S.tab];
@@ -906,12 +1013,12 @@ function faceDesc(f) {
 }
 function hoverTick() {
   if (!lastMove) return;
-  if (controls.active || SEC.drag || SEC.hover) { lastMove = null; setHover(-1); $("#tip").style.display = "none"; return; }
+  if (controls.active || SEC.drag || SEC.hover || BOX.drag || BOX.hover >= 0) { lastMove = null; setHover(-1); $("#tip").style.display = "none"; return; }
   const e = lastMove; lastMove = null;
   const hit = pick(e);
   const tip = $("#tip");
   const m = S.models[S.tab];
-  if (!hit || !m || m.kind !== "step") { setHover(-1); tip.style.display = "none"; return; }
+  if (!hit || !m || hit.m !== m || m.kind !== "step") { setHover(-1); tip.style.display = "none"; return; }
   const i = m.faceOfVert[hit.face.a];
   setHover(i);
   const f = m.h.faces[i];
@@ -1016,7 +1123,7 @@ function showFixMenu(x, y) {
 async function fixClick(e) {
   const m = S.models.output;
   const hit = pick(e);
-  if (!hit) { clearPick(); return; }
+  if (!hit || hit.m !== m) { clearPick(); return; }
   const i = m.faceOfVert[hit.face.a];
   if (e.shiftKey) {
     S.fix.sel.has(i) ? S.fix.sel.delete(i) : S.fix.sel.add(i);
@@ -1039,7 +1146,7 @@ async function fixClick(e) {
 let brush = null;
 function brushAt(x, y) {
   const m = S.models.output, hit = pick({ clientX: x, clientY: y });
-  if (!m || !hit) return;
+  if (!m || !hit || hit.m !== m) return;
   const i = m.faceOfVert[hit.face.a];
   if (brush.add === null) brush.add = !S.fix.sel.has(i);
   if (brush.add === S.fix.sel.has(i)) return;
@@ -1142,6 +1249,7 @@ function renderFixes() {
     row.addEventListener("mouseleave", () => { if (!$("#fixmenu").classList.contains("show")) { S.fix.sel.clear(); repaintOutput(); } });
   });
   $("#fixbuild").disabled = !S.fix.groups.length || !!S.job;
+  $("#fixundo").disabled = !S.fix.groups.length || !!S.job;
   $("#fixbtn").disabled = !fixable();
   $("#fixbtn").title = fixable() ? "Fix faces by hand: click a face, choose what it is (E)"
     : S.input && /\.(step|stp)$/i.test(S.input) ? "Fix faces needs the mesh this STEP was converted from (<name>.stl beside it)"
@@ -1155,6 +1263,18 @@ async function refreshHints() {
     setHints(await api(`/api/hints?input=${encodeURIComponent(S.input)}${out}`));
   } catch (ex) { setHints({ groups: [] }); }
 }
+// Undo (Ctrl+Z): take back the last hand fix
+async function undoFix() {
+  const n = S.fix.groups.length;
+  if (!n || !S.input) return;
+  try {
+    setHints(await api("/api/hints/remove", { input: S.input, output: S.paths.output, index: n - 1 }));
+    delete S.fix.results[n];
+    renderFixes();
+    fixTag(`Hand fix ${n} taken back`, 3000);
+  } catch (ex) { toast(ex.message); }
+}
+$("#fixundo").addEventListener("click", undoFix);
 $("#fixbuild").addEventListener("click", () => { $("#o_hints").checked = true; updateCmd(); $("#go").click(); });
 $("#fixclear").addEventListener("click", async () => {
   if (!S.fix.groups.length || !confirm(`Forget all ${S.fix.groups.length} hand fixes of ${base(S.input)}?`)) return;
@@ -1170,6 +1290,7 @@ const AXES = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: 
 const AXIS_COLORS = { x: "#f05a5a", y: "#6fd65c", z: "#5a8cf0" };
 const SEC = { axis: null, d: 0, flip: false, hover: false, drag: null, lo: 0, hi: 1 };
 const secPlane = new THREE.Plane();
+const SEC_PLANES = [secPlane];           // (one array: applyClip tells the modes apart by it)
 const secN = new THREE.Vector3();        // arrow direction: toward the removed side
 const secO = new THREE.Vector3();        // arrow base: the plane at the part's centre
 
@@ -1220,6 +1341,138 @@ secHelp.add(secCap, secFill, secLine, secArrow);
 secHelp.visible = false;
 scene.add(secHelp);
 
+// ---- box view: six planes facing in, only what's inside all of them shows.
+// A knob in the middle of each side drags it along its axis (as the section's
+// arrow does); the box starts as the part's bounding box.
+const BOX = { lo: new THREE.Vector3(), hi: new THREE.Vector3(), ok: false, drag: null, hover: -1 };
+const BOX_PLANES = Array.from({ length: 6 }, () => new THREE.Plane());   // side k: axis k >> 1, k & 1 ? max : min
+// (in the section's own style: accent edges over a faint glass fill, and on
+// each side an arrow like the section's, pointing out of the box)
+const BOX_COLOR = 0x6fd6bf;
+const box3 = new THREE.Box3();
+const boxHelp = new THREE.Group();
+const boxLines = new THREE.Box3Helper(box3, BOX_COLOR);
+boxLines.material.transparent = true; boxLines.material.opacity = 0.5; boxLines.material.depthTest = false;
+boxLines.renderOrder = 9;
+const boxGlass = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshBasicMaterial({ color: BOX_COLOR, transparent: true, opacity: 0.04, side: THREE.DoubleSide, depthWrite: false }));
+const BOX_DIRS = [0, 1, 2].flatMap((a) => [new THREE.Vector3().setComponent(a, -1), new THREE.Vector3().setComponent(a, 1)]);
+const boxKnobs = Array.from({ length: 6 }, (_, k) => {
+  const mat = new THREE.MeshBasicMaterial({ color: BOX_COLOR, depthTest: false, depthWrite: false, transparent: true });
+  const o = new THREE.Group();
+  const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.62, 10), mat);
+  shaft.position.y = 0.31;
+  const head = new THREE.Mesh(new THREE.ConeGeometry(0.15, 0.36, 16), mat);
+  head.position.y = 0.8;
+  const dot = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.16, 0.16), mat);   // square foot: it sits on a side
+  for (const c of [shaft, head, dot]) c.renderOrder = 10;
+  o.add(shaft, head, dot);
+  o.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), BOX_DIRS[k]);
+  o.userData = { k, mat };
+  return o;
+});
+boxHelp.add(boxGlass, boxLines, ...boxKnobs);
+boxHelp.visible = false;
+scene.add(boxHelp);
+function updateBox(b) {
+  const pad = Math.max(b.hi.distanceTo(b.lo), 1e-9) * 0.01;
+  if (!BOX.ok) { BOX.lo.copy(b.lo).subScalar(pad); BOX.hi.copy(b.hi).addScalar(pad); BOX.ok = true; }
+  const min = b.lo.clone().subScalar(pad), max = b.hi.clone().addScalar(pad);
+  BOX.lo.clamp(min, max); BOX.hi.clamp(min, max);
+  for (let a = 0; a < 3; a++) {
+    const u = AXES["xyz"[a]];
+    BOX_PLANES[2 * a].set(u.clone(), -BOX.lo.getComponent(a));          // keep x >= lo
+    BOX_PLANES[2 * a + 1].set(u.clone().negate(), BOX.hi.getComponent(a)); // keep x <= hi
+  }
+  box3.min.copy(BOX.lo); box3.max.copy(BOX.hi);
+  const c = BOX.lo.clone().add(BOX.hi).multiplyScalar(0.5);
+  boxGlass.position.copy(c);
+  boxGlass.scale.copy(BOX.hi).sub(BOX.lo).max(new THREE.Vector3(1e-9, 1e-9, 1e-9));
+  boxKnobs.forEach((o, k) => {
+    const a = k >> 1;
+    o.position.copy(c).setComponent(a, (k & 1 ? BOX.hi : BOX.lo).getComponent(a));
+  });
+}
+// knobs a fixed size on screen, brighter under the cursor or while dragged
+function boxTick() {
+  if (!boxHelp.visible) return;
+  const h = canvas.clientHeight || 1, t = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / h;
+  boxKnobs.forEach((o, k) => {
+    const on = BOX.drag?.k === k || BOX.hover === k;
+    o.scale.setScalar(camera.position.distanceTo(o.position) * t * 46);   // ~46 px long
+    o.userData.mat.color.set(on ? 0xffffff : BOX_COLOR);
+  });
+  boxGlass.material.opacity = BOX.drag ? 0.08 : 0.04;
+}
+function boxHit(e) {
+  if (!boxHelp.visible) return -1;
+  secRay(e);
+  // (an arrow's hit area: a ball around its middle, a little wider than it is long)
+  let best = -1, bd = Infinity;
+  const h = canvas.clientHeight || 1, t = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) / h;
+  const mid = new THREE.Vector3();
+  boxKnobs.forEach((o, k) => {
+    const px = camera.position.distanceTo(o.position) * t;
+    mid.copy(o.position).addScaledVector(BOX_DIRS[k], px * 22);
+    const r = px * 26;
+    const d = ray.ray.distanceToPoint(mid);
+    if (d < r && d / r < bd) { bd = d / r; best = k; }
+  });
+  return best;
+}
+// the point of axis line (origin, u) nearest the mouse ray, as a parameter along u
+function axisParam(e, origin, u) {
+  const rr = secRay(e);
+  const b = u.dot(rr.direction), w = origin.clone().sub(rr.origin);
+  const den = 1 - b * b;
+  if (den < 1e-3) return null;
+  return (b * rr.direction.dot(w) - u.dot(w)) / den;
+}
+{
+  const v = $("#view");
+  v.addEventListener("pointerdown", (e) => {
+    if (e.target !== canvas || e.button !== 0 || e.altKey || e.ctrlKey) return;
+    const k = boxHit(e);
+    if (k < 0) return;
+    e.stopPropagation(); e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    const a = k >> 1, u = AXES["xyz"[a]], origin = boxKnobs[k].position.clone();
+    BOX.drag = { k, a, u, origin, t0: axisParam(e, origin, u), v0: (k & 1 ? BOX.hi : BOX.lo).getComponent(a), y0: e.clientY };
+    canvas.style.cursor = "grabbing";
+  }, true);
+  v.addEventListener("pointermove", (e) => {
+    if (!BOX.drag) {
+      if (e.target !== canvas || e.buttons || controls.active) return;
+      const k = boxHit(e);
+      if (k !== BOX.hover) { BOX.hover = k; canvas.style.cursor = k >= 0 ? "grab" : ""; }
+      return;
+    }
+    e.stopPropagation();
+    const g = BOX.drag, t = g.t0 == null ? null : axisParam(e, g.origin, g.u);
+    let val;
+    if (t != null) val = g.v0 + (t - g.t0);
+    else {
+      const px = (2 * camera.position.distanceTo(g.origin) * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2))) / (canvas.clientHeight || 1);
+      val = g.v0 + (g.y0 - e.clientY) * px;
+    }
+    // a side never passes the opposite one
+    const gap = Math.max(BOX.hi.distanceTo(BOX.lo), 1e-9) * 1e-3;
+    if (g.k & 1) BOX.hi.setComponent(g.a, Math.max(val, BOX.lo.getComponent(g.a) + gap));
+    else BOX.lo.setComponent(g.a, Math.min(val, BOX.hi.getComponent(g.a) - gap));
+    updateSection();
+  }, true);
+  const up = (e) => {
+    if (!BOX.drag) return;
+    e.stopPropagation();
+    BOX.drag = null;
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+    BOX.hover = boxHit(e);
+    canvas.style.cursor = BOX.hover >= 0 ? "grab" : "";
+  };
+  v.addEventListener("pointerup", up, true);
+  v.addEventListener("pointercancel", up, true);
+}
+
 function sectionBounds() {
   const m = S.models[S.tab];
   if (!m) return null;
@@ -1229,14 +1482,18 @@ function sectionBounds() {
 // plane, helper geometry and UI from SEC
 function updateSection() {
   const b = sectionBounds();
-  const on = !!SEC.axis && !!b;
-  secHelp.visible = on;
-  $("#secbox").classList.toggle("show", on);
+  const on = !!SEC.axis && !!b, isBox = SEC.axis === "box";
+  secHelp.visible = on && !isBox;
+  boxHelp.visible = on && isBox;
+  $("#secbox").classList.toggle("show", on && !isBox);
   $("#secbtn").classList.toggle("on", !!SEC.axis);
-  $("#secbtn").textContent = SEC.axis ? `Section ${SEC.axis.toUpperCase()}` : "Section";
+  $("#secbtn").textContent = isBox ? "Box" : SEC.axis ? `Section ${SEC.axis.toUpperCase()}` : "Section";
   $$("#secmenu button[data-axis]").forEach((x) => x.classList.toggle("on", x.dataset.axis === SEC.axis));
-  $("#secmflip").disabled = $("#secmoff").disabled = !SEC.axis;
+  $("#secmbox").classList.toggle("on", isBox);
+  $("#secmflip").disabled = !SEC.axis || isBox;
+  $("#secmoff").disabled = !SEC.axis;
   if (!on) return;
+  if (isBox) { updateBox(b); return; }
   const k = "xyz".indexOf(SEC.axis), u = AXES[SEC.axis];
   SEC.lo = b.lo.getComponent(k); SEC.hi = b.hi.getComponent(k);
   const span = SEC.hi - SEC.lo, pad = Math.max(span, 1e-9) * 0.02;
@@ -1271,7 +1528,8 @@ const secFmt = (d) => String(+d.toFixed(Math.abs(SEC.hi - SEC.lo) >= 10 ? 3 : 4)
 function setSection(axis) {
   axis = axis || null;
   $("#secval").blur();   // a pending edit belongs to the old axis (its "change" fires now)
-  if (axis && axis !== SEC.axis) {
+  if (axis === "box" && SEC.axis !== "box") BOX.ok = false;   // a new box: the whole part
+  else if (axis && axis !== "box" && axis !== SEC.axis) {
     // a new axis starts through the middle of the part
     const b = sectionBounds();
     const k = "xyz".indexOf(axis);
@@ -1286,7 +1544,7 @@ function setSection(axis) {
   showSecMenu(false);
 }
 function flipSection() {
-  if (!SEC.axis) return;
+  if (!SEC.axis || SEC.axis === "box") return;
   SEC.flip = !SEC.flip;
   updateSection();
 }
@@ -1404,6 +1662,7 @@ function showSecMenu(on) { $("#secmenu").classList.toggle("show", on); }
 $("#secbtn").addEventListener("click", (e) => { e.stopPropagation(); showSecMenu(!$("#secmenu").classList.contains("show")); });
 $$("#secmenu button[data-axis]").forEach((b) => b.addEventListener("click", () => setSection(b.dataset.axis)));
 $("#secmflip").addEventListener("click", () => { flipSection(); showSecMenu(false); });
+$("#secmbox").addEventListener("click", () => setSection(SEC.axis === "box" ? null : "box"));
 $("#secmoff").addEventListener("click", () => setSection(null));
 document.addEventListener("pointerdown", (e) => {
   if (!e.target.closest("#secmenu, #secbtn")) showSecMenu(false);
@@ -1437,8 +1696,22 @@ function loop() {
   camera.updateMatrixWorld();
   hoverTick();
   secTick();
+  boxTick();
   pivotTick();
-  renderer.render(scene, camera);
+  const L = cmpLeft(), R = S.models[S.tab];
+  if (L && R) {
+    // compare: the same frame twice, each model in its own side of the line
+    const W = canvas.clientWidth, H = canvas.clientHeight, x = Math.round(CMP.x * W);
+    renderer.setScissorTest(true);
+    R.group.visible = false;
+    renderer.setScissor(0, 0, x, H);
+    renderer.render(scene, camera);
+    R.group.visible = true; L.group.visible = false;
+    renderer.setScissor(x, 0, W - x, H);
+    renderer.render(scene, camera);
+    L.group.visible = true;
+    renderer.setScissorTest(false);
+  } else renderer.render(scene, camera);
   drawGizmo();
   requestAnimationFrame(loop);
 }
@@ -1464,8 +1737,11 @@ function updateStatus() {
   if (!m) { $("#statusmain").textContent = S.input ? base(S.input) : "Ready"; return; }
   const [lo, hi] = m.h.bbox;
   const dims = hi.map((v, i) => fnum(v - lo[i])).join(" × ");
-  const what = m.kind === "stl" ? `${fmt(m.h.stats.triangles)} triangles` : `${fmt(m.h.stats.faces)} faces · ${fmt(m.h.stats.edges)} edges`;
-  $("#statusmain").innerHTML = `<b>${escapeHtml(m.h.name)}</b> — ${what} · ${dims} mm`;
+  const what = (m) => m.kind === "stl" ? `${fmt(m.h.stats.triangles)} triangles` : `${fmt(m.h.stats.faces)} faces · ${fmt(m.h.stats.edges)} edges`;
+  const L = cmpLeft();
+  $("#statusmain").innerHTML = L
+    ? `◧ <b>${escapeHtml(L.h.name)}</b> — ${what(L)} &nbsp;|&nbsp; <b>${escapeHtml(m.h.name)}</b> — ${what(m)} ◨ · ${dims} mm`
+    : `<b>${escapeHtml(m.h.name)}</b> — ${what(m)} · ${dims} mm`;
 }
 
 // ---------------------------------------------------------------- stats panel
@@ -1540,6 +1816,8 @@ async function pickInput(path) {
   S.isolate = null;
   S.fitted = null;
   S.fix.sel.clear();
+  CMP.on = false; updateCmpUI();
+  BOX.ok = false;   // the box hugs the new part
   setFixMode(false);
   try { localStorage.setItem("refit.input", path || ""); } catch {}
   refreshTabs(); renderStats(); updateCmd(); updateStatus(); setTitle();
@@ -1782,7 +2060,16 @@ $$("#display button[data-disp]").forEach((b) => b.addEventListener("click", () =
   if (!S.disp.shaded && !S.disp.edges && !S.disp.mesh) S.disp[k] = true;
   $$("#display button[data-disp]").forEach((x) => x.classList.toggle("on", S.disp[x.dataset.disp]));
   applyDisplay(S.models[S.tab]);
+  applyDisplay(cmpLeft());
 }));
+// full screen: the desktop window's own, else the page's
+async function toggleFullscreen() {
+  const api = native();
+  if (api?.toggle_fullscreen) { try { await api.toggle_fullscreen(); return; } catch {} }
+  try { document.fullscreenElement ? await document.exitFullscreen() : await document.documentElement.requestFullscreen(); }
+  catch (ex) { toast(`Full screen: ${ex?.message || ex}`); }
+}
+$("#fsbtn").addEventListener("click", toggleFullscreen);
 $("#flatbtn").addEventListener("click", () => setFlat(!S.flat));
 try { setFlat(localStorage.getItem("refit.flat") === "1"); } catch { setFlat(false); }
 $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () => {
@@ -1792,8 +2079,13 @@ $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () 
 }));
 window.addEventListener("keydown", (e) => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.key === "F11") { e.preventDefault(); toggleFullscreen(); return; }
   if ((e.ctrlKey || e.metaKey) && (e.key === "o" || e.key === "O")) { e.preventDefault(); openFile(); }
+  else if ((e.ctrlKey || e.metaKey) && (e.key === "z" || e.key === "Z")) { e.preventDefault(); undoFix(); }
+  else if (e.ctrlKey || e.metaKey || e.altKey) return;   // (Ctrl / Alt drive the camera)
   else if (e.key === "Escape") { showSecMenu(false); clearPick(); }
+  else if (e.key === "c" || e.key === "C") setCompare(!CMP.on);
+  else if (e.key === "b" || e.key === "B") setSection(SEC.axis === "box" ? null : "box");
   else if (e.key === "e" || e.key === "E") setFixMode(!S.fix.on);
   else if (e.key === "f" || e.key === "F") fit(null, null);
   else if (e.key === "i" || e.key === "I") fit(null, "iso");
@@ -1833,6 +2125,9 @@ window.refitUI = {
   orbit: () => setOrbit(!controls.free),
   section: (axis) => setSection(axis),
   flipSection,
+  compare: () => setCompare(!CMP.on),
+  fullscreen: toggleFullscreen,
+  undo: undoFix,
 };
 window.addEventListener("pywebviewready", () => { document.body.classList.add("native"); setTitle(); });
 
