@@ -31,6 +31,12 @@ def tri_of(shape, defl):
         aree.append(R.face_area(f))
         loc = TopLoc_Location()
         t = R.bt_Triangulation(f, loc)
+        # (a face the fine mesher gives up on - the cone of test10 at 0.01 - would vanish: coarser, as cadcmp.tri_of)
+        for d2 in (defl * 4, defl * 20, defl * 100):
+            if t is not None and t.NbTriangles() > 0:
+                break
+            BRepMesh_IncrementalMesh(f, d2, False, 0.5, True)
+            t = R.bt_Triangulation(f, loc)
         if t is not None:
             tr = loc.Transformation()
             P = np.array([[t.Node(i).Transformed(tr).X(), t.Node(i).Transformed(tr).Y(),

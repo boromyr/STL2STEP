@@ -427,6 +427,79 @@ def stl_info(path):
     return info
 
 
+# =============================================================================
+# Contours: the CAD's edges read from the mesh alone (tools/contours.py)
+# =============================================================================
+# Per triangle of the FILE (the page draws the file's triangles as they are):
+# the face contours.py groups it into; and the contour segments. With the
+# <name>_original.step beside it, also measured against the true CAD (aligned
+# by ICP): each segment caught / false, the CAD's edges no contour found
+# (missed), and the totals - as `contours.py MESH --cad ORIG`.
+_CONTOURS = {}
+
+
+def contours_bytes(stl, cad=None):
+    key = (_file_key(stl), _file_key(cad) if cad else None)
+    with _info_lock:
+        if key in _CONTOURS:
+            return _CONTOURS[key]
+    t0 = time.perf_counter()
+    R = refit_module()
+    tools = os.path.join(ROOT, "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    level = R.Log.level
+    import contours as C
+    R.Log.level = 100                    # (quiet while it runs - refit's log is the conversions')
+    with _OCC_lock:
+        try:
+            shB = R.read_input(stl)[0]
+            topo = R.Topo(shB)
+            c = C.Contours(topo)
+            m = c.m
+            a, b = m.ef[:, 0], m.ef[:, 1]
+            pred = c.border
+            stats = {"faces": int(len(np.unique(c.labels))), "contourLength": float(m.len[pred].sum()),
+                     "contourEdges": int(pred.sum())}
+            cls = np.zeros(len(pred), dtype=np.uint32)          # 0 contour (nothing to measure against)
+            show = pred.copy()
+            if cad:
+                of = C.ground_truth(cad, shB, topo, m)
+                true = of[a] != of[b]
+                cls[pred & true] = 1                            # caught
+                cls[pred & ~true] = 2                           # false
+                cls[true & ~pred] = 3                           # missed
+                show = pred | true
+                r = C.evaluate(m, c.labels, of, c.areas)
+                stats.update(cadFaces=r["cad_faces"], whole=r["whole"], split=r["split"], merged=r["merged"],
+                             wholeArea=r["whole_area"] / max(r["area"], 1e-300),
+                             caughtLength=r["caught_len"] / max(r["cad_len"], 1e-300),
+                             falseLength=r["false_len"], cadLength=r["cad_len"])
+        finally:
+            R.Log.level = level          # (contours.py silences refit's log on import)
+    ks = np.nonzero(show)[0]
+    seg = np.empty((2 * len(ks), 3), dtype=np.float32)
+    seg[0::2] = c.P0[ks]
+    seg[1::2] = c.P1[ks]
+    # the file's triangles <- refit's (it may drop or reorder some): by centroid
+    si = stl_info(stl)
+    _, near = cKDTree_of(c.cents).query(si["cen"])
+    _, lab = np.unique(c.labels, return_inverse=True)
+    header = {"kind": "contours", "cad": bool(cad), "stats": stats, "time": time.perf_counter() - t0}
+    data = pack(header, {"seg": seg, "cls": cls[ks], "lab": lab[near].astype(np.uint32)})
+    with _info_lock:
+        if len(_CONTOURS) > 6:
+            _CONTOURS.pop(next(iter(_CONTOURS)))
+        _CONTOURS[key] = data
+    return data
+
+
+def cKDTree_of(P):
+    from scipy.spatial import cKDTree
+
+    return cKDTree(P)
+
+
 def _close_pick(si, pick):
     """
     The pick (a mask over the input's triangles) with the few triangles it
@@ -1009,6 +1082,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not p.lower().endswith(EXTS) or not os.path.isfile(p):
                     return self._send(404, {"error": f"not found: {p}"})
                 return self._send(200, mesh_bytes(p), "application/octet-stream")
+            if u.path == "/api/contours":
+                p = resolve(q.get("path"))
+                if not p.lower().endswith(".stl") or not os.path.isfile(p):
+                    return self._send(404, {"error": f"not a mesh: {p}"})
+                cad = resolve(q["cad"]) if q.get("cad") else None
+                if cad and not os.path.isfile(cad):
+                    return self._send(404, {"error": f"not found: {cad}"})
+                return self._send(200, contours_bytes(p, cad), "application/octet-stream")
             if u.path == "/api/text":
                 p = resolve(q.get("path"))
                 if not p.lower().endswith(".txt") or not os.path.isfile(p):

@@ -279,6 +279,9 @@ table.stats tr.gap td { padding-top: 10px; }
       <button data-disp="mesh">Triangles</button>
       <button id="flatbtn" title="Unlit: every face its own colour, no shading">Flat</button>
       <span class="sep"></span>
+      <button id="ctrbtn" title="Mesh: the CAD's edges read from the triangles (tools/contours.py) - the contours orange, the faces between them coloured (K)">Contours</button>
+      <button id="chkbtn" title="Contours against the original CAD (<name>_original.step, aligned): caught green, false red, missed blue">Check</button>
+      <span class="sep"></span>
       <button data-color="type" class="on" title="Faces coloured by surface type">Type</button>
       <button data-color="faces" title="One colour per face">Faces</button>
       <button data-color="curves" title="Edges coloured by curve type">Curves</button>
@@ -622,6 +625,8 @@ const S = {
   files: [], input: null, paths: { input: null, output: null, cad: null },
   models: { input: null, output: null, cad: null }, tab: "input",
   disp: { shaded: true, edges: true, mesh: false }, color: "type", flat: false,
+  // contours of the mesh (tools/contours.py): on = shown; check = against the original CAD
+  ctr: { on: false, check: false },
   isolate: null, hover: -1, job: null, fitted: null,
   // hand fixes: on = picking mode; sel = faces picked (of the STEP shown);
   // groups = the input's hints file; mark = face -> type of a group not built yet
@@ -794,7 +799,16 @@ function recolor(m) {
   if (!m) return;
   const a = m.geo.attributes.color.array;
   if (m.kind === "stl") {
-    for (let k = 0; k < a.length; k += 3) { a[k] = PLAIN.r; a[k + 1] = PLAIN.g; a[k + 2] = PLAIN.b; }
+    const lab = S.ctr.on && m.ctr?.lab;
+    if (lab) {
+      // one soft colour per face the contours close (the lines say where they part)
+      for (let t = 0; t < lab.length; t++) {
+        tmp.setHSL((lab[t] * 0.6180339887) % 1, 0.45, 0.7);
+        for (let k = 9 * t, e = 9 * t + 9; k < e; k += 3) { a[k] = tmp.r; a[k + 1] = tmp.g; a[k + 2] = tmp.b; }
+      }
+    } else {
+      for (let k = 0; k < a.length; k += 3) { a[k] = PLAIN.r; a[k + 1] = PLAIN.g; a[k + 2] = PLAIN.b; }
+    }
   } else {
     for (let i = 0; i < m.h.faces.length; i++) paintFace(m, i);
     const ea = m.egeo.attributes.color.array;
@@ -823,7 +837,103 @@ function applyDisplay(m) {
     m.wire.visible = S.disp.mesh && !(cmpLeft() && m === S.models[S.tab]);
     m.wire.material.opacity = S.disp.shaded ? 0.85 : 1;
   }
+  if (m.kind === "stl") showContours(m);
   applyClip(m);
+}
+
+// ---------------------------------------------------------------- contours (mesh)
+// The CAD's edges as tools/contours.py reads them from the triangles: the server
+// computes them once per file (and, with Check, against <name>_original.step).
+const CTR_COLORS = [new THREE.Color("#ff7a1a"), new THREE.Color("#22c55e"), new THREE.Color("#ff2d2d"), new THREE.Color("#2f7bff")];
+const CTR_NAMES = ["contour", "caught", "false", "missed"];
+const ctrWant = () => (S.ctr.check && S.paths.cad ? S.paths.cad : "");
+async function fetchContours(m) {
+  const want = ctrWant(), path = S.paths.input;
+  const key = path + "|" + want;
+  if (m.ctr?.key === key || m.ctrLoading === key || m.ctrFailed === key) return;
+  m.ctrLoading = key;
+  overlay(want ? "Contours against the original CAD (aligning it)…" : "Reading the contours…");
+  try {
+    const res = await fetch("/api/contours?path=" + encodeURIComponent(path) + (want ? "&cad=" + encodeURIComponent(want) : ""));
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error; } catch {}
+      throw new Error(msg);
+    }
+    const buf = await res.arrayBuffer();
+    const hl = new DataView(buf).getUint32(0, true);
+    const h = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hl)));
+    const arr = (name) => {
+      const b = h.buffers[name];
+      const C = { float32: Float32Array, uint32: Uint32Array }[b.dtype];
+      return new C(buf, 4 + hl + b.offset, b.length);
+    };
+    if (S.models.input !== m || S.paths.input !== path) return;   // another file meanwhile
+    const seg = arr("seg"), cls = arr("cls");
+    const col = new Float32Array(seg.length);
+    for (let i = 0; i < cls.length; i++) {
+      const c = CTR_COLORS[cls[i]];
+      for (let k = 6 * i; k < 6 * i + 6; k += 3) { col[k] = c.r; col[k + 1] = c.g; col[k + 2] = c.b; }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(seg, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    if (m.ctr?.lines) { m.group.remove(m.ctr.lines); m.ctr.lines.geometry.dispose(); m.ctr.lines.material.dispose(); }
+    const lines = new THREE.LineSegments(g, new THREE.LineBasicMaterial({ vertexColors: true }));
+    lines.renderOrder = 2;
+    m.group.add(lines);
+    m.ctr = { key, h, lab: arr("lab"), lines };
+  } catch (e) {
+    toast(`Contours: ${e.message}`);
+    m.ctrFailed = key;                   // (not again for this file - showContours below would retry)
+    if (want) { S.ctr.check = false; updateCtrUI(); }
+  } finally {
+    if (m.ctrLoading === key) m.ctrLoading = null;
+    overlay(null);
+  }
+  showContours(m);
+  recolor(m);
+  applyClip(m);
+  renderStats();
+}
+function showContours(m) {
+  if (!m || m.kind !== "stl") return;
+  if (S.ctr.on && m === S.models.input) fetchContours(m);
+  if (m.ctr?.lines) m.ctr.lines.visible = S.ctr.on && m.ctr.key === S.paths.input + "|" + ctrWant();
+}
+function updateCtrUI() {
+  const stl = !!(S.paths.input && /\.stl$/i.test(S.paths.input));
+  $("#ctrbtn").disabled = !stl;
+  $("#chkbtn").disabled = !stl || !S.paths.cad;
+  $("#chkbtn").title = S.paths.cad ? "Contours against the original CAD (" + base(S.paths.cad) + ", aligned): caught green, false red, missed blue"
+    : "Check: needs <name>_original.step beside the mesh";
+  $("#ctrbtn").classList.toggle("on", S.ctr.on);
+  $("#chkbtn").classList.toggle("on", S.ctr.on && S.ctr.check);
+}
+function setContours(on, check = S.ctr.check) {
+  S.ctr.on = !!on;
+  S.ctr.check = !!check;
+  updateCtrUI();
+  const m = S.models.input;
+  if (m) { showContours(m); recolor(m); }
+  renderStats();
+  try { localStorage.setItem("refit.contours", S.ctr.on ? "1" : "0"); } catch {}
+}
+function contourStatsHtml(m) {
+  const c = S.ctr.on && m.ctr?.h;
+  if (!c) return "";
+  const st = c.stats, pct = (x) => (100 * x).toFixed(1) + "%";
+  const row = (a, b) => `<tr><td>${a}</td><td>${b}</td></tr>`;
+  const sw = (i) => `<span class="swatch" style="background:#${CTR_COLORS[i].getHexString()}"></span>`;
+  let html = `<tr class="gap"><td colspan="2"><b>Contours</b></td></tr>`;
+  html += row("Faces found", fmt(st.faces)) + row(`${sw(0)}Contours`, fmt(st.contourLength, 1) + " mm");
+  if (c.cad) {
+    html += row("CAD faces", fmt(st.cadFaces));
+    html += row("· whole", `${fmt(st.whole)} (${pct(st.wholeArea)} of the area)`) + row("· split", fmt(st.split)) + row("· merged", fmt(st.merged));
+    html += row(`${sw(1)}CAD edges caught`, pct(st.caughtLength) + ` of ${fmt(st.cadLength, 0)} mm`);
+    html += row(`${sw(2)}False`, fmt(st.falseLength, 1) + " mm") + row(`${sw(3)}Missed`, fmt(st.cadLength * (1 - st.caughtLength), 1) + " mm");
+  }
+  return html;
 }
 
 // ---------------------------------------------------------------- tabs
@@ -857,6 +967,7 @@ function refreshTabs() {
   });
   $("#tabs button[data-tab=output]").textContent = "STEP";
   $("#cmpbtn").disabled = !canCompare();
+  updateCtrUI();
 }
 
 // ---------------------------------------------------------------- compare (mesh ⇆ STEP)
@@ -1758,6 +1869,7 @@ function renderStats() {
     html += row("Open edges", st.boundaryEdges ? `<span style="color:var(--warn)">${fmt(st.boundaryEdges)}</span>` : "0");
     html += row("Non-manifold edges", st.nonManifoldEdges ? `<span style="color:var(--warn)">${fmt(st.nonManifoldEdges)}</span>` : "0");
     html += row("Area", fmt(st.area, 2) + " mm²");
+    html += contourStatsHtml(m);
     html += "</table>";
     box.innerHTML = html;
     return;
@@ -2071,6 +2183,11 @@ async function toggleFullscreen() {
 }
 $("#fsbtn").addEventListener("click", toggleFullscreen);
 $("#flatbtn").addEventListener("click", () => setFlat(!S.flat));
+$("#ctrbtn").addEventListener("click", () => setContours(!S.ctr.on));
+// (Check off again leaves the contours on)
+$("#chkbtn").addEventListener("click", () => setContours(true, !(S.ctr.on && S.ctr.check)));
+try { S.ctr.on = localStorage.getItem("refit.contours") === "1"; } catch {}
+updateCtrUI();
 try { setFlat(localStorage.getItem("refit.flat") === "1"); } catch { setFlat(false); }
 $$("#display button[data-color]").forEach((b) => b.addEventListener("click", () => {
   S.color = b.dataset.color;
@@ -2091,6 +2208,7 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "i" || e.key === "I") fit(null, "iso");
   else if (e.key === "o" || e.key === "O") setOrbit(!controls.free);
   else if (e.key === "l" || e.key === "L") showLog(!$("#log").classList.contains("show"));
+  else if ((e.key === "k" || e.key === "K") && !$("#ctrbtn").disabled) setContours(!S.ctr.on);
   else if (e.key === "1") loadTab("input");
   else if (e.key === "2") loadTab("output");
   else if (e.key === "3") loadTab("cad");
