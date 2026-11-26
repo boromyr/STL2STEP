@@ -42,6 +42,11 @@ Every threshold was tried on all six: what helped four and hurt test12/14 was le
                                                           strong contour no edge covers is a face
                                                           across a crease. Worst ones listed with
                                                           where they are and the faces they part.
+  python tools/contours.py MESH.stl --step OUT.step --hints H.json
+                                                          the faces found here whole that the
+                                                          conversion cut into pieces, as refit's
+                                                          hints (refit.py --hints H.json; all three
+                                                          steps: tools/refit_contours.py)
   --png FILE [--at X,Y,Z] [--dir DX,DY,DZ] [--span MM]    picture: the contours red (strong thick,
                                                           weak thin), and with --step the output's
                                                           faces by kind (plane grey, cylinder blue,
@@ -62,10 +67,11 @@ As a module:
   c.polylines()                             # the contours as chains of mesh vertices
   c.faces()                                 # per face: triangles, area, flat or curved
   c.follow(shape)                           # a B-Rep's edges against the contours
+  c.hints(shape)                            # refit's hints where the B-Rep cut a face found here
 """
 import sys, os, math, json, argparse
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -96,6 +102,10 @@ ABSORB_TRIS, ABSORB_FRAC = 3, 0.25  # a face of fewer triangles joins its neighb
 FIT_TOL = 5e-3                  # mm: two faces next to each other are one surface if all their vertices are this close to it
 PLANE_NANG = 0.1                # ... a plane: and each face's mean normal within this many degrees of the plane's
 AXIAL_TRIS = 4                  # ... a cylinder or cone: and each face of this many triangles at least
+GROW_ANG, GROW_OFF = 10.0, 0.05  # grow_axial(): a neighbour's triangles turn from the surface by this many degrees at
+                                #   most - all but this share of its area
+SMALL_TOL, SMALL_FOLD, SMALL_VERTS = 1e-3, 5.0, 8   # ... small faces together on one cylinder or cone: mm, degrees, vertices
+SCAN_VERTS = 400                # _axial_fit(): the cone's axis scanned (the normals can't tell it) on this many vertices at most
 SPLIT_TOL = 1.5e-3              # mm: a face no one surface fits is split if each part fits one this closely
 SPLIT_TRIS, SPLIT_SEEDS = 4, 24  # ... a face of this many triangles at least; surfaces grown from this many of its triangles
 CHORD_TESS, CHORD_NEAR, CHORD_TRIS = 3.0, 2.0, 4  # split_chords: tess across a chord; its ends not this x its length apart
@@ -103,7 +113,15 @@ CHORD_TESS, CHORD_NEAR, CHORD_TRIS = 3.0, 2.0, 4  # split_chords: tess across a 
 SPLIT_TRY = 1                   # ... grown parts tried, biggest first (2: 19 faces more whole, 85 mm more false; 4: 25, 192 mm)
 FREE_TESS, FREE_TOL = 1.0, 1e-3  # ... or, the rest fitting nothing (free-form), the part this closely - and the triangles changing
                                 # across its border (Mesh.tess, mean by length) this much at least
+SPLIT_TRIVIAL, SPLIT_NEAR = 6, 2.0  # ... not if every part has this many vertices or fewer (two strips: three rulings, a
+                                # cylinder through any) and the whole face is on one cylinder or cone within this x FIT_TOL
 SPLIT_PART = 0.05              # ... the grown part between this fraction of the face's area and 1 minus it
+HINT_COVER = 0.95               # hints(): a conversion's face holding this share of ours leaves it alone
+HINT_FRAG, HINT_LOOSE = 15, 0.03  # ... a free-form / torus / sphere face only if cut into this many (mm: torus, sphere)
+HINT_TRIS = 6
+HINT_AXIAL = 3.0                # ... a cylinder or cone within this x FIT_TOL before a torus or sphere within HINT_LOOSE
+HINT_EXACT = 1e-3               # ... less the conversion's cylinders, cones, tori its facets' vertices lie on within this (mm)
+HINT_DEV = 2.0                  # refit's "max_dev": edge tolerance ceilings the hint's surface may stand off vertices and facets
 
 
 class Mesh:
@@ -489,7 +507,7 @@ def merge_fitted(m, lab, kind, tol=FIT_TOL):
             return r if r < tol and tilt(la, n) <= PLANE_NANG and tilt(lb, n) <= PLANE_NANG else math.inf
         ts = np.array(tris[la] + tris[lb])
         try:
-            p = R.fit_axial(V, m.N[ts], m.area[ts])
+            p = R.fit_axial(V, m.N[ts], m.area[ts], shallow=True)
             if p is not None:
                 p = R.lm_refine(p, V, stall=True)
         except Exception:
@@ -532,9 +550,270 @@ def merge_fitted(m, lab, kind, tol=FIT_TOL):
     return np.array([find(int(l)) for l in lab.tolist()])
 
 
-def _surfaces(m, g):
+def _join_small(m, lab, tol=SMALL_TOL, fold=SMALL_FOLD, min_verts=SMALL_VERTS):
+    """
+    Faces too small to fit on their own (under AXIAL_TRIS triangles), next to each other across folds of `fold`
+    degrees at most, become one face where together they are one cylinder or cone - `min_verts` vertices at least,
+    all within `tol` - and no plane: a coarse band of quads and fans, each its own flat (test9: 3 faces of 3
+    triangles, 192 mm2, on a cylinder within 5e-7 mm).
+    """
+    P = m.topo.vpos
+    a, b = m.ef[:, 0], m.ef[:, 1]
+    cnt = defaultdict(int)
+    for l in lab.tolist():
+        cnt[l] += 1
+    small = {l for l, n in cnt.items() if n < AXIAL_TRIS}
+    k = np.nonzero((lab[a] != lab[b]) & ~m.sharp & (m.ang < fold))[0]
+    par = {l: l for l in small}
+
+    def find(x):
+        while par[x] != x:
+            par[x] = par[par[x]]
+            x = par[x]
+        return x
+    for x, y in zip(lab[a[k]].tolist(), lab[b[k]].tolist()):
+        if x in small and y in small:
+            par[find(x)] = find(y)
+    groups = defaultdict(list)
+    for l in small:
+        groups[find(l)].append(l)
+    lab = lab.copy()
+    for r, ls in groups.items():
+        if len(ls) < 2:
+            continue
+        g = np.nonzero(np.isin(lab, ls))[0]
+        if len(np.unique(m.tv[g])) < min_verts:
+            continue
+        s = _surfaces(m, g, scan=True)
+        if s[0][0] >= FIT_TOL and len(s) > 1 and s[1][0] < tol:
+            lab[g] = r
+    return lab
+
+
+def grow_axial(m, lab, tol=FIT_TOL, ang=GROW_ANG):
+    """
+    A curved face grows over its neighbours on ITS OWN cylinder or cone: the face of AXIAL_TRIS triangles or more
+    that one holds within `tol` (and no plane), the largest first, takes each neighbour - of any size - whose
+    vertices all lie on that surface within `tol` and whose triangles turn from it by `ang` degrees at most; the
+    surface fitted again on what it grew to, from where it was. ⚠️ NOT merge_fitted's pairs: that fits each two
+    faces again, the axis read off their normals - on a coarse wall the facets' normals span a few degrees, and the
+    axis came out wrong (test9's lettered wall, r 271 mm: one face of 437 mm2 in 31, single fans of 1-90 triangles
+    between the letters, each pair "a" cylinder r 444 tilted 18 degrees, or none). The surface of the largest one
+    holds them all within 2e-5 mm.
+    """
+    P = m.topo.vpos
+    a, b = m.ef[:, 0], m.ef[:, 1]
+    lab = _join_small(m, lab)
+    tris = defaultdict(list)
+    for i, l in enumerate(lab.tolist()):
+        tris[l].append(i)
+    nb = defaultdict(set)
+    k = np.nonzero((lab[a] != lab[b]) & ~m.sharp)[0]
+    for x, y in zip(lab[a[k]].tolist(), lab[b[k]].tolist()):
+        nb[x].add(y)
+        nb[y].add(x)
+    cos_ang = math.cos(math.radians(ang))
+
+    def surface(ts, start=None):
+        V = P[np.unique(m.tv[ts])]
+        try:
+            p = start if start is not None else R.fit_axial(V, m.N[ts], m.area[ts], shallow=True)
+            p = R.lm_refine(p, V, stall=True) if p is not None else None
+        except Exception:
+            return None
+        if p is None or getattr(p, "kind", None) != "axial":
+            return None
+        d = np.abs(p.dist(V))
+        return p if np.isfinite(d).all() and float(d.max()) < tol else None
+
+    def lies_on(p, ts):
+        ts = np.asarray(ts)
+        if float(np.abs(p.dist(P[np.unique(m.tv[ts])])).max()) >= tol:
+            return False
+        # (by area: a sliver between a letter's outline and a far vertex has its three vertices on the surface and
+        # any plane at all around its long side - test9's fans, hundreds of them, kept two faces of one r 404 wall)
+        n = p.normal_at(P[m.tv[ts]].mean(axis=1))
+        off = np.abs(np.einsum("ij,ij->i", n, m.N[ts])) < cos_ang
+        return float(m.area[ts][off].sum()) <= GROW_OFF * float(m.area[ts].sum())
+
+    tnb = defaultdict(list)          # triangle -> its neighbours across edges no crease marks
+    for x, y in zip(a[~m.sharp].tolist(), b[~m.sharp].tolist()):
+        tnb[x].append(y)
+        tnb[y].append(x)
+
+    def take_part(l, p, mine, x):
+        """the triangles of a free-form neighbour x (no plane, cylinder or cone holds it within SPLIT_TOL) that lie on
+        the surface p within FREE_TOL, joined to the face l, if the triangles change across where they part from the
+        rest of x (FREE_TESS, as split_fitted's free-form rest): test9's rim over the lettering, six coarse facets of
+        the r 404 wall in one face with the lip's chord wall beside them, 5.4 degrees apart"""
+        ts = tris[x]
+        if len(ts) < SPLIT_TRIS or fits_any(ts, SPLIT_TOL):
+            return None
+        ts = np.asarray(ts)
+        vs = np.unique(m.tv[ts])
+        ok = np.zeros(len(P), bool)
+        ok[vs[np.abs(p.dist(P[vs])) < FREE_TOL]] = True
+        n = p.normal_at(P[m.tv[ts]].mean(axis=1))
+        on = ok[m.tv[ts]].all(axis=1) & (np.abs(np.einsum("ij,ij->i", n, m.N[ts])) >= cos_ang)
+        cand = set(ts[on].tolist())
+        if not cand or len(cand) == len(ts):
+            return None
+        mineset = set(mine)
+        st = [t for t in cand if any(y in mineset for y in tnb[t])]
+        part = set(st)
+        while st:
+            for y in tnb[st.pop()]:
+                if y in cand and y not in part:
+                    part.add(y)
+                    st.append(y)
+        if not part or 2 * len(part) >= len(ts):
+            return None
+        inP = np.zeros(len(lab), bool)
+        inP[list(part)] = True
+        inX = lab == x
+        bd = (inP[a] != inP[b]) & inX[a] & inX[b]
+        if not bd.any() or float((m.tess[bd] * m.len[bd]).sum() / m.len[bd].sum()) < FREE_TESS:
+            return None
+        return sorted(part)
+
+    def holds(ts):
+        """a fit of its own holds the triangles ts too - what _surfaces will read, the hints' kind: test10's face of
+        14 triangles took 3 more within 5e-3 of its cylinder, read on its own at 5.5e-3 it went a sphere"""
+        u = np.asarray(ts)
+        V = P[np.unique(m.tv[u])]
+        q2 = _axial_fit(m, u, V)
+        return q2 is not None and float(np.abs(q2.dist(V)).max()) < tol
+
+    def fits_any(ts, t):
+        return any(r < t for r, _ in _surfaces(m, np.asarray(ts)))
+
+    seeds = []
+    for l, ts in tris.items():
+        if len(ts) < AXIAL_TRIS or not nb[l]:
+            continue
+        s = _surfaces(m, ts)
+        if s[0][0] < tol:
+            continue        # (a plane: merge_fitted's)
+        p = surface(ts)
+        if p is not None:
+            seeds.append((-float(m.area[ts].sum()), l, p))
+    seeds.sort(key=lambda q: q[:2])
+    par = {}
+
+    def find(x):
+        while par.get(x, x) != x:
+            x = par[x]
+        return x
+
+    for _, l, p in seeds:
+        if find(l) != l:
+            continue
+        mine = list(tris[l])
+        todo = set(nb[l])
+        seen = {l}
+        late, retried = [], False
+        while todo or (late and not retried):
+            if not todo:
+                # ⚠️ ONCE MORE, THE ONES ITS OWN FIT REFUSED, ON ALL IT GREW TO: on part of an arc the axis read off the
+                # normals can be anywhere (test9's r 271 wall: a 34 mm2 facet, vertices on it to 1e-5, refused at
+                # 1669 triangles - the fit 6.4 mm off - and fine at 2102). Which neighbour came first decided it.
+                todo, retried = {x for x in late if find(x) == x}, True
+                seen -= todo
+            x = todo.pop()
+            if x in seen or find(x) != x:
+                continue
+            seen.add(x)
+            if not lies_on(p, tris[x]):
+                part = take_part(l, p, mine, x)
+                if part and not holds(mine + part):
+                    late.append(x)      # (the same partial-arc axis as below: once more at the end)
+                elif part:
+                    mine += part
+                    pset = set(part)
+                    tris[x] = [t for t in tris[x] if t not in pset]
+                    lab[part] = l
+                    # (and the faces the part touches, on the far side of x: theirs to try too)
+                    todo |= {find(int(lab[y])) for t in part for y in tnb[t]} - seen
+                continue
+            q = surface(mine + tris[x], start=p)
+            if q is None:
+                continue
+            if not holds(mine + tris[x]):
+                late.append(x)
+                continue
+            p = q
+            par[x] = l
+            mine += tris[x]
+            todo |= nb[x] - seen
+    if not par:
+        return lab
+    return np.array([find(int(x)) for x in lab.tolist()])
+
+
+def _axial_fit(m, g, V, tol=FIT_TOL):
+    """
+    The cylinder or cone through the triangles g's vertices V (refit's fit_axial, refined on V), or None.
+    ⚠️ THE NORMALS WEIGHED BY THE TRIANGLE'S SHAPE TOO: a sliver between a letter's outline and a far vertex has
+    any plane at all around its long side - test9's r 404 wall, 770 triangles mostly slivers, read as nothing
+    (0.22 mm) though its vertices lie on the cylinder within 2e-4. ⚠️ AND WHERE THE NORMALS CAN'T TELL THE AXIS,
+    SCANNED: a cone band of a few facets has its normals on a short arc, and the cone's axis is anywhere in the
+    plane of their mean and of the axis across their spread (the cylinder's); a few dozen axes in that plane, the
+    closest refined (test9's coarse 45-degree chamfers, 19 facets of 147 mm2: 2.5e-2 mm read, 4e-7 scanned).
+    Only on a few hundred vertices: the coarse faces it is for.
+    """
+    T = m.topo.vpos[m.tv[g]]
+    e2 = sum(np.einsum("ij,ij->i", T[:, i] - T[:, j], T[:, i] - T[:, j]) for i, j in ((0, 1), (1, 2), (2, 0)))
+    q = np.clip(4.0 * math.sqrt(3.0) * m.area[g] / np.maximum(e2, 1e-300), 0.0, 1.0)
+    W = m.area[g] * q * q
+    if W.sum() <= 1e-12 * max(m.area[g].sum(), 1e-300):
+        W = m.area[g]
+
+    def done(p):
+        try:
+            p = R.lm_refine(p, V, stall=True) if p is not None else None
+        except Exception:
+            return None, math.inf
+        if p is None or getattr(p, "kind", None) != "axial":
+            return None, math.inf
+        d = np.abs(p.dist(V))
+        return (p, float(d.max())) if np.isfinite(d).all() else (None, math.inf)
+    try:
+        best, r = done(R.fit_axial(V, m.N[g], W, shallow=True))
+    except Exception:
+        best, r = None, math.inf
+    if r < tol or len(V) < 6 or len(V) > SCAN_VERTS:
+        return best
+    w = W / max(W.sum(), 1e-300)
+    N = m.N[g]
+    nb = (N * w[:, None]).sum(axis=0)
+    D = N - nb
+    sp = np.linalg.eigh((D * w[:, None]).T @ D)[1][:, 2]
+    a0 = np.cross(nb, sp)
+    if np.linalg.norm(nb) < 0.5 or np.linalg.norm(a0) < 1e-9:
+        return best
+    a0 /= np.linalg.norm(a0)
+    u = nb / np.linalg.norm(nb)
+    scan = []
+    for beta in np.radians(np.linspace(-80.0, 80.0, 33)):
+        ax = math.cos(beta) * a0 + math.sin(beta) * u
+        try:
+            p = R._axial_on_axis(V, ax / np.linalg.norm(ax), False, 3.0)
+        except Exception:
+            p = None
+        if p is not None:
+            scan.append((p.rms, p))
+    for _, p in sorted(scan, key=lambda s: s[0])[:2]:
+        p, rr = done(p)
+        if rr < r:
+            best, r = p, rr
+    return best
+
+
+def _surfaces(m, g, scan=False):
     """[(largest distance of the triangles g's vertices, distance function)]: the plane and the cylinder or cone
-    fitted to them"""
+    fitted to them (`scan`: by _axial_fit - slivers weighed down, the cone's axis scanned where the normals can't
+    tell it; for the coarse faces and the hints only. split_fitted's seeds read so parted test10's blend
+    otherwise, a "sphere" hint of 17 triangles came out of it)"""
     P = m.topo.vpos
     g = np.asarray(g)
     V = P[np.unique(m.tv[g])]
@@ -542,16 +821,21 @@ def _surfaces(m, g):
     n = np.linalg.svd(V - ctr, full_matrices=False)[2][2]
     out = [(float(np.abs((V - ctr) @ n).max()), lambda X, c=ctr, n=n: np.abs((X - c) @ n))]
     if len(g) >= 3:
-        try:
-            p = R.fit_axial(V, m.N[g], m.area[g])
-            if p is not None:     # (fit_axial reads the axis off the normals: on a narrow strip microns off)
-                p = R.lm_refine(p, V, stall=True)
-        except Exception:
-            p = None
+        if scan:
+            p = _axial_fit(m, g, V)
+        else:
+            try:
+                p = R.fit_axial(V, m.N[g], m.area[g], shallow=True)
+                if p is not None:     # (fit_axial reads the axis off the normals: on a narrow strip microns off)
+                    p = R.lm_refine(p, V, stall=True)
+            except Exception:
+                p = None
         if p is not None:
             d = np.abs(p.dist(V))
             if np.isfinite(d).all():
-                out.append((float(d.max()), lambda X, p=p: np.abs(p.dist(X))))
+                f = lambda X, p=p: np.abs(p.dist(X))
+                f.prim = p
+                out.append((float(d.max()), f))
     return out
 
 
@@ -593,6 +877,29 @@ def split_fitted(m, lab, tol=FIT_TOL, part_tol=SPLIT_TOL):
 
     def fits(g, t):
         return any(r < t for r, _ in _surfaces(m, g))
+
+    def trivial(g):
+        """a part any surface fits: a strip or two of a coarse wall, as few vertices as the surface has unknowns"""
+        return len(np.unique(m.tv[np.asarray(list(g))])) <= SPLIT_TRIVIAL
+
+    def one_wall(ts, parts):
+        """the whole face on one cylinder or cone within SPLIT_NEAR x tol (its axis scanned), and nothing changes across
+        where the parts meet: alike triangles (Mesh.tess under SAME_TESS, mean by length)"""
+        pid = np.full(len(lab), -1)
+        for j, c in enumerate(parts):
+            pid[list(c)] = j
+        bd = (pid[a] >= 0) & (pid[b] >= 0) & (pid[a] != pid[b])
+        if not bd.any() or float((m.tess[bd] * m.len[bd]).sum() / m.len[bd].sum()) >= SAME_TESS:
+            return False
+        s = _surfaces(m, ts, scan=True)
+        return len(s) > 1 and s[1][0] < SPLIT_NEAR * tol
+
+    def trivial_split(ts, parts):
+        # ⚠️ A FEW STRIPS OF A COARSE WALL FIT A CYLINDER EACH, ALWAYS: test9's rim, one facet tall in strips 5.7 mm
+        # wide, on a cylinder r 130 within 5.6e-3 (past tol), came apart in two and two strips - three rulings, three
+        # unknowns. Only where the triangles don't change across: test12's tangent planes and cylinders of 5-6 coarse
+        # triangles, as few vertices, part where they do (tess 0.65-2.1) - kept split, 4 of its 6 such faces right
+        return all(trivial(c) for c in parts) and one_wall(ts, parts)
 
     def comps(sel):
         """the connected pieces of the triangles sel"""
@@ -675,6 +982,8 @@ def split_fitted(m, lab, tol=FIT_TOL, part_tol=SPLIT_TOL):
         rest = comps([t for t in ts.tolist() if t not in S])
         if all(fits(c, tol) for c in rest):
             groups = settle(ts, [sorted(S)] + rest)
+            if trivial_split(ts, groups):
+                return None
             return groups if all(fits(c, part_tol) for c in groups) else None
         if not fits(np.array(sorted(S)), FREE_TOL):
             return None
@@ -684,7 +993,7 @@ def split_fitted(m, lab, tol=FIT_TOL, part_tol=SPLIT_TOL):
         bd = (inS[a] != inS[b]) & inF[a] & inF[b]
         if not bd.any() or float((m.tess[bd] * m.len[bd]).sum() / m.len[bd].sum()) < FREE_TESS:
             return None
-        return [sorted(S)] + rest
+        return None if trivial_split(ts, [sorted(S)] + rest) else [sorted(S)] + rest
 
     work = [l for l, ts in tris.items() if len(ts) >= SPLIT_TRIS]
     while work:
@@ -852,8 +1161,12 @@ def extract(m):
     lab = absorb_small(m, lab, cut)
     lab = merge_fitted(m, lab, "plane")
     lab = merge_fitted(m, lab, "axial")
+    lab = grow_axial(m, lab)
     lab = split_fitted(m, lab)
     lab = split_chords(m, lab)
+    # (again: a piece split_fitted parted from a face no surface held is on its neighbour's own surface - test9's
+    # r 404 wall, 79 triangles of a mixed face of 117 beside the 691 of the rest)
+    lab = grow_axial(m, lab)
     return lab, strong, weak, cut
 
 
@@ -1134,6 +1447,173 @@ class Contours:
                     edges_off=sum(1 for E in real if E["on"] < 0.999), worst=worst, all=edges,
                     strong_length=strong_len, strong_uncovered=unc_len, uncovered=unc[:n_worst])
 
+    def step_faces(self, shape, defl=0.01, margin=0.03):
+        """per triangle: the face of `shape` (a conversion of this mesh, in its frame) it lies on - of the faces within
+        `margin` the one whose normal is the triangle's own, then the nearest; -1 off every face"""
+        from align import tri_of
+        from icp import tri_index
+        tA, fA, _, _ = tri_of(shape, defl)
+        idx = tri_index(tA)
+        nA = np.cross(tA[:, 1] - tA[:, 0], tA[:, 2] - tA[:, 0])
+        nA /= np.maximum(np.linalg.norm(nA, axis=1), 1e-300)[:, None]
+        pi, ti, d, _ = idx.near(self.cents, margin)
+        f = fA[ti]
+        o = np.lexsort((d, f, pi)); pi, ti, d, f = pi[o], ti[o], d[o], f[o]
+        first = np.r_[True, (pi[1:] != pi[:-1]) | (f[1:] != f[:-1])]; pi, ti, d, f = pi[first], ti[first], d[first], f[first]
+        ang = np.degrees(np.arccos(np.clip(np.abs(np.einsum("ij,ij->i", self.m.N[pi], nA[ti])), 0.0, 1.0)))
+        o = np.lexsort((d, np.round(ang / 0.2), pi)); pi, f = pi[o], f[o]
+        first = np.r_[True, pi[1:] != pi[:-1]]
+        out = np.full(len(self.labels), -1); out[pi[first]] = f[first]
+        return out
+
+    def hints(self, shape, frag=HINT_FRAG, loose=HINT_LOOSE, min_tris=HINT_TRIS):
+        """
+        refit's hints (refit.py --hints) where the conversion `shape` cut one of these faces into pieces: the face that
+        one plane, cylinder or cone holds within FIT_TOL always (refit fits it again: a wrong one goes back); one only
+        a torus or sphere holds within `loose` mm, or none (one free-form patch), only if the conversion cut it into
+        `frag` faces or more. ⚠️ ONLY WHERE THE CONVERSION CUT: where its face is larger than ours, ours is the one cut
+        (test0: 14 of 14 such faces were halves of a whole CAD face). ⚠️ NOT ON A FEW PIECES: a tangent torus, sphere
+        and cylinder this file sees as one face, the conversion parts right into 2-12 analytic faces (test13: 9 free-
+        form hints, 57 -> 48 whole faces); a free-form wall it leaves as mesh comes in 15-76 (test12_foro). ⚠️ LESS ITS
+        EXACT CURVED PIECES: a free-form patch over the whole face took test18's tube bends - 27 of 104 cylinders and 7
+        of 21 tori gone into B-splines, the largest tolerance doubled. The conversion's cylinders, cones, tori whose
+        facets' vertices lie on them within HINT_EXACT stay; the hint is what is left, each connected piece still cut
+        in two or more. (Not the curved share as a test: test12's B-spline walls, one CAD face each, come in strips of
+        cylinders 12-78% of the area, and without those hints its false contours went 2960 -> 4417 mm.)
+        Returns [{"type", "label", "points" (centroids), "areas"}].
+        """
+        sf = self.step_faces(shape)
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        stype = [str(BRepAdaptor_Surface(R.td_Face(f)).GetType()).split("_")[-1] for f in R.explore(shape, R.TopAbs_FACE)]
+        curved = [t in ("Cylinder", "Cone", "Torus", "Sphere") for t in stype]
+        spline = [t in ("BSplineSurface", "BezierSurface") for t in stype]
+        m = self.m
+        P = m.topo.vpos
+        exact = {}
+
+        def is_exact(p):
+            """the conversion's face p is a cylinder, cone, torus or sphere its facets' vertices lie on"""
+            if p < 0 or not curved[p]:
+                return False
+            if p not in exact:
+                g = np.nonzero(sf == p)[0]
+                ok = False
+                if len(g) >= 4:
+                    V = P[np.unique(m.tv[g])]
+                    ok = min(r for r, _ in _surfaces(m, g)) < HINT_EXACT
+                    if not ok:
+                        try:
+                            q = R.fit_torus(self.cents[g], m.N[g], m.area[g])
+                            q = R.lm_refine(q, V, stall=True) if q is not None else None
+                            ok = q is not None and float(np.abs(q.dist(V)).max()) < HINT_EXACT
+                        except Exception:
+                            ok = False
+                exact[p] = ok
+            return exact[p]
+
+        def kind_of(g):
+            """a cylinder or cone within HINT_AXIAL x FIT_TOL, a torus or sphere within `loose`, else freeform"""
+            V = P[np.unique(m.tv[g])]
+            # ⚠️ THE CYLINDER BEFORE THE SPHERE: a wall one facet tall, a few strips on a cylinder within 5.6e-3 (test9's
+            # rim) is a "sphere" within `loose` too - and refit made it one
+            ax = _surfaces(m, g, scan=True)
+            if len(ax) > 1 and ax[1][0] < HINT_AXIAL * FIT_TOL:
+                return "cylinder" if abs(float(ax[1][1].prim.slope)) < 1e-3 else "cone"
+            for k, fit in (("torus", lambda: R.fit_torus(self.cents[g], m.N[g], m.area[g])), ("sphere", lambda: R.fit_sphere(V))):
+                try:
+                    q = fit()
+                    q = R.lm_refine(q, V, stall=True) if q is not None else None
+                except Exception:
+                    q = None
+                if q is not None and float(np.abs(q.dist(V)).max()) < loose:
+                    return k
+            return "freeform"
+
+        def pieces(sel):
+            """the connected pieces of the triangles sel (across the mesh's edges)"""
+            on = np.zeros(len(self.labels), bool); on[sel] = True
+            a, b = m.ef[:, 0], m.ef[:, 1]
+            k = on[a] & on[b]
+            par = {int(t): int(t) for t in sel}
+
+            def find(x):
+                while par[x] != x:
+                    par[x] = par[par[x]]; x = par[x]
+                return x
+            for x, y in zip(a[k].tolist(), b[k].tolist()):
+                rx, ry = find(x), find(y)
+                if rx != ry:
+                    par[rx] = ry
+            comp = defaultdict(list)
+            for t in sel:
+                comp[find(int(t))].append(int(t))
+            return [np.array(c) for c in comp.values()]
+        def coarse_exact(ts, tol=SMALL_TOL):
+            """...but a curved face of a few large facets, SMALL_VERTS vertices on a cylinder or cone within
+            `tol` and on no plane, is one surface whatever its count (test9: a wall r 403 mm, 236 mm2 in 5
+            triangles, cut in 5 flats)"""
+            if len(ts) < 3 or len(np.unique(m.tv[ts])) < SMALL_VERTS - 1:
+                return False
+            s = _surfaces(m, ts, scan=True)
+            return s[0][0] >= FIT_TOL and len(s) > 1 and s[1][0] < tol
+
+        def auto_hint(l, g, s):
+            h = dict(type="auto", label=f"contours face {l}", points=self.cents[g].tolist(), areas=self.areas[g].tolist(), max_dev=HINT_DEV)
+            if len(s) > 1 and getattr(s[1][1], "prim", None) is not None:
+                p = s[1][1].prim      # (refit's start where the facets' normals can't tell the axis - see fit_hint)
+                h["surface"] = dict(kind="axial", center=np.asarray(p.center, float).tolist(), axis=np.asarray(p.axis, float).tolist(),
+                                    r0=float(p.r0), slope=float(p.slope))
+            return h
+        out = []
+        groups = defaultdict(list)
+        for i, l in enumerate(self.labels.tolist()):
+            groups[l].append(i)
+        for l, ts in groups.items():
+            ts = np.asarray(ts)
+            # (within FIT_TOL as any hint: test9's rim, 5 triangles on a cone within 2.3e-3 cut in 4 flats)
+            if len(ts) < min_tris and not coarse_exact(ts, FIT_TOL):
+                continue
+            A = float(self.areas[ts].sum())
+            pf = np.unique(sf[ts])
+            share = np.array([self.areas[ts[sf[ts] == p]].sum() for p in pf])
+            if share.max() >= HINT_COVER * A:
+                continue
+            s = _surfaces(m, ts, scan=True)
+            kind = "plane" if s[0][0] < FIT_TOL else "auto" if len(s) > 1 and s[1][0] < FIT_TOL else None
+            if kind is None:
+                # ⚠️ ...BUT A FREE-FORM FACE IN FREE-FORM PIECES IS CUT, HOWEVER FEW: test9's chamfer and blend
+                # patches came in 2-12 B-spline pieces, its coarse blends (6-60 triangles, 25-90 mm2) in planes
+                # of a facet or two - 840 mm2, no hint. The conversion's own patches and flats, not the analytic
+                # faces test13's tangent fillets part into: those few pieces only if all
+                # B-splines or planes, less the exact ones.
+                few = len(pf) < frag
+                flat_or_free = lambda p: p >= 0 and (spline[int(p)] or stype[int(p)] == "Plane")
+                keep = ts[~np.array([is_exact(int(p)) for p in sf[ts]])]
+                ps = [int(p) for p in np.unique(sf[keep])]
+                if few and not all(flat_or_free(p) for p in ps):
+                    # ⚠️ ...LESS THOSE ANALYTIC PIECES, NOT THE WHOLE FACE, WHERE FLATS OF A FACET OR THREE ARE LEFT:
+                    # test9's top rims (12-47 mm2) in B-splines and single-facet flats beside one cone or cylinder
+                    # the vertices miss by 2.6e-3 - no hint, the flats left. With no such flat the analytic pieces
+                    # are the face's (test13's fillet: B-splines, a torus and cylinders - hinted, 59 -> 67 faces)
+                    if not any(p >= 0 and stype[p] == "Plane" and int((sf == p).sum()) <= 3 for p in ps):
+                        continue
+                    big = {p for p in ps if not flat_or_free(p) and int((sf == p).sum()) >= 4}
+                    keep = keep[~np.isin(sf[keep], list(big))] if big else keep
+                for g in pieces(keep):
+                    if len(np.unique(sf[g])) < 2:
+                        continue
+                    if len(g) >= min_tris:
+                        out.append(dict(type=kind_of(g), label=f"contours face {l}", points=self.cents[g].tolist(), areas=self.areas[g].tolist(), max_dev=HINT_DEV))
+                    elif coarse_exact(g, FIT_TOL):
+                        # ⚠️ ...AND A FEW COARSE FLATS ONE CYLINDER OR CONE HOLDS: test9's top rim, five single-
+                        # triangle flats (7 vertices on a cone within 2.1e-3) an exact cylinder parted from its
+                        # B-spline - too few for a patch, left as triangles
+                        out.append(auto_hint(l, g, _surfaces(m, g, scan=True)))
+                continue
+            out.append(auto_hint(l, ts, s) if kind == "auto" else
+                       dict(type=kind, label=f"contours face {l}", points=self.cents[ts].tolist(), areas=self.areas[ts].tolist(), max_dev=HINT_DEV))
+        return out
+
 
 # --- against the true CAD -------------------------------------------------------------------------
 
@@ -1334,6 +1814,7 @@ def main(argv=None):
     ap.add_argument("--at", type=lambda s: _vec(s, 3), help="X,Y,Z: centre of the picture (default: the --near ball's, or the part's)")
     ap.add_argument("--dir", type=lambda s: _vec(s, 3), default=[1.0, 1.0, 1.0], help="DX,DY,DZ: looking from there")
     ap.add_argument("--span", type=float, help="mm: half the picture's height (default: the --near radius, or half the part)")
+    ap.add_argument("--hints", help="with --step: refit's hints file (refit.py --hints) for the faces the conversion cut into pieces")
     ap.add_argument("--save", help=".npy: per triangle centroid x, y, z and face label")
     ap.add_argument("--json", help="everything measured")
     ap.add_argument("--worst", type=int, default=15, help="how many edges off the contours to list")
@@ -1380,6 +1861,13 @@ def main(argv=None):
             for u in f["uncovered"][:a.worst]:
                 print(f"    L {u['length']:.3f}  angle {u['angle']:5.1f}  at {np.round(u['mid'], 2).tolist()}")
         rep["follow"] = {k: v for k, v in f.items() if k != "all"}
+    if a.hints:
+        if shape is None:
+            ap.error("--hints needs --step (the conversion to compare)")
+        hs = c.hints(shape)
+        with open(a.hints, "w", encoding="utf-8") as fh:
+            json.dump({"refit_hints": 1, "groups": hs}, fh)
+        print(f"  hints: {len(hs)} faces the conversion cut ({', '.join(f'{k} {n}' for k, n in Counter(h['type'] for h in hs).items()) or 'none'}) -> {a.hints}")
     if a.png:
         at = a.at or (a.near[:3] if a.near else None)
         span = a.span or (a.near[3] if a.near else None)

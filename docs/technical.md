@@ -767,8 +767,45 @@ dropped before writing: the reader made a wire of its own out of one, and a 0.33
     it: a row of facets given to the neighbour) or "unseen" (no contour there) - and lists the strong
     contours no edge covers (a face across a crease); `--near X,Y,Z,R`, `--png` (contours red on the
     mesh or on the output's faces by kind), `--json`. Importable: `Contours(topo)`, `.polylines()`,
-    `.faces()`, `.follow(shape)`.
+    `.faces()`, `.follow(shape)`. A coarse curved wall (a few large facets, each its own flat) is put back
+    together by `grow_axial`: the largest face on a cylinder or cone takes every neighbour whose vertices
+    lie on that same surface, and faces too small to fit alone join when together they are one
+    cylinder or cone (test9's lettered wall, r 271 mm: 35 faces → 1).
     `python tools/contours.py test/test17.STL --step test/test17.step --near 20.2,-7.35,7.5,4 --png c.png`
+    With `--step OUT.step --hints H.json` it writes refit's hints for the faces it finds whole that the
+    conversion cut into pieces (`Contours.hints`): a face one plane, cylinder or cone holds within 5 µm
+    always (of 6 triangles at least, or fewer large ones whose 7+ vertices lie on the cylinder or cone
+    within 1 µm); a free-form, torus or sphere face only if cut into 15 faces or more, less the conversion's
+    cylinders, cones and tori its vertices lie on within 1 µm. Each group carries `"max_dev": 2`: its
+    surface may stand off the vertices and the facets by two edge tolerance ceilings (hand fixes: five,
+    vertices only).
+  - [`tools/refit_contours.py`](../tools/refit_contours.py) — refit helped by contours: convert, take the
+    hints above, convert again (the first output kept as `<OUT>_pass1.step`). On test12 whole CAD faces
+    943 → 969 and false edges 5.1 → 3.1 m at the same largest tolerance; test12_foro 503 → 278 faces;
+    test18, test15 a few faces fewer with their cylinders and tori kept; test0, 4, 13 untouched; test9
+    1041 → 526 (its coarse r 250-400 mm cylinders and chamfer cones, three strips each, one face each -
+    a contours hint needs two facets, not `--min-faces`; an analytic one isn't judged by its chords' sag,
+    the simplest plane/cylinder/cone within 5 µm goes before a B-spline, and the vertices refine a few
+    facets' axis only within a degree of what their normals read). A free-form face is hinted when cut in
+    15 pieces or more, or in fewer when they are all B-splines or flats (test9's chamfer and blend
+    patches) - where flats of 1-3 triangles sit beside one, a cone or cylinder piece of 4+ triangles
+    the vertices miss is left out, not the whole face (with no such flat the face is skipped: test13's
+    fillet, hinted, went 59 → 67); a piece too small for a patch (or a face of under 6 triangles) that one cylinder or cone holds
+    within 5 µm goes as an `auto` hint (test9's top rims: single-triangle flats 19 → 0). A free-form
+    hint may stand off its facets by up to 1.5× what the chords themselves sag (L·φ/6 on each edge,
+    within 2.5 caps): test9's coarse rim blend, 0.061 mm against a 0.059 cap, chords 0.05; its fine
+    faces' wiggly patches (0.07-0.1 mm on chords of 0.002) stay out. A hint facet that a neighbour's
+    conversion rebuilt (ReShape) is found again by its vertices (`Engine._refresh_fobjs`: test9's
+    coarse cones, "region's faces no longer present" 9 → 0). test9 on the viewer's options (`-a -c -a
+    0.005`): 1041 → 563 faces, largest tolerance 0.15 mm. The
+    coarse rims those faces leave - one 16 mm chord per neighbor, 0.08-0.12 mm off both exact surfaces -
+    become arcs at the end (`snap_arcs` takes a single chord whose tolerance is past twice its own: the
+    exact intersection, the circle about two near-coaxial axes through its ends, or between two analytic
+    surfaces with no closed-form meet the spline through their meet walked by Newton - not
+    GeomAPI_IntSS, which hung for 35 minutes on one chord).
+    `python tools/refit_contours.py test/test12.stl -o out.step -j 20`; `--from FIRST.step` starts from a
+    conversion already made (steps 2-3 only, half the time). In the viewer: **With contours** beside
+    Report, or **Refine with contours** under the Convert button once a conversion is shown.
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
     used during development.

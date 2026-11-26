@@ -158,6 +158,7 @@ select.field { cursor: pointer; }
 #go { background: var(--accent); color: var(--accent-ink); }
 #go:hover { filter: brightness(1.06); }
 #go:disabled { background: #2a2e36; color: #5c626d; cursor: default; filter: none; }
+#refine { background: transparent; border: 1px solid var(--accent); color: var(--accent); display: none; margin-top: 8px; }
 #cancel { background: transparent; border: 1px solid #5a3434; color: var(--err); display: none; }
 .presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; padding: 4px; background: var(--card); border: 1px solid var(--line); border-radius: 9px; margin-bottom: 8px; }
 .presets button { border: 0; background: transparent; color: var(--muted); padding: 6px 2px; border-radius: 6px; cursor: pointer; font-size: 12.5px; }
@@ -327,6 +328,7 @@ table.stats tr.gap td { padding-top: 10px; }
       <label><input type="checkbox" id="o_verbose"> Verbose</label>
       <label><input type="checkbox" id="o_nofree"> No B-spline</label>
       <label><input type="checkbox" id="o_noarcs"> No arcs</label>
+      <label title="tools/refit_contours.py: convert, find the faces of the mesh the conversion cut into pieces (tools/contours.py), convert again with them as hints. Twice the time; the first output kept as &lt;name&gt;_pass1.step"><input type="checkbox" id="o_contours"> With contours</label>
     </div>
     <details>
       <summary>More options</summary>
@@ -349,6 +351,7 @@ table.stats tr.gap td { padding-top: 10px; }
     <div id="cmd" title="Click to copy"></div>
     <div id="cmdnote"></div>
     <button class="big" id="go" disabled>Convert to STEP</button>
+    <button class="big" id="refine" title="The conversion shown, refined: the faces of the mesh it cut into pieces (tools/contours.py) converted again as hints - the second pass only. The one shown is kept as &lt;name&gt;_pass1.step">Refine with contours</button>
     <button class="big" id="cancel">Cancel</button>
     <div id="runstate">
       <div class="top"><div class="spin" id="runspin"></div><div class="ph" id="runphase"></div><div class="tm" id="runtime"></div></div>
@@ -1934,6 +1937,7 @@ async function pickInput(path) {
   try { localStorage.setItem("refit.input", path || ""); } catch {}
   refreshTabs(); renderStats(); updateCmd(); updateStatus(); setTitle();
   $("#go").disabled = !path || !!S.job;
+  syncRefine();
   if (!path) return;
   await loadTab("input");
   const rel = await (await fetch(`/api/related?path=${encodeURIComponent(path)}&args=${encodeURIComponent(buildArgs())}&output=${encodeURIComponent($("#output").value.trim())}`)).json();
@@ -1943,6 +1947,7 @@ async function pickInput(path) {
   S.mesh = rel.mesh || null;
   refreshTabs();
   renderFixes();
+  syncRefine();
   // prefetch in the background so the panel can compare them
   if (S.paths.output) loadTab("output", false).then(refreshHints);
   else refreshHints();
@@ -1995,7 +2000,7 @@ function updateCmd() {
   const inp = S.input ? q(base(S.input)) : "<file>";
   const outField = $("#output").value.trim();
   const hints = useHints() ? ` --hints ${q(base(S.fix.path))}` : "";
-  $("#cmd").textContent = `python refit.py ${inp}${args ? " " + args : ""}${hints}${outField ? " -o " + q(outField) : ""}`;
+  $("#cmd").textContent = `python ${$("#o_contours").checked ? "tools/refit_contours.py" : "refit.py"} ${inp}${args ? " " + args : ""}${hints}${outField ? " -o " + q(outField) : ""}`;
   $$("#presets button").forEach((b) => b.classList.toggle("on", b.dataset.seq === $("#seq").value.trim()));
   saveOpts();
   clearTimeout(outTimer);
@@ -2011,7 +2016,7 @@ $$("#presets button").forEach((b) => b.addEventListener("click", () => { $("#seq
 $("#cmd").addEventListener("click", () => { navigator.clipboard?.writeText($("#cmd").textContent); flash($("#cmd")); });
 function flash(el) { el.style.borderColor = "var(--accent)"; setTimeout(() => (el.style.borderColor = ""), 400); }
 
-const OPT_IDS = ["seq", "tol", "lintol", "threads", "extra", ...FLAGS.map((f) => f[0]), "o_j1", "o_hints"];
+const OPT_IDS = ["seq", "tol", "lintol", "threads", "extra", ...FLAGS.map((f) => f[0]), "o_j1", "o_hints", "o_contours"];
 // (the hand fixes go in when there are any and the box is ticked; the server adds the path)
 const useHints = () => !!(S.fix.path && S.fix.groups.length && $("#o_hints").checked);
 function saveOpts() {
@@ -2058,25 +2063,33 @@ $("#logbtn").addEventListener("click", () => showLog(!$("#log").classList.contai
 $("#logclose").addEventListener("click", () => showLog(false));
 $("#logcopy").addEventListener("click", () => { navigator.clipboard?.writeText($("#logtext").innerText); flash($("#logcopy")); });
 
-$("#go").addEventListener("click", async () => {
+// "Refine with contours": only for a mesh input with its conversion shown, nothing running
+function syncRefine() {
+  const ok = !!(S.input && S.paths.output && !S.job && /\.stl$/i.test(S.input));
+  $("#refine").style.display = ok ? "block" : "none";
+}
+$("#go").addEventListener("click", () => startRun({ contours: $("#o_contours").checked }));
+$("#refine").addEventListener("click", () => S.paths.output && startRun({ refine: true, output: S.paths.output }));
+async function startRun(how) {
   if (!S.input || S.job) return;
-  const body = { input: S.input, args: buildArgs(), output: $("#output").value.trim(), hints: useHints() };
+  const body = { input: S.input, args: buildArgs(), output: how.output || $("#output").value.trim(), hints: useHints(), contours: !!how.contours, refine: !!how.refine };
   const res = await fetch("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const j = await res.json();
   if (!res.ok) { toast(j.error); return; }
-  S.job = { id: j.id, input: S.input, next: 0, output: j.output, phase: "Starting…", t0: performance.now(), summary: [], fixres: {} };
+  S.job = { id: j.id, input: S.input, next: 0, output: j.output, phase: "Starting…", t0: performance.now(), summary: [], fixres: {}, contours: body.contours || body.refine };
   clearPick();
   renderFixes();
   $("#logtext").textContent = "";
   appendLog(["$ " + j.cmd.map(q).join(" "), ""]);
   $("#logtitle").textContent = "refit.py — " + base(S.input);
   $("#go").style.display = "none";
+  $("#refine").style.display = "none";
   $("#cancel").style.display = "block";
   $("#runstate").style.display = "block";
   $("#runspin").style.display = "";
   $("#runsum").innerHTML = "";
   poll();
-});
+}
 $("#cancel").addEventListener("click", async () => {
   if (!S.job) return;
   await fetch("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: S.job.id }) });
@@ -2094,6 +2107,9 @@ async function poll() {
       const b = /^== (.*?)\s*─*$/.exec(s);
       if (b) job.phase = b[1];
       if (/^\[✓\] .*input faces -> /.test(s) || /^\[✓\] Phase .*regions converted/.test(s)) job.summary.push(s.replace(/^\[✓\]\s*/, ""));
+      // (tools/refit_contours.py: how many faces contours.py gave as hints, or none)
+      const ch = /^\s+(\d+ faces \(.*?\))|^\s+(none: the conversion stays|contours\.py failed.*)/.exec(s);
+      if (ch) job.summary.push("Contours: " + (ch[1] ? ch[1] + " given as hints" : ch[2]));
       // the hand fixes' outcome (refit.py: "Hand fix N (type): ..."; the last word wins)
       const hf = /^\[(✓|!)\] Hand fix (\d+) \((.*?)\): (.*)$/.exec(s);
       if (hf) job.fixres[+hf[2]] = { ok: hf[1] === "✓", text: hf[4] };
@@ -2135,11 +2151,12 @@ async function poll() {
       const nf = Object.keys(job.fixres).length;
       if (nf) {
         const ok = Object.values(job.fixres).filter((r) => r.ok).length;
-        fixTag(`Hand fixes: <span class="hl">${ok} of ${nf} built</span>` + (ok < nf ? " · the others are back as they were (see the log)" : ""), 9000);
+        fixTag(`${job.contours ? "Hints (hand fixes and contours)" : "Hand fixes"}: <span class="hl">${ok} of ${nf} built</span>` + (ok < nf ? " · the others are back as they were (see the log)" : ""), 9000);
       }
     }
   }
   renderFixes();
+  syncRefine();
 }
 function fmtTime(s) { s = Math.round(s); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; }
 async function openReport(path) {

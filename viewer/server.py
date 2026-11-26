@@ -50,6 +50,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 REFIT = os.path.join(ROOT, "refit.py")
+REFIT_CONTOURS = os.path.join(ROOT, "tools", "refit_contours.py")
 TESTS = os.path.join(ROOT, "test")
 UPLOADS = os.path.join(ROOT, "viewer_uploads")
 EXTS = (".stl", ".step", ".stp")
@@ -1144,7 +1145,16 @@ class Handler(BaseHTTPRequestHandler):
                 # (the hand fixes picked in the page, if asked and there are any)
                 if body.get("hints") and os.path.isfile(hints_path(inp)) and "--hints" not in args:
                     args += ["--hints", hints_path(inp)]
-                cmd = [_python_exe(), "-u", REFIT, inp, *args, "-o", out, "--no-color"]
+                # (with contours: tools/refit_contours.py - refit.py, the faces it cut as hints, refit.py again;
+                # it passes the same arguments on)
+                # (refine: the conversion already there is the first pass - steps 2-3 only)
+                if body.get("refine"):
+                    if not os.path.isfile(out):
+                        return self._send(400, {"error": "convert it first: refine starts from the conversion shown"})
+                    cmd = [_python_exe(), "-u", REFIT_CONTOURS, inp, *args, "-o", out, "--from", out, "--no-color"]
+                else:
+                    prog = REFIT_CONTOURS if body.get("contours") else REFIT
+                    cmd = [_python_exe(), "-u", prog, inp, *args, "-o", out, "--no-color"]
                 j = Job(cmd, inp, out)
                 JOBS[j.id] = j
                 return self._send(200, {"id": j.id, "cmd": cmd, "output": out})

@@ -1114,6 +1114,17 @@ def face_area(face) -> float:
     return a
 
 
+def face_area_exact(face, eps: float = 1e-9) -> float:
+    # ⚠️ THE DEFAULT INTEGRATION IS OFF BY MORE THAN A CRESCENT on a big
+    # face with many edges: test9's r 404 lettered wall, 157 mm2 and 71
+    # edges, read 156.9085 against 156.9047 (3.8e-3) - and every arc of the
+    # letters beside it, 1.4e-3 allowed, was refused for that noise. With an
+    # eps it costs 0.03 s there, so only a check that failed asks for it.
+    g = GProp_GProps()
+    gp_Surface(face, g, eps)
+    return abs(float(g.Mass()))
+
+
 _VOL_MEMO: list = []  # [(shape, volume)], most recent last
 
 
@@ -1137,6 +1148,13 @@ def shape_volume(shape) -> float:
     _VOL_MEMO.append((shape, v))
     del _VOL_MEMO[:-6]
     return v
+
+
+def shape_volume_exact(shape, eps: float = 1e-6) -> float:
+    # (2-3 s on test9 against 0.1 s: only for a check the default failed)
+    g = GProp_GProps()
+    gp_Volume(shape, g, eps)
+    return float(g.Mass())
 
 
 def edge_length(edge) -> float:
@@ -1424,6 +1442,10 @@ MESH_SAG: Optional[float] = None
 # Whether the arcs smooth the zigzag seams between faces that agree (snap_arcs,
 # _seam_curve); --no-seams turns it off.
 SEAMS = not os.environ.get("REFIT_NO_SEAMS")  # (the environment: the worker processes read it too)
+# Edge tolerance ceilings an extruded band's strips may sag off its surface
+# (Segmenter._extrusion_bands); the hints of tools/contours.py get two too.
+SWEEP_CEILINGS = float(os.environ.get("REFIT_SWEEP_CEILINGS", "2.0"))
+EXTRUDE_EXACT_R = float(os.environ.get("REFIT_EXTRUDE_EXACT_R", "3.0"))
 # and how the chords' sag goes with the radius (_measure_mesh_turn): (sag
 # per mm of radius or None, largest radius seen, [(radius, sag)] of the
 # exact regions), or None.
@@ -4037,9 +4059,11 @@ def _axial_on_axis(P: np.ndarray, axis: np.ndarray, force_cyl: bool, max_slope: 
     return best
 
 
-def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.0, ratio_1d: float = 0.05) -> Optional[Prim]:
+def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.0, ratio_1d: float = 0.05,
+              shallow: bool = False) -> Optional[Prim]:
     """
-    Cylinder or cone.
+    Cylinder or cone. (`shallow`: the cylinder across the normals' spread tried next to the cone always, not only
+    where the cone missed - tools/contours.py, reading a coarse mesh's faces; see below.)
 
     The normals satisfy  n·a = s  constant  (s = 0 cylinder, s = sin(alpha)
     cone): i.e. the points {n_i} in normal-space lie on a PLANE. The fit is
@@ -4076,6 +4100,7 @@ def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.
         return None  # all normals identical
 
     cands = []
+    fallback = None
     if evals[1] <= ratio_1d * evals[2]:
         # --- 1D spread: degenerate ---
         spread = evecs[:, 2]
@@ -4094,11 +4119,33 @@ def fit_axial(P: np.ndarray, N: np.ndarray, W: np.ndarray, max_slope: float = 3.
         if n0 < 1e-9:
             return None
         cands.append((evecs[:, 0] / n0, False))
+        # ⚠️ AND THE CYLINDER ACROSS THE SPREAD TOO, ON A PARTIAL ARC: a coarse wall's facets are chords of the
+        # cylinder skewed in height, their normals tilted 1-3 degrees off the plane across the axis - the second
+        # spread, as large as the arc's own. The smallest eigenvector is then the MEAN NORMAL, and a cone along it
+        # came out (test9's lettered wall, r 271 mm, 16 degrees of arc: slope 0.7, 5.6 mm off; the cylinder 0.003).
+        # ⚠️ ONLY AS A FALLBACK, where the cone misses by 1% of the region's size: tried next to it on every region
+        # (even only on the flat cones, axis within 26 degrees of the mean normal) the cylinder won some of
+        # test13's rolling-ball cones and tori by a hair, 57 -> 74 faces
+        a = np.cross(nb, evecs[:, 2])
+        na = np.linalg.norm(a)
+        # (and the spread wide both ways, evals 15%: a chord's tilt is a third of the arc's spread or more there,
+        # test4's toroidal fillet patches, 3-10%, went cylinders - 47 -> 46 faces whole)
+        fallback = (a / na, True) if np.linalg.norm(nb) > 0.5 and na > 1e-9 and evals[1] > 0.15 * evals[2] else None
+        if shallow and fallback is not None:
+            cands.append(fallback)
+            fallback = None
 
     best = None
     for axis, force_cyl in cands:
         q = _axial_on_axis(P, axis, force_cyl, max_slope)
         if q is not None and (best is None or q.rms < best.rms):
+            best = q
+    span = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+    # (where the cone came out and missed - not where none did: test13's small toroidal patches went cylinders)
+    if fallback is not None and best is not None and best.rms > 1e-2 * span:
+        q = _axial_on_axis(P, fallback[0], True, max_slope)
+        # (a shallow arc only, under 30 degrees: the radius twice the region)
+        if q is not None and q.r0 > 2.0 * span and q.rms < best.rms:
             best = q
     return best
 
@@ -4695,12 +4742,22 @@ def fit_extrusion(P: np.ndarray, Nrep: np.ndarray, d: np.ndarray, tol: float, ch
             cx, cz, r = taubin_circle(prof[:, 0], prof[:, 1])
         except Exception:
             r = math.inf
-        if np.isfinite(r) and 0.0 < r <= max_radius:
-            cyl = lm_refine(Prim(AXIAL, C + cx * X + cz * Z, Y.copy(), float(r), 0.0), P, fix_r=None)
+        # ⚠️ PAST THE RADIUS CAP ONLY WHEN THE VERTICES SIT ON THE ARC.
+        # test9's bottom outline is two CAD arcs, r 248.5 and r 381.8, three
+        # strips each, vertices on them within 1e-5: over the cap (1.5 diag,
+        # 222 mm), both went into one B-spline. A band is curved by its
+        # creases, so a big circle isn't a plane in disguise - but only an
+        # exact one is trusted (EXTRUDE_EXACT_R caps, 0.1 tol on the vertices).
+        if np.isfinite(r) and 0.0 < r <= EXTRUDE_EXACT_R * max_radius:
+            cyl = Prim(AXIAL, C + cx * X + cz * Z, Y.copy(), float(r), 0.0)
+            if r <= max_radius:
+                # (past it the axis IS d: at r 400 a tilt of 0.01 degrees turns
+                # the rims into ellipses (test9), so the profile circle is kept)
+                cyl = lm_refine(cyl, P, fix_r=None)
             if cyl is not None and abs(cyl.slope) < 1e-9 and float(np.abs(cyl.axis @ Y)) >= math.cos(math.radians(1.0)):
                 cyl.slope = 0.0
                 dm = float(np.abs(cyl.dist(P)).max())
-                ok = dm <= tol and normal_deviation(cyl, P_all, Nrep) <= 10.0
+                ok = dm <= (tol if cyl.r0 <= max_radius else 0.1 * tol) and normal_deviation(cyl, P_all, Nrep) <= 10.0
                 if ok and check is not None and len(check) and check_tol is not None:
                     ok = float(np.abs(cyl.dist(np.asarray(check, float))).max()) <= check_tol
                 if ok:
@@ -7534,6 +7591,88 @@ def _coax_profile_circles(pa: "Prim", pb: "Prim", tol: float) -> List["_Curve"]:
         if rho > 10.0 * tol:
             out.append(_circle(O + t * a, a, rho))
     return out
+
+
+def _near_coax_circle(pa: "Prim", pb: "Prim", P0: np.ndarray, P1: np.ndarray, tol: float) -> Optional[CCircle]:
+    """
+    ⚠️ COAXIAL IN THE PART, NOT IN THE FIT. test9's r271 cylinder and the
+    45-degree cone on it were each fitted on three facets of 3.4 degrees:
+    vertices on both to 1e-6, the axes parallel to 1e-7 - and 0.012 mm apart,
+    as close as a 10-degree arc pins an axis 271 mm away. The exact circle
+    about one axis misses the chord's ends by 0.017 and no exact curve is
+    taken: the 16 mm chord stays, 0.12 off both faces. Their meet is the
+    circle about the axis they nearly share, through the two ends: a
+    hundredth off each face where the chord was a tenth. For two surfaces
+    of revolution with axes within half a degree and 2e-4 of the radius,
+    and ends at one height on it; snap_arcs judges it on the faces.
+    """
+    ax = [p for p in (pa, pb) if p is not None and p.kind in (AXIAL, TORUS) and p.axis is not None]
+    if len(ax) < 1 or any(p.kind not in (AXIAL, TORUS, SPHERE) for p in (pa, pb)):
+        return None
+    a = ax[0].axis / np.linalg.norm(ax[0].axis)
+    O = ax[0].center
+    if len(ax) == 2:
+        b = ax[1].axis / np.linalg.norm(ax[1].axis)
+        cs = float(a @ b)
+        if abs(cs) < math.cos(math.radians(0.5)):
+            return None
+        a = a + (b if cs > 0 else -b)
+        a = a / np.linalg.norm(a)
+    other = pb if ax[0] is pa else pa
+    d = other.center - O
+    off = float(np.linalg.norm(d - (d @ a) * a))
+    rr = [float(np.linalg.norm((P - O) - ((P - O) @ a) * a)) for P in (P0, P1)]
+    if off > max(tol, 2e-4 * max(rr)):
+        return None
+    if off > 0.0:
+        O = O + 0.5 * (d - (d @ a) * a)  # between the two axes
+    if abs(float((P1 - P0) @ a)) > tol:
+        return None  # not at one height: no circle about this axis
+    m = 0.5 * (P0 + P1)
+    c = O + float((m - O) @ a) * a
+    u = (P1 - P0) - float((P1 - P0) @ a) * a
+    if float(np.linalg.norm(u)) < 1e-9:
+        return None
+    u = u / np.linalg.norm(u)
+    c = c - float((c - m) @ u) * u  # on the chord's bisector: through both ends
+    r = float(np.linalg.norm(P0 - c))
+    if r <= 10.0 * tol or abs(r - 0.5 * (rr[0] + rr[1])) > max(tol, 2e-4 * r):
+        return None
+    return _circle(c, a, r)
+
+
+def _meet_spline(pa: "Prim", pb: "Prim", P0: np.ndarray, P1: np.ndarray, tol: float, n: int = 9) -> Optional["CGeom"]:
+    """
+    The meet of two analytic surfaces between two points on both, as the
+    cubic spline through n points of it: the chord's points walked onto both
+    surfaces at once (Newton, the least step off the pair of constraints).
+    None where it doesn't converge (tangent surfaces) or turns back.
+    """
+    Q = P0 + np.linspace(0.0, 1.0, n)[:, None] * (P1 - P0)
+    for _ in range(40):
+        f = np.stack([pa.dist(Q), pb.dist(Q)], axis=1)  # (n, 2)
+        if float(np.abs(f).max()) < 1e-9:
+            break
+        Na, Nb = pa.normal_at(Q), pb.normal_at(Q)
+        # (dist and normal_at agree in sign: the step is -J^T (J J^T)^-1 f)
+        g11 = np.einsum("ij,ij->i", Na, Na)
+        g12 = np.einsum("ij,ij->i", Na, Nb)
+        g22 = np.einsum("ij,ij->i", Nb, Nb)
+        det = g11 * g22 - g12 * g12
+        if float(det.min()) < 1e-6:
+            return None  # tangent: no well-posed meet
+        la = (g22 * f[:, 0] - g12 * f[:, 1]) / det
+        lb = (g11 * f[:, 1] - g12 * f[:, 0]) / det
+        Q = Q - la[:, None] * Na - lb[:, None] * Nb
+    if not np.all(np.isfinite(Q)) or float(np.abs(np.stack([pa.dist(Q), pb.dist(Q)])).max()) > 0.1 * tol:
+        return None
+    if float(np.linalg.norm(Q[0] - P0)) > tol or float(np.linalg.norm(Q[-1] - P1)) > tol:
+        return None
+    Q[0], Q[-1] = P0, P1
+    d = np.diff(Q, axis=0)
+    if float((d @ (P1 - P0)).min()) <= 0.0:
+        return None  # walked back along it: not one branch between the ends
+    return _chain_spline(Q)
 
 
 def _sphere_torus_meridian(sp: "Prim", tr: "Prim", tol: float) -> List["_Curve"]:
@@ -13826,23 +13965,56 @@ class Segmenter:
         if not crease:
             return regions
         nb = defaultdict(list)
-        for (i, j), (dd, _) in crease.items():
-            nb[i].append((j, dd))
-            nb[j].append((i, dd))
-        def grow_bands(allowed):
+        for (i, j), (dd, th) in crease.items():
+            nb[i].append((j, dd, th))
+            nb[j].append((i, dd, th))
+        # ⚠️ A SHALLOW CREASE HAS NO DIRECTION. test9's outer rim is a wall
+        # one facet tall whose lower rim runs downhill: the strips come in
+        # pairs of triangles, one dead vertical, the other leaning 0.3-1.4
+        # degrees. Between two strips 0.7-1.7 degrees apart that lean is as
+        # big as the turn, and n_a x n_b swung 25-65 degrees off the wall's
+        # axis: the band broke at every leaning triangle, and the rim came
+        # out in planes, triangles and small splines. Under 3 degrees the
+        # crease only has to join two strips square to d (the strips'
+        # own rule); the direction is read from the sharper creases, each
+        # weighted by its turn.
+        # ⚠️ ...AND A BAND GROWN THAT WAY ONLY REPLACES THE STRICT ONES WHEN
+        # IT ENDS UP IN FEWER FACES. On a rolling-ball fillet (test13) the
+        # same noise sits on creases 3-10 degrees off d: relaxed, they grew
+        # bands of 30-50 strips over the round that failed and were cut into
+        # cylinders (57 -> 61 faces, arcs lost; test16/17 +2..+22). Locally
+        # the two are the same thing (dd is the shared edge, never anything
+        # else): only the outcome tells them apart. The strict bands run
+        # first, as they always did; a relaxed band is fitted afterwards and
+        # kept where it takes every strict piece it touches and leaves fewer
+        # faces behind. It only joins two or more swept faces that are already
+        # there into fewer: on strips no strict band took, 3-7 of them made a
+        # spline each and the round they belonged to came out in more pieces
+        # (test16 +6); stretching a single strict face over its loose
+        # neighbours cost test12 27 faces downstream.
+        shallow = math.radians(3.0)
+
+        def along(dd, th, d0, relax) -> bool:
+            return (relax and th < shallow) or abs(float(dd @ d0)) >= cos3
+
+        def grow_bands(allowed, relaxed=False):
             done = set()
             bands_ = []
-            for (i, j), (d0, _) in sorted(crease.items(), key=lambda kv: -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]])):
+            # a relaxed seed has to say where d is: the sharp creases first,
+            # and a band seeded on a shallow one stays strict
+            key = (lambda kv: (kv[1][1] < shallow, -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]]))) if relaxed else (lambda kv: -(topo.areas[kv[0][0]] + topo.areas[kv[0][1]]))
+            for (i, j), (d0, th0) in sorted(crease.items(), key=key):
                 if i in done or j in done or i not in allowed or j not in allowed:
                     continue
+                relax = relaxed and th0 >= shallow
                 g = {i, j}
                 st = [i, j]
                 while st:
                     a = st.pop()
-                    for b, dd in nb[a]:
+                    for b, dd, th in nb[a]:
                         if b in g or b in done or b not in allowed:
                             continue
-                        if abs(float(dd @ d0)) >= cos3 and abs(float(topo.norms[b] @ d0)) <= sin3:
+                        if along(dd, th, d0, relax) and abs(float(topo.norms[b] @ d0)) <= sin3:
                             g.add(b)
                             st.append(b)
                 if len(g) >= 3:
@@ -13855,11 +14027,18 @@ class Segmenter:
         def links(g):
             return [(k, v[1]) for k, v in crease.items() if k[0] in g and k[1] in g]
 
+        lean = [False]
+
         def fit_once(g, d0, cut):
             fs = sorted(g)
-            # the extrusion direction: the band's creases averaged (sign-aligned)
-            ds = [crease[k][0] * (1.0 if float(crease[k][0] @ d0) >= 0 else -1.0) for k, _ in links(g) if k not in cut]
-            d = np.mean(ds, axis=0) if ds else d0
+            # the extrusion direction: the band's creases averaged (sign-aligned);
+            # in a relaxed band only the creases along d0, weighted by their turn
+            if lean[0]:
+                ds = [crease[k][0] * (th if float(crease[k][0] @ d0) >= 0 else -th) for k, th in links(g) if k not in cut and abs(float(crease[k][0] @ d0)) >= cos3]
+                d = np.sum(ds, axis=0) if ds else d0
+            else:
+                ds = [crease[k][0] * (1.0 if float(crease[k][0] @ d0) >= 0 else -1.0) for k, _ in links(g) if k not in cut]
+                d = np.mean(ds, axis=0) if ds else d0
             d = d / np.linalg.norm(d)
             P = np.vstack([topo.verts[i] for i in fs])
             Nrep = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in fs])
@@ -13882,24 +14061,23 @@ class Segmenter:
             # curve, the spline through the vertices took all of it, and the
             # rims came out with 0.14 mm tolerances. That coarse, the mesh
             # doesn't say where the wall is: it stays as it was.
+            # ⚠️ ...TWO CEILINGS WHERE THE CHORDS THEMSELVES SAG PAST ONE, AS
+            # FOR THE HINTS. test9's rim is a wall one facet tall cut in
+            # strips 5.7 mm wide, 2.3-2.7 degrees apart: their chords sit
+            # 0.033 mm inside the curve, one ceiling is 0.0296 - no surface
+            # through the vertices could pass - and every strip stayed a plane
+            # of its own (tools/contours.py's hints get HINT_DEV = 2 ceilings
+            # off the facets). ONLY THERE: two ceilings everywhere let test2's
+            # two bands of fine strips (sag under one) grow into one of 17
+            # the B-Rep refused - 83 -> 95 faces, 40 polylines more.
             ceiling = max(20.0 * self.tol_fit, 2e-4 * self.diag)
+            if sag > ceiling:
+                ceiling *= SWEEP_CEILINGS
             pr = fit_extrusion(P, Nrep, d, self.tol_fit, check=sag_points(topo, fs, dense=True), check_tol=min(2.0 * sag + 2.0 * self.tol_fit, ceiling), max_radius=self.max_radius, spline=self.allow_free)
             return pr, fs, P, d, sag, width
 
-        def kink(fs, live, d, width):
-            """
-            ⚠️ CUT WHERE THE CURVATURE JUMPS, NOT AT THE SHARPEST CREASE. On
-            an outline whose radius drifts from 20 to 24 mm the strips meet at
-            1-5 degrees, the widest strips at the widest angles: cutting at
-            the sharpest crease split test14's wall in the middle of a smooth
-            stretch, again and again, into six pieces - while what kept the
-            band from fitting was a 2 mm fillet at one end (curving the other
-            way) and a reversed 1.4-degree crease (two CAD faces meeting at a
-            corner of 4 degrees) where the turns run +2.3, +2.4. Along the
-            strips' chain each crease's signed curvature (turn over the mean
-            width of its two strips) is compared with its neighbours'; the
-            crease that departs most is cut. None if the band isn't a chain.
-            """
+        def chain_of(fs, live):
+            """The band's strips in order along the profile; None if not a chain."""
             sfs = set(fs)
             adj_ = defaultdict(list)
             for (a_, b_), th in live:
@@ -13917,7 +14095,24 @@ class Segmenter:
                 if not nx or nx[0] in chain:
                     return None
                 chain.append(nx[0])
-            if len(chain) < 3:
+            return chain
+
+        def kink(fs, live, d, width):
+            """
+            ⚠️ CUT WHERE THE CURVATURE JUMPS, NOT AT THE SHARPEST CREASE. On
+            an outline whose radius drifts from 20 to 24 mm the strips meet at
+            1-5 degrees, the widest strips at the widest angles: cutting at
+            the sharpest crease split test14's wall in the middle of a smooth
+            stretch, again and again, into six pieces - while what kept the
+            band from fitting was a 2 mm fillet at one end (curving the other
+            way) and a reversed 1.4-degree crease (two CAD faces meeting at a
+            corner of 4 degrees) where the turns run +2.3, +2.4. Along the
+            strips' chain each crease's signed curvature (turn over the mean
+            width of its two strips) is compared with its neighbours'; the
+            crease that departs most is cut. None if the band isn't a chain.
+            """
+            chain = chain_of(fs, live)
+            if chain is None or len(chain) < 3:
                 return None
             k_ = []
             for a_, b_ in zip(chain[:-1], chain[1:]):
@@ -13963,6 +14158,32 @@ class Segmenter:
                         fit_band(set(c), d0, cut, depth + 1, out)
                 return
             pr, fs, P, d, sag, width = fit_once(g, d0, cut)
+            if pr is not None and pr.kind == FREE and sag > max(20.0 * self.tol_fit, 2e-4 * self.diag):
+                # ⚠️ A SPLINE THE SECOND CEILING LET THROUGH MAY BE TWO ARCS.
+                # test9's bottom wall: r 248.5 then r 381.8, three strips each,
+                # one B-spline over both. The curvature steps there, and kink()
+                # (departure from the neighbours) peaks BESIDE a step - it cut
+                # 4 + 2. Every cut of the chain leaving three strips or more a
+                # side is tried; the two pieces are kept only if both are
+                # analytic, the best by vertex rms.
+                ch = chain_of(fs, [(k, th) for k, th in links(g) if k not in cut])
+                best = None
+                if ch is not None and len(ch) == len(fs) and len(ch) >= 6:
+                    for m in range(3, len(ch) - 2):
+                        kb = (min(ch[m - 1], ch[m]), max(ch[m - 1], ch[m]))
+                        pa, fa = fit_once(set(ch[:m]), d, cut | {kb})[:2]
+                        if pa is None or pa.kind == FREE:
+                            continue
+                        pb, fb = fit_once(set(ch[m:]), d, cut | {kb})[:2]
+                        if pb is None or pb.kind == FREE:
+                            continue
+                        sc_ = pa.rms * len(fa) + pb.rms * len(fb)
+                        if best is None or sc_ < best[0]:
+                            best = (sc_, [(pa, fa), (pb, fb)])
+                if best is not None:
+                    Log.debug(f"  extruded band at {np.round(P.mean(axis=0), 2)}: two arcs {[f'{p_.r0:.2f}' for p_, _ in best[1]]}, not one spline")
+                    out.extend(best[1])
+                    return
             if pr is not None:
                 if Log.level <= 10:
                     chk = sag_points(topo, fs)
@@ -14015,6 +14236,24 @@ class Segmenter:
         loose = {i for i in cand if i not in owner}
         for g, d0 in grow_bands(loose):
             fit_band(g, d0, frozenset(), 0, out)
+        lean[0] = True
+        for g, d0 in grow_bands(loose, relaxed=True):
+            old = [(p_, f_) for p_, f_ in out if g.intersection(f_)]
+            if len(old) < 2 or any(not g.issuperset(f_) for _, f_ in old):
+                continue
+            new = []
+            fit_band(g, d0, frozenset(), 0, new)
+            if not new or len(new) >= len(old):
+                continue
+            cov_new = {i for _, fs in new for i in fs}
+            cov_old = {i for _, fs in old for i in fs}
+            n_new = len(new) + sum(1 for i in g if i not in cov_new)
+            n_old = len(old) + sum(1 for i in g if i not in cov_old)
+            if n_new >= n_old:
+                continue
+            Log.debug(f"  relaxed band at {np.round(np.mean([topo.cents[i] for i in g], axis=0), 2)}: {n_old} faces -> {n_new}")
+            out = [(p_, f_) for p_, f_ in out if not g.intersection(f_)] + new
+        lean[0] = False
         # then the bands through the cylinders: kept only where they end up
         # in two faces fewer at least than the cylinders plus what the loose
         # strips gave (one less isn't worth a swept face in place of a
@@ -16871,7 +17110,43 @@ class Engine:
             return None, None
         return q, sorted(pos[i] for i in cur)
 
+    def _refresh_fobjs(self, R: Region) -> None:
+        """
+        ⚠️ A FACET REBUILT BY A NEIGHBOUR'S CONVERSION IS STILL THE REGION'S. ReShape rebuilds every face over a
+        vertex or edge it replaced, not only the converted region's: a facet across a corner of it comes back a new
+        TShape, same vertices, same place, and the region holding it read "region's faces no longer present" - test9's
+        coarse cones r 270 (three facets of 34 mm2, a hint each, vertices within 7e-7 mm) rejected twice on the
+        viewer's options (-a 0.005), three planes each. The missing facet is found again by its vertices.
+        """
+        topo = self.topo
+        miss = [j for j, f in enumerate(R.fobjs) if topo.face_index(f) < 0]
+        if not miss:
+            return
+        # (no memo of the centres: the Topo is updated in place, faces come and
+        # go, and a stale array indexed past the face list - test14 crashed)
+        C = np.array([topo.cents[i] for i in range(len(topo.faces))]).reshape(-1, 3)
+        eps = 1e-6 * max(float(self.diag), 1.0)
+        fo = list(R.fobjs)
+        for j in miss:
+            V = np.unique(face_vertices(fo[j]).round(9), axis=0)
+            if not len(V) or not len(C):
+                return
+            d = np.linalg.norm(C - V.mean(axis=0), axis=1)
+            hit = None
+            for k in np.argsort(d)[:3].tolist():
+                if d[k] > eps:
+                    break
+                W = np.unique(face_vertices(topo.faces[k]).round(9), axis=0)
+                if len(W) == len(V) and np.abs(W - V).max() <= eps:
+                    hit = k
+                    break
+            if hit is None:
+                return
+            fo[j] = topo.faces[hit]
+        R.fobjs = fo
+
     def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
+        self._refresh_fobjs(R)
         cap = self.sag_cap
         # (an exporter that limits the ANGLE between chords sags deeper on a
         # bigger radius: see _measure_mesh_turn)
@@ -18950,11 +19225,13 @@ def _arc_fit_circle(P: np.ndarray):
     return c0 + cen[0] * X + cen[1] * Y, rad, nrm, X, Y, max(dev, fuori_piano)
 
 
-def _arc_chains(topo: "Topo"):
+def _arc_chains(topo: "Topo", tol: Optional[float] = None):
     """
     Maximal chains of consecutive STRAIGHT edges replaceable by a single
     edge: interior vertices must have degree 2 (no other face touches
     there) and the two side faces must always be the same.
+    With tol, also the single edges standing off their faces by more than
+    twice it (see the chords below).
     Returns [(edges, vertices in order, [face, face]), ...].
     """
     nE = len(topo.edges)
@@ -18999,7 +19276,14 @@ def _arc_chains(topo: "Topo"):
             # two segments are enough when the curve is the EXACT
             # intersection of the two faces (snap_arcs asks for three to
             # trust a circle fitted through the vertices)
-            if len(cat) >= 2:
+            # ⚠️ ONE CHORD OF A COARSE ARC IS STILL AN ARC. test9's r271
+            # cylinders and cones came in three strips of 3.4 degrees: their
+            # rims are 16 mm chords, one per neighboring face, each standing
+            # 0.08-0.12 off the two exact surfaces it joins - the part's
+            # largest tolerances, and never a chain. A single edge goes too
+            # when its tolerance says it stands off its faces (snap_arcs then
+            # takes only an exact or near-coaxial curve for it).
+            if len(cat) >= 2 or (tol is not None and seq[0] != seq[-1] and float(bt_Tolerance(topo.edges[e0])) > 2.0 * tol):
                 out.append((cat, seq, sorted(facce)))
     return out
 
@@ -19915,7 +20199,10 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
          through the vertices, if the chain is smooth (see _chain_spline);
     Rings closed on themselves (a hole's rim left polygonal because, when the
     hole was converted, the plane around it was still loose facets) become a
-    single closed edge. Every replacement is checked on BOTH faces touching
+    single closed edge. A single chord standing off its faces (a coarse
+    arc's rim, see _arc_chains) takes only 1., the circle about two
+    near-coaxial axes (_near_coax_circle) or, between analytic surfaces, their
+    meet (_meet_spline). Every replacement is checked on BOTH faces touching
     it, and at the end the whole part is rechecked: if something doesn't
     hold up, all of them are given up at once.
     With seams, what took none of these is tried last as the smooth curve of
@@ -19927,7 +20214,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
     """
     t0 = time.perf_counter()
     topo = Topo(shape) if _topo is None else _topo
-    cands = _arc_chains(topo)
+    cands = _arc_chains(topo, tol)
     # (with the seams, the runs a chain in pieces left behind: see _seam_runs)
     runs = _seam_runs(topo) if seams else []
     run_ids = {tuple(c) for c, _, _ in runs}
@@ -20024,7 +20311,8 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
         P = run_points(cat, seq) if joined else topo.vpos[np.array(seq)]
         closed = seq[0] == seq[-1]
         Pq = P[:-1] if closed else P
-        if len(Pq) < 3:
+        chord = len(cat) == 1 and not closed and not joined  # a single chord (see _arc_chains)
+        if len(Pq) < 3 and not chord:
             return False
         seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
         # ⚠️ NOT A SLIVER INTO A LENS. A 0.001 mm2 triangle beside a test17
@@ -20094,6 +20382,33 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
             if vtol > tol:
                 cv = choose_curve(ex_c, Pq, vtol, scale=diag, arc_tol=arc_tol)
                 exact = cv is not None
+        # ⚠️ TWO SURFACES OF REVOLUTION ALMOST ON ONE AXIS: the circle
+        # through the chain's ends about it (see _near_coax_circle). On
+        # the faces within half of what the chain's edges stand off them,
+        # never past the arc's own gate.
+        near = False
+        if cv is None and not seam_only and not closed and pa is not None and pb is not None:
+            nc = _near_coax_circle(pa, pb, P[0], P[-1], tol)
+            if nc is not None:
+                lim_n = min(arc_tol, 0.5 * max(float(bt_Tolerance(topo.edges[k])) for k in cat))
+                if lim_n > tol and choose_curve([nc], Pq, tol, scale=diag, arc_tol=arc_tol) is not None:
+                    cv, near = nc, lim_n
+        # ⚠️ ...AND A CHORD WHERE THE MEET HAS NO CLOSED FORM: the same cone's
+        # rim ran into a torus whose axis crosses it, a fillet - 16 mm chords
+        # 0.085 off the cone. The two surfaces' meet through the chord's
+        # ends (see _meet_spline), held like the circle above. ⚠️ NOT
+        # GeomAPI_IntSS: on test9 it ran 35 minutes on one chord, B-spline
+        # or analytic, and never came back.
+        if chord and cv is None and not seam_only and pa is not None and pb is not None and pa.kind != FREE and pb.kind != FREE:
+            ms = _meet_spline(pa, pb, P[0], P[-1], tol)
+            cv = choose_curve([ms], Pq, tol, scale=diag, arc_tol=arc_tol) if ms is not None else None
+            if cv is not None:
+                near = max(tol, min(arc_tol, 0.5 * float(bt_Tolerance(topo.edges[cat[0]]))))
+        if chord and cv is None:
+            if Log.level <= 10:
+                Log.debug(f"  arc: chord at {np.round(0.5 * (P[0] + P[-1]), 2)}: no curve ({pa.label() if pa else '-'} x {pb.label() if pb else '-'}, exact {len(ex_c)}"
+                          + (f", ends off {min(float(np.abs(c.dist(Pq)).max()) for c in ex_c):.1e}" if ex_c else "") + ")")
+            return False
         # ⚠️ TWO SEGMENTS: THE CIRCLE THROUGH THEM, ON PROBATION. Where a
         # rolling-ball fillet hands over to the r1 cylinder its ball sweeps
         # next (test13, each end of the fillets) the two faces are tangent
@@ -20120,7 +20435,7 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
         # both faces (the edges' own tolerance doesn't widen it: those are
         # exact surfaces, not a fit).
         spline = False
-        lim_p = tol
+        lim_p = near if near else tol
         P_fit, strays = P, 0
         if cv is None and not closed and len(cat) >= 3 and dev_retta > tol and not seam_only:
             # (between tangent faces, the vertices off their line of contact
@@ -20275,6 +20590,17 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
             # (plus the triangle each vertex left out of the curve stands over)
             for i in sorted(set(range(len(P))) - set(keep)):
                 crescent += 0.75 * float(np.abs(cv.dist(P[i][None, :]))[0]) * float(seg[i - 1] + seg[i])
+        # ⚠️ A SEAM NEVER WIDENS WHAT IT SMOOTHS. Its limit is the pieces'
+        # tolerance times 1.2, and the curve's own is 1.2 times what it stood
+        # off: pass after pass a run's tolerance grew by half - test9's
+        # 4 mm circle between two B-spline patches ended 0.132, over pieces of
+        # 0.05-0.11, the part's largest. The seam's curve is looks, not
+        # precision: at most the tolerance of what it replaces.
+        if buono and seam:
+            old_t = max(tol, max(float(bt_Tolerance(topo.edges[k])) for k in cat))
+            if 1.2 * max(worst, gap) + 1e-7 > 1.001 * old_t:
+                Log.debug(f"  arc: {where}: the seam would need {1.2 * max(worst, gap):.1e}, its pieces {old_t:.1e}")
+                buono = False
         if buono and not trusted:
             for fi in facce:
                 F_new = td_Face(rl.Apply(topo.faces[fi]))
@@ -20286,9 +20612,13 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
                 # fifth of a second - test15's arm, 1,400 of them in a pass)
                 ok_f = is_valid(F_new)
                 a_new = face_area(F_new) if ok_f else 0.0
-                if not ok_f or abs(a_new - topo.areas[fi]) > crescent or a_new < 0.5 * topo.areas[fi]:
+                a_old = topo.areas[fi]
+                if ok_f and abs(a_new - a_old) > crescent:
+                    # (the default integral's own error, not the arc's: both measured again exactly)
+                    a_old, a_new = face_area_exact(topo.faces[fi]), face_area_exact(F_new)
+                if not ok_f or abs(a_new - a_old) > crescent or a_new < 0.5 * a_old:
                     if Log.level <= 10:
-                        Log.debug(f"  arc: {where}: face {fi} " + (f"area {topo.areas[fi]:.4f} -> {a_new:.4f} (crescent {crescent:.1e})" if ok_f else "invalid: " + ", ".join(check_detail(F_new, 3))))
+                        Log.debug(f"  arc: {where}: face {fi} " + (f"area {a_old:.4f} -> {a_new:.4f} (crescent {crescent:.1e})" if ok_f else "invalid: " + ", ".join(check_detail(F_new, 3))))
                     buono = False
                     break
                 # (nor cross its neighbor past their shared vertex: see _cusp_crossing)
@@ -20586,7 +20916,11 @@ def snap_arcs(shape, tol: float, title: str = "Arcs", memo: Optional[set] = None
         # already (a defect of an earlier phase) every arc used to be thrown
         # away for a fault that isn't theirs
         male = "BRepCheck: " + ", ".join(check_detail(nuovo, 3))
-    elif abs(v1 - v0) > sliver * (lever / 3.0 + 1.0) + 1e-6 * abs(v0) + 1e-9:
+    elif abs(v1 - v0) > sliver * (lever / 3.0 + 1.0) + 1e-6 * abs(v0) + 1e-9 and abs(
+            (v1 := shape_volume_exact(nuovo)) - (v0 := shape_volume_exact(shape))) > sliver * (lever / 3.0 + 1.0) + 1e-6 * abs(v0) + 1e-9:
+        # (measured again with an eps before giving up: the default integral
+        # is off by tens of mm3 on test9, 21568 against 21632 - two arcs on
+        # its letters were refused for 0.16 of that noise)
         # (!) the volume DOES change, and not only because the true arc
         # lies outside the chord. With a polygonal rim the planar face and
         # the cylinder don't meet exactly: between the polygon and the
@@ -20844,6 +21178,9 @@ def _measure_mesh_turn(regions: List[Region], tol_fit: float):
 # "auto". It writes the input's triangles under those faces to a hints file
 # beside the input, <name>.hints.json:
 #   {"refit_hints": 1, "groups": [{"type": "torus", "points": [[x, y, z], ...], "areas": [a, ...]}]}
+# ("max_dev": N, optional - tools/contours.py writes 2: its surface may stand off the vertices
+# and the facets' sag by N edge tolerance ceilings, not HINT_MAX_DEV off the vertices only; "surface":
+# {"kind": "axial", "center", "axis", "r0", "slope"}, optional - the cylinder or cone it found, see fit_hint)
 # one point per triangle, its centroid, and the triangle's area - the mesh's,
 # not one conversion's: the faces the group was picked on are gone once it is
 # rebuilt.
@@ -20863,6 +21200,8 @@ HINTS: Optional[List["Hint"]] = None
 # 6 mm; built, it would have been a different part. Better tessellated than
 # deformed: past this the group goes back to the automatic segmentation.
 HINT_MAX_DEV = 5.0
+# tools/contours.py's "auto" hints: a plane, cylinder or cone within this (mm, its FIT_TOL) before a free-form patch
+HINT_NEAR = 5e-3
 
 
 @dataclass(eq=False)  # confronto per identita': i campi sono array numpy
@@ -20873,6 +21212,8 @@ class Hint:
     done: bool = False  # converted by an earlier Phase C
     result: str = ""  # what it became, or why not
     areas: Optional[np.ndarray] = None  # each point's triangle area (files from the viewer)
+    max_dev: Optional[float] = None  # edge tolerance ceilings its surface may stand off the vertices AND the facets (tools/contours.py)
+    surface: Optional["Prim"] = None  # the cylinder or cone tools/contours.py found holding its vertices (a start, see fit_hint)
 
 
 def load_hints(path: str) -> List[Hint]:
@@ -20890,7 +21231,17 @@ def load_hints(path: str) -> List[Hint]:
         P = np.asarray(g.get("points", []), dtype=float).reshape(-1, 3)
         A = np.asarray(g.get("areas") or [], dtype=float).ravel()
         if len(P):
-            out.append(Hint(kind, P, str(g.get("label", "") or ""), areas=A if len(A) == len(P) and np.all(np.isfinite(A)) else None))
+            md = g.get("max_dev")
+            sf = None
+            s = g.get("surface")
+            try:
+                if isinstance(s, dict) and s.get("kind") == "axial":
+                    ax = np.asarray(s["axis"], float)
+                    sf = Prim(AXIAL, np.asarray(s["center"], float), ax / np.linalg.norm(ax), float(s["r0"]), float(s.get("slope", 0.0)))
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                sf = None
+            out.append(Hint(kind, P, str(g.get("label", "") or ""), areas=A if len(A) == len(P) and np.all(np.isfinite(A)) else None,
+                            max_dev=float(md) if isinstance(md, (int, float)) and md > 0 else None, surface=sf))
     return out
 
 
@@ -20981,6 +21332,21 @@ def _hint_owner(n: int, rings_of, cents: np.ndarray, radii: np.ndarray, normals,
 
 def _hint_axial(verts, norms, areas, G, P, cylinder: bool) -> Optional[Prim]:
     p = refit_exact(G, verts, norms, areas, AXIAL)
+    if p is not None:
+        # ⚠️ FEW FACETS, A POOR AXIS. Read off the normals of 9 facets (test9's face 7647, three strips r 271 mm
+        # turning 3.3 deg) the axis left the vertices 0.011 mm off - a B-spline went in instead; from there on the
+        # vertices it comes to 1.3e-6.
+        # ⚠️ ...BUT THE VERTICES OF A NARROW BAND PIN NO AXIS: around test9's r403 cone a r401 band of three strips
+        # slid off to an axis 58 degrees over (vertices 3e-5 off), its rim to the cone a 16 mm chord no curve could
+        # take. The vertices only refine the axis the normals read: within a degree of it.
+        Pu = np.unique(np.round(P, 9), axis=0)
+        try:
+            q = lm_refine(p, Pu, stall=True)
+        except Exception:
+            q = None
+        if q is not None and np.isfinite(_worst(q, Pu)) and _worst(q, Pu) < _worst(p, Pu) \
+                and abs(float(q.axis @ p.axis)) >= math.cos(math.radians(1.0)) * float(np.linalg.norm(q.axis) * np.linalg.norm(p.axis)):
+            p = q
     if p is None or not cylinder or abs(p.slope) < 1e-12:
         return p
     t = (P - p.center) @ p.axis
@@ -21034,6 +21400,33 @@ def _worst(p, P: np.ndarray) -> float:
         return math.inf
     d = np.abs(p.dist(P))
     return float(d.max()) if len(d) and np.all(np.isfinite(d)) else math.inf
+
+
+def _chord_sag(topo, F: List[int]) -> float:
+    """
+    The sag any smooth surface through these facets' vertices stands off them: on each edge L * phi / 6 (phi the
+    angle between its ends' normals, area-weighted over F - a circular arc's L^2 / 8r, a third more at a facet's
+    centre). What the mesh's own chords hold, not a surface's wiggle.
+    """
+    VN: Dict[tuple, np.ndarray] = {}
+    rings = []
+    for i in F:
+        V = np.asarray(topo.verts[i], float)
+        if len(V) < 3:
+            continue
+        ks = [tuple(np.round(v, 7).tolist()) for v in V]
+        rings.append((V, ks))
+        n = np.asarray(topo.norms[i], float) * float(topo.areas[i])
+        for k in ks:
+            VN[k] = VN[k] + n if k in VN else n.copy()
+    worst = 0.0
+    for V, ks in rings:
+        for a in range(len(V)):
+            b = (a + 1) % len(V)
+            na, nb = VN[ks[a]], VN[ks[b]]
+            c = float(na @ nb) / max(float(np.linalg.norm(na) * np.linalg.norm(nb)), 1e-300)
+            worst = max(worst, float(np.linalg.norm(V[a] - V[b])) * math.acos(min(1.0, max(-1.0, c))) / 6.0)
+    return worst
 
 
 def fit_hint_quadric(kind: str, verts, norms, areas, G: List[int], tol: float) -> Optional[Prim]:
@@ -21141,7 +21534,8 @@ def _hint_halves(topo, G: List[int], min_faces: int) -> List[List[int]]:
     return []
 
 
-def fit_hint(kind: str, topo, G: List[int], tol: float, min_faces: int, allow_free: bool = True) -> List[Tuple[Prim, List[int]]]:
+def fit_hint(kind: str, topo, G: List[int], tol: float, min_faces: int, allow_free: bool = True, near: Optional[float] = None,
+             surface: Optional[Prim] = None) -> List[Tuple[Prim, List[int]]]:
     """
     The surfaces of a hand-fixed group of facets, of the type the user chose
     ("auto": the simplest quadric holding the vertices within twice the
@@ -21181,6 +21575,39 @@ def fit_hint(kind: str, topo, G: List[int], tol: float, min_faces: int, allow_fr
     p = checked(fit_hint_quadric(kind, topo.verts, topo.norms, topo.areas, G, tol), G)
     if p is not None or kind != "auto":
         return [(p, G)] if p is not None else []
+    if near is not None:
+        # ⚠️ A NEAR QUADRIC BEFORE A FREE-FORM PATCH (near: a tools/contours.py hint, that read a plane, cylinder or
+        # cone within `near` mm off the mesh): test9's face 7647, a cylinder within 5 microns, 9 facets - past the
+        # 2 x tolerance above, the B-spline it got stood its facets 0.055 mm off and its edge's tolerance went
+        # 0.07 -> 0.11 mm.
+        # ⚠️ THE SIMPLEST WITHIN `near`, NOT THE CLOSEST: on three strips a cone has a slope to spare, and test9's
+        # r24.9 band took one of 0.57 degrees, its axis 0.48 mm off the cylinder beside it - their rim a chord no
+        # curve could take. A cylinder holding it within `near` is the cylinder.
+        P = np.vstack([topo.verts[i] for i in G])
+        for k_ in ("plane", "cylinder", "cone"):
+            c = fit_hint_quadric(k_, topo.verts, topo.norms, topo.areas, G, tol)
+            if c is not None and _worst(c, P) <= near:
+                c = checked(c, G)
+                if c is not None:
+                    return [(c, G)]
+        # ⚠️ ...AND THE ONE CONTOURS FOUND, WHERE THESE FACETS' NORMALS CAN'T TELL THE AXIS: a coarse 45-degree
+        # chamfer of 19 facets has them on a 3-degree arc, and its cone's axis is anywhere in a plane (test9's top
+        # rims, 32-147 mm2 each: a B-spline, or flats). contours scanned that plane; the vertices refine it here,
+        # within a degree of where it was.
+        if surface is not None:
+            Pu = np.unique(np.round(P, 9), axis=0)
+            c = surface
+            try:
+                q = lm_refine(surface, Pu, stall=True)
+                if q is not None and _worst(q, Pu) < _worst(c, Pu) \
+                        and abs(float(q.axis @ c.axis)) >= math.cos(math.radians(1.0)) * float(np.linalg.norm(q.axis) * np.linalg.norm(c.axis)):
+                    c = q
+            except Exception:
+                pass
+            if _worst(c, P) <= near:
+                c = checked(c, G)
+                if c is not None:
+                    return [(c, G)]
     out = sheets("freeform") if allow_free else []
     if out:
         return out
@@ -21224,18 +21651,40 @@ def apply_hints(regions: List[Region], topo, tol_fit: float, max_edge_tol: float
         G = largest_component(G, topo.adj) if G else []
         G = _hint_holes(topo, G, taken) if G else []
         tag = f"Hand fix {g + 1} ({h.kind}{', ' + h.label if h.label else ''})"
-        if len(G) < max(2, min_faces):
+        # ⚠️ A COARSE CYLINDER IS THREE FACETS. A hint of tools/contours.py's (max_dev set) names a face it read off
+        # the mesh, every triangle of it: test9's 35 cylinders r 250-400 mm in three strips of two triangles,
+        # vertices within 1e-7 mm, Phase A made each strip one facet and min_faces (4) left them three planes each.
+        # Two facets are enough there; a hand pick keeps min_faces. ⚠️ A PLANE, CYLINDER OR CONE ONLY: a sphere on
+        # 2 of its 17 facets (test10's, read off a few triangles of a blend) stood 7.6e-3 off them, an edge 0.159.
+        coarse = h.max_dev is not None and h.kind in ("auto", "plane", "cylinder", "cone")
+        if len(G) < (2 if coarse else max(2, min_faces)):
             # (the second Phase C finds the few facets the first one left:
             # its verdict says more)
             h.result = h.result or f"only {len(G)} facet{'s' if len(G) != 1 else ''} of it left to fit"
             continue
-        pieces = fit_hint(h.kind, topo, G, tol_fit, min_faces, allow_free)
+        pieces = fit_hint(h.kind, topo, G, tol_fit, min_faces, allow_free, near=HINT_NEAR if h.max_dev is not None else None,
+                          surface=h.surface)
         if not pieces:
             h.result = f"no {h.kind} fits its {len(G)} facets"
             Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
             continue
         Rs = [describe_region(pr, topo, F) for pr, F in pieces]
-        worst, cap = max(R.max_res for R in Rs), HINT_MAX_DEV * max_edge_tol
+        worst, cap = max(R.max_res for R in Rs), (h.max_dev or HINT_MAX_DEV) * max_edge_tol
+        if h.max_dev is not None:
+            # (a hint no one picked - tools/contours.py's: on test12 a free-form patch within 12 microns of the
+            # vertices had its facets 0.16 mm off it, and its edges' tolerance went 0.08 -> 0.29 mm)
+            # A free-form patch only: a plane, cylinder, cone... the vertices lie on has its facets off it by the
+            # chords' sag, as the CAD tessellated it (test9's coarse cylinders r 250-400 mm: vertices 1e-7 mm,
+            # facets 0.12 mm - three planes each before).
+            worst = max(worst, max((R.sag for R in Rs if R.prim.kind == FREE), default=0.0))
+            # ⚠️ ...AND THE CHORDS' OWN SAG ON COARSE FACETS: test9's top rim blend (15 triangles, edges 3.4 mm) took
+            # a patch through its vertices 0.061 mm off its facets, past 0.059 - the chords of a 10 mm round hold
+            # 0.05 of that - and stayed eight flats, single triangles. Up to 1.5 x what the chords hold, within 2.5
+            # caps; test9's fine faces (edges 0.15 mm, chords 2e-3) whose patches stood 0.07-0.1 off are still out.
+            if worst > cap:
+                free = [F for (pr, F), R in zip(pieces, Rs) if R.prim.kind == FREE]
+                if free:
+                    cap = min(2.5 * cap, max(cap, 1.5 * max(_chord_sag(topo, F) for F in free)))
         if worst > cap:
             h.result = f"its {h.kind} stands {worst:.2g} mm off the facets, past {cap:.2g} mm: better tessellated than deformed"
             Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
