@@ -562,6 +562,7 @@ USAGE
     python refit.py part.stl -j 1             # everything on one core (same result, slower)
     python refit.py part.step -o out.step     # STEP input
     python refit.py part.stl --hints part.hints.json  # with the hand fixes picked in the viewer
+    python refit.py part.stl --contours               # again with the faces tools/contours.py says it cut
     python refit.py --check                   # check the environment
 
 DEPENDENCIES
@@ -16104,7 +16105,10 @@ def _seg_cache_path(seg) -> Optional[str]:
         simple = (int, float, str, bool, type(None), tuple, list, dict, frozenset)
         # (the private ones are caches - _VOL_MEMO, _ALIVE - and anything
         # printed with a memory address would change the key at every run)
-        gl = sorted((k, repr(g[k])) for k in g if k.isupper() and not k.startswith("_") and isinstance(g[k], simple))
+        # ⚠️ NOT THE HINTS: the segmentation never reads them (apply_hints
+        # works on its regions after it), and with them in the key the second
+        # conversion of --contours made test9's again for nothing
+        gl = sorted((k, repr(g[k])) for k in g if k.isupper() and not k.startswith("_") and k != "HINTS" and isinstance(g[k], simple))
         h.update(repr([kv for kv in gl if " at 0x" not in kv[1]]).encode())
         return os.path.join(d, h.hexdigest()[:32] + ".seg.pkl")
     except Exception as ex:
@@ -22288,6 +22292,13 @@ def parse_args(argv=None):
         help="[A C] hand fixes (<name>.hints.json, written by the viewer): groups of the input's triangles, each converted as ONE face "
         "of the type given (auto, plane, cylinder, cone, sphere, torus, tube, freeform)",
     )
+    g.add_argument(
+        "--contours",
+        action="store_true",
+        help="[C] convert, find with tools/contours.py the faces of the mesh the conversion cut into pieces, convert again "
+        "with them as hints (<out>.contours.json; the first kept as <out>_pass1.step) - in one process: the mesh read, "
+        "the first Phase A and its segmentation made once",
+    )
 
     g = p.add_argument_group("mesh input (STL)")
     g.add_argument(
@@ -22412,6 +22423,118 @@ def main(argv=None) -> int:
         warm_pool(args.threads, before["faces"])
 
     Log.info("Sequence: " + " ".join(w + ("" if v is None or v <= 0 else f"({v:g})") for w, v in seq))
+    contours = bool(getattr(args, "contours", False)) and not only_a
+    first_a: List = []
+    shape, results, after_a = _convert_all(shape, args, seq, before, stem, only_a, first_a, keep=contours)
+    if contours:
+        shape, results, after_a = _contours_pass(shape, results, after_a, args, seq, before, stem, out_path, first_a)
+        if shape is None:
+            return 1
+    else:
+        _save(shape, out_path, args, before, after_a, results)
+
+    Log.banner("Done")
+    st = shape_stats(shape)
+    Log.ok(
+        f"{before['faces']:,} input faces -> {st['faces']:,} output faces · "
+        f"free edges {count_free_edges(shape)} · max tolerance {max_tolerance(shape):.1e} mm "
+        f"· {time.perf_counter() - t_start:.1f}s"
+    )
+    for name, r in results:
+        Log.ok(f"Phase {name}: {r.n_ok}/{len(r.regions)} regions converted")
+    # (one line per hand fix, the viewer reads them: "Hand fix N: ...")
+    for k, h in enumerate(HINTS or []):
+        (Log.ok if h.done else Log.warn)(f"Hand fix {k + 1} ({h.kind}): " + (h.result or "its triangles weren't found among the facets"))
+    close_pool()
+    return 0
+
+
+def _save(shape, out_path: str, args, before, after_a, results):
+    """write the STEP (read back and mended, see write_step_checked), the report, the log; the shape read back"""
+    Log.banner("Saving")
+    # ⚠️ THE LAST WORD BEFORE WRITING. Every conversion validates itself,
+    # but the checks are local: if something slipped through, this is where it shows.
+    if not is_valid(shape):
+        Log.warn("the finished part doesn't pass BRepCheck: " + ", ".join(check_detail(shape, 4)))
+    _ri = write_step_checked(shape, out_path, src=args.input, pcurves=args.pcurves)
+    if is_valid(shape) and not is_valid(_ri):
+        Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))
+    if args.report:
+        # next to the OUTPUT: with -o elsewhere it used to land beside the input
+        write_report(f"{os.path.splitext(out_path)[0]}_report.txt", args.input, before, after_a, results)
+    if args.log:
+        Log.dump(args.log)
+    return _ri
+
+
+def _contours_pass(shape, results, after_a, args, seq, before, stem, out_path, first_a):
+    """
+    --contours: the conversion saved, tools/contours.py's hints for the faces it cut (Contours.hints, on the STEP as
+    read back), the conversion again with them - from the first Phase A kept in memory, whose segmentation the cache
+    hands back. What tools/refit_contours.py did with two refit.py processes, the same files: <out>.contours.json
+    (the --hints groups first; "pass2" = the output's size and mtime once made), <out>_pass1.step. Nothing to hint, or
+    contours.py failing: the first conversion stays. None on a failure of the second.
+    """
+    import json
+    import shutil
+
+    global HINTS, MESH_SAG, MESH_TURN
+    _save(shape, out_path, args, before, after_a, results)
+    base = os.path.splitext(out_path)[0]
+    p1, hf = base + "_pass1.step", base + ".contours.json"
+    Log.banner("Contours · the faces the conversion cut")
+    tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+    try:
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import contours as _ct
+
+        _ct.R.Log.no_color, _ct.R.Log.level = Log.no_color, Log.level
+        # (its own copy of this file - `refit`, not __main__ - fresh globals, as in a process of its own)
+        hs = _ct.Contours.from_file(args.input).hints(_ct.R.read_input(out_path)[0])
+    except Exception as ex:  # (the first conversion is saved: a failure here costs only the second)
+        Log.warn(f"contours.py failed ({type(ex).__name__}: {ex}): the conversion stays")
+        return shape, results, after_a
+    if not hs:
+        Log.info("None: the conversion stays")
+        return shape, results, after_a
+    groups = []
+    if args.hints:
+        with open(args.hints, encoding="utf-8") as fh:
+            groups = json.load(fh).get("groups", [])
+    doc = {"refit_hints": 1, "groups": groups + hs}
+    with open(hf, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    kinds: Dict[str, int] = defaultdict(int)
+    for h in hs:
+        kinds[h["type"]] += 1
+    Log.info(f"{len(hs)} faces ({', '.join(f'{k} {n}' for k, n in kinds.items())}) -> {os.path.basename(hf)}")
+    shutil.copyfile(out_path, p1)
+    Log.info(f"The first conversion kept as {os.path.basename(p1)}")
+    # (fresh hints - the --hints ones too: the first conversion marked theirs done - and the chord sag measured again,
+    # on the second conversion's first Phase C, as a second refit.py process would)
+    HINTS = load_hints(hf)
+    MESH_SAG, MESH_TURN = None, None
+    Log.banner("Conversion with them")
+    shape, results, after_a = _convert_all(None, args, seq, before, stem, False, first_a, keep=False)
+    _save(shape, out_path, args, before, after_a, results)
+    st = os.stat(out_path)
+    doc["pass2"] = [st.st_size, st.st_mtime_ns]
+    with open(hf, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh)
+    return shape, results, after_a
+
+
+def _convert_all(shape, args, seq, before, stem, only_a, first_a: List, keep: bool = False):
+    """
+    The phases of `seq` (args.iterations times), the needles, the arcs. first_a: the first Phase A's
+    (shape, before, after) - kept there when `keep` (a deep copy: the phases after it build on its faces), used
+    instead of running it again when there (shape None). A sequence not opening with Phase A keeps the input instead.
+    """
+    if keep and seq[0][0] != "A":
+        first_a[:] = [None, copy_shape(shape)]
+    if shape is None and first_a and first_a[0] is None:
+        shape = first_a[1]
     results: List[Tuple[str, PhaseResult]] = []
     after_a = before
     n_a = 0
@@ -22422,11 +22545,17 @@ def main(argv=None) -> int:
                 n_a += 1
                 lt = val if (val is not None and val > 0) else args.lin_tol
                 titolo = "PHASE A — merging coplanar faces" if n_a == 1 else "PHASE A — re-merging faces"
+                if n_a == 1 and first_a and first_a[0] is not None and not keep:
+                    shape, bef_a, after_a = first_a[0]
+                    Log.info(f"Phase A{tag}: the first conversion's ({count_sub(shape, TopAbs_FACE):,} faces)")
+                    continue
                 shape, bef_a, after_a = phase_a(shape, lt, args.ang_tol, validate=args.validate, title=titolo + tag, use_barrier=not args.no_cad_edges)
                 # ⚠️ 'before' stays the FILE's count, not the first Phase A's:
                 # with Phase A not first in sequence (e.g. -b -c -a) otherwise the
                 # report would say "994 input faces" instead of 5,682.
                 if n_a == 1:
+                    if keep and it == 0 and seq[0][0] == "A":
+                        first_a[:] = [(copy_shape(shape), bef_a, after_a)]
                     if args.keep_a and not only_a:
                         write_step(shape, f"{stem}_phaseA.step", src=args.input)
             elif w == "B":
@@ -22485,34 +22614,7 @@ def main(argv=None) -> int:
                 shape, _n = snap_arcs(shape, _tolA, title="Arcs (seams)" if _pass == 0 else f"Arcs (seams, pass {_pass + 1})", memo=_memo, threads=args.threads, seams=True)
                 if not _n:
                     break
-    Log.banner("Saving")
-    # ⚠️ THE LAST WORD BEFORE WRITING. Every conversion validates itself,
-    # but the checks are local: if something slipped through, this is where it shows.
-    if not is_valid(shape):
-        Log.warn("the finished part doesn't pass BRepCheck: " + ", ".join(check_detail(shape, 4)))
-    _ri = write_step_checked(shape, out_path, src=args.input, pcurves=args.pcurves)
-    if is_valid(shape) and not is_valid(_ri):
-        Log.warn("valid in memory but not after the STEP write: " + ", ".join(check_detail(_ri, 4)))
-    if args.report:
-        # next to the OUTPUT: with -o elsewhere it used to land beside the input
-        write_report(f"{os.path.splitext(out_path)[0]}_report.txt", args.input, before, after_a, results)
-    if args.log:
-        Log.dump(args.log)
-
-    Log.banner("Done")
-    st = shape_stats(shape)
-    Log.ok(
-        f"{before['faces']:,} input faces -> {st['faces']:,} output faces · "
-        f"free edges {count_free_edges(shape)} · max tolerance {max_tolerance(shape):.1e} mm "
-        f"· {time.perf_counter() - t_start:.1f}s"
-    )
-    for name, r in results:
-        Log.ok(f"Phase {name}: {r.n_ok}/{len(r.regions)} regions converted")
-    # (one line per hand fix, the viewer reads them: "Hand fix N: ...")
-    for k, h in enumerate(HINTS or []):
-        (Log.ok if h.done else Log.warn)(f"Hand fix {k + 1} ({h.kind}): " + (h.result or "its triangles weren't found among the facets"))
-    close_pool()
-    return 0
+    return shape, results, after_a
 
 
 if __name__ == "__main__":

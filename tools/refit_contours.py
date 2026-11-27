@@ -10,6 +10,9 @@ convert again with those faces as hints.
 3. refit.py MESH -o OUT --hints H ...           again with them (a --hints file given is kept: its groups first)
 
 Nothing to hint -> the first conversion stays. The first one is kept as <OUT>_pass1.step.
+Without --from the three steps are one process: refit.py --contours (see _contours_pass there), which reads the mesh
+and makes the first Phase A once, and gets the second conversion's first segmentation from its cache - the same files
+as three processes, byte for byte (test0, test4, test10, test13, 27/11/2026).
 --from FIRST.step: a conversion of MESH already made (the viewer's "Refine with contours") is the first: steps 2-3
 only, half the time. --from OUT where OUT is this script's own second pass: its <OUT>_pass1.step is the first.
 Measured 20/11/2026 against the true CAD (whole faces / CAD edges caught / false contours / faces):
@@ -70,16 +73,15 @@ def main(argv=None):
         except (OSError, ValueError):
             pass
 
-    if first:
-        if not os.path.isfile(first):
-            print(f"[x] --from {first}: no such file"); return 1
-        print(f"== refit_contours: 1/3 the conversion already made: {first}", flush=True)
-        if os.path.abspath(first) != os.path.abspath(out):
-            shutil.copyfile(first, out)
-    else:
-        print(f"== refit_contours: 1/3 conversion -> {out}", flush=True)
-        if run(["--hints", user_hints] if user_hints else []) != 0:
-            return 1
+    if not first:
+        # (the whole of it in one refit.py: the mesh read, the first Phase A and its segmentation made once)
+        print(f"== refit_contours: refit.py --contours -> {out}", flush=True)
+        return 1 if run(["--contours"] + (["--hints", user_hints] if user_hints else [])) != 0 else 0
+    if not os.path.isfile(first):
+        print(f"[x] --from {first}: no such file"); return 1
+    print(f"== refit_contours: 1/3 the conversion already made: {first}", flush=True)
+    if os.path.abspath(first) != os.path.abspath(out):
+        shutil.copyfile(first, out)
     print("== refit_contours: 2/3 the faces it cut (contours.py)", flush=True)
     sys.path.insert(0, HERE); sys.path.insert(0, os.path.dirname(HERE))
     try:

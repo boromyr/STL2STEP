@@ -1145,8 +1145,8 @@ class Handler(BaseHTTPRequestHandler):
                 # (the hand fixes picked in the page, if asked and there are any)
                 if body.get("hints") and os.path.isfile(hints_path(inp)) and "--hints" not in args:
                     args += ["--hints", hints_path(inp)]
-                # (with contours: tools/refit_contours.py - refit.py, the faces it cut as hints, refit.py again;
-                # it passes the same arguments on)
+                # (with contours: tools/refit_contours.py - refit.py --contours: the conversion, the faces it cut as
+                # hints, the conversion again, in one process; it passes the same arguments on)
                 # (refine: the conversion already there is the first pass - steps 2-3 only)
                 if body.get("refine"):
                     if not os.path.isfile(out):

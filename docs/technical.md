@@ -803,8 +803,10 @@ dropped before writing: the reader made a wire of its own out of one, and a 0.33
     exact intersection, the circle about two near-coaxial axes through its ends, or between two analytic
     surfaces with no closed-form meet the spline through their meet walked by Newton - not
     GeomAPI_IntSS, which hung for 35 minutes on one chord).
-    `python tools/refit_contours.py test/test12.stl -o out.step -j 20`; `--from FIRST.step` starts from a
-    conversion already made (steps 2-3 only, half the time). In the viewer: **With contours** beside
+    `python tools/refit_contours.py test/test12.stl -o out.step -j 20`, the same as `python refit.py
+    test/test12.stl -o out.step --contours -j 20`: one process, the mesh read and the first Phase A made
+    once, the second conversion's first segmentation taken from the cache, the same output byte for byte;
+    `--from FIRST.step` starts from a conversion already made (steps 2-3 only, half the time). In the viewer: **With contours** beside
     Report, or **Refine with contours** under the Convert button once a conversion is shown.
   - other scripts (`align.py`, `cadfit.py`, `cadinfo.py`, `extra.py`, `icp.py`, `leak.py`,
     `mancanti.py`, `rbrep.py`, `segnali.py`, `strips.py`, `vstrips.py`) — analysis and debug tools
