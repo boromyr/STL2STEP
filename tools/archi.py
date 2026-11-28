@@ -45,6 +45,9 @@ def fit_circle_3d(P):
     return c0 + cen[0] * X + cen[1] * Y, rad, max(float(d.max()), piano)
 
 
+VERBOSE = False
+
+
 def main(path, tol, ang_vivo=20.0):
     sh = R.read_input(path)[0]
     topo = R.Topo(sh)
@@ -153,7 +156,7 @@ def main(path, tol, ang_vivo=20.0):
                     if ang < 5.0:
                         continue
                     restanti.discard(id(run))
-                    archi.append((len(run), rad, ang, dev))
+                    archi.append((len(run), rad, ang, dev, P.mean(axis=0)))
     print(f"    runs of >=3 consecutive segments: {corse}")
     print(f"    MISSED ARCS : {len(archi)}  ({sum(a[0] for a in archi)} edges that "
           f"would be {len(archi)} circles)")
@@ -167,9 +170,14 @@ def main(path, tol, ang_vivo=20.0):
             pass
         print("       most frequent radii:",
               dict(Counter(np.round(r, 2)).most_common(8)))
+    if VERBOSE:
+        for a in sorted(archi, key=lambda a: -a[1]):
+            print(f"       r {a[1]:7.3f}  {a[2]:5.1f} deg  {a[0]} segments  dev {a[3]:.1e}  at {np.round(a[4], 2).tolist()}")
     print(f"    MISSED LINES : {len(rette)}  ({sum(a[0] for a in rette)} edges that "
           f"would be {len(rette)} segments)")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], float(sys.argv[2]) if len(sys.argv) > 2 else 1e-3)
+    VERBOSE = "-v" in sys.argv
+    av = [a for a in sys.argv[1:] if a != "-v"]
+    main(av[0], float(av[1]) if len(av) > 1 else 1e-3)

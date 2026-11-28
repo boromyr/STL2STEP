@@ -11791,10 +11791,19 @@ class Segmenter:
                 q = self._cone_not_cylinder(p, rf, P, d0)
                 if q is not None:
                     return q
+            # Only past the tolerance: test18's sphere at 0.9 x tol_fit taken as a cone cost 16 faces, 2 tori, 2 ellipses.
+            if p.kind == SPHERE and self.allow_cone and d0 > self.tol_fit:
+                q = self._cone_not_sphere(p, rf, P, d0)
+                if q is not None:
+                    return q
             if d0 > 0.25 * self.tol_fit:
                 return p
             if p.kind == SPHERE and self.allow_cone:
                 q = refit_exact(rf, topo.verts, topo.norms, topo.areas, AXIAL)
+                # (a good cylinder stays: test18's 57-facet sphere is one, and the cone search's pick there cost 16 faces)
+                if q is None or q.kind != AXIAL or float(np.abs(q.dist(P)).max()) > max(2.0 * d0, 0.05 * self.tol_fit):
+                    best = self._cone_search(p, rf, P)
+                    q = best[1] if best is not None else q
             elif p.kind == AXIAL and self.allow_sphere:
                 q = refit_exact(rf, topo.verts, topo.norms, topo.areas, SPHERE)
             else:
@@ -11813,6 +11822,19 @@ class Segmenter:
             if s_q * pen(q) < 0.5 * s_p * pen(p):
                 Log.debug(f"Type review: {p.label()} -> {q.label()} on {len(rf)} facets (chord sag {s_p:.1e} -> {s_q:.1e})")
                 return q
+            # ⚠️ ON A WIDE RING NOTHING IN THE MESH TELLS THEM APART. test9's
+            # 45-degree rim bands (r85-95, 1.5 mm tall, fan-tessellated) have
+            # every vertex on the two rims and no side along a ruling: the
+            # facets sag 3e-2 under sphere and cone alike. The drawing does:
+            # the cone through the two rims is at 45.000 degrees, the sphere
+            # r129.899 - a chamfer, not a spherical band. A cone as exact as
+            # the sphere at a round semi-angle (a multiple of 5 degrees,
+            # within a hundredth) wins.
+            if p.kind == SPHERE and q.kind == AXIAL:
+                ang = math.degrees(math.atan(abs(q.slope)))
+                if abs(ang - 5.0 * round(ang / 5.0)) <= 0.01 and 0.0 < round(ang / 5.0) < 18:
+                    Log.debug(f"Type review: {p.label()} -> {q.label()} on {len(rf)} facets (cone at {ang:.4f} degrees, vertices {d0:.1e})")
+                    return q
         except Exception:
             pass
         return p
@@ -11882,6 +11904,91 @@ class Segmenter:
             self._exact_mesh = ex
             Log.debug(f"Mesh exact to the float: {ex} ({len(devs)} planar faces, median deviation {float(np.median(devs)) if devs else -1:.1e}, float step {eps:.1e})")
         return ex
+
+    def _cone_not_sphere(self, p, rf, P, d0):
+        """
+        ⚠️ THE CHAMFER THAT GREW AS A SPHERE PAST THE TOLERANCE. A 45-degree
+        chamfer band round a big step (test9's r94-r96 rim) has vertices on
+        two coaxial circles only, and its seeds - 4 to 9 facets of a ring
+        r94 - can't fix an axis: rank_primitives offers a sphere and a
+        cylinder, the sphere holds both circles and grows. Over 36 degrees
+        of the ring the sphere strays 1.8e-3 from the vertices (tol_fit
+        1.5e-3), the cone through them 1.9e-4: past a quarter of the
+        tolerance _review_type's sag comparison doesn't look at it, and on
+        a mesh that isn't exact _cone_not_cylinder doesn't either.
+        Revolution-axis fits fail on such data (every axis through the
+        sphere's centre explains the normals): _cone_search starts from the
+        vertices instead. Only when the cone holds every facet, explains
+        the vertices at least twice as well and doesn't sag more.
+        """
+        topo = self.topo
+        eps = coord_eps(float(np.abs(P).max()))
+        best = self._cone_search(p, rf, P)
+        if best is None:
+            return None
+        dq, q = best
+        Nr = np.vstack([np.tile(topo.norms[i], (len(topo.verts[i]), 1)) for i in rf])
+        if dq > self.tol_fit or dq > 0.5 * d0:
+            return None
+        if normal_deviation(q, P, Nr) > 15.0 or not all(self.within(q, i) for i in rf):
+            return None
+        Q = sag_points(topo, rf)
+        s_p = float(np.sqrt(np.mean(p.dist(Q) ** 2)))
+        s_q = float(np.sqrt(np.mean(q.dist(Q) ** 2)))
+        if s_q > s_p + eps:
+            return None
+        Log.debug(f"Type review: {p.label()} -> {q.label()} on {len(rf)} facets (vertices {d0:.1e} -> {dq:.1e})")
+        return q
+
+    def _cone_search(self, p, rf, P):
+        """
+        The cone closest to a sphere region's vertices, as (max deviation,
+        cone) or None: coaxial chamfer bands that grew as spheres (see
+        _cone_not_sphere). The facet normals of a fan band alternate a
+        degree either side of the cone's, too noisy for its axis; the
+        vertices' least direction is a few degrees off it and each pass -
+        radius line on the axis, LM - brings it closer (test9's rim: 7
+        degrees -> 1.4 -> 0.06). refit_exact's cone is tried too.
+        """
+        topo = self.topo
+        eps = coord_eps(float(np.abs(P).max()))
+        Wt = np.concatenate([np.full(len(topo.verts[i]), max(topo.areas[i], 1e-12) / max(len(topo.verts[i]), 1)) for i in rf])
+        c = np.asarray(p.center, dtype=float)
+
+        def cone_on(a, c):
+            D = P - c
+            t = D @ a
+            if float(np.ptp(t)) <= 10.0 * eps:
+                return None
+            rho = np.linalg.norm(D - np.outer(t, a), axis=1)
+            k, r0 = np.polyfit(t, rho, 1, w=np.sqrt(Wt))
+            return lm_refine(Prim(AXIAL, c.copy(), a.copy(), float(r0), float(k)), P, Wt)
+
+        try:
+            U = (P - P.mean(axis=0)) * np.sqrt(Wt)[:, None]
+            a = np.linalg.svd(U, full_matrices=False)[2][2]
+        except np.linalg.LinAlgError:
+            return None
+        best = None
+        q = None
+        for _ in range(6):
+            q = cone_on(a, c)
+            if q is None or q.kind != AXIAL:
+                break
+            dq_ = float(np.abs(q.dist(P)).max())
+            if best is not None and dq_ >= 0.9 * best[0]:
+                break
+            if abs(q.slope) > 0.05 and prim_radius(q) <= self.max_radius:
+                best = (dq_, q)
+            a = q.axis / np.linalg.norm(q.axis)
+            c = np.asarray(q.center, dtype=float)
+        q = refit_exact(rf, topo.verts, topo.norms, topo.areas, AXIAL)
+        q = lm_refine(q, P, Wt) if q is not None else None
+        if q is not None and q.kind == AXIAL and abs(q.slope) > 0.05 and prim_radius(q) <= self.max_radius:
+            dq_ = float(np.abs(q.dist(P)).max())
+            if best is None or dq_ < best[0]:
+                best = (dq_, q)
+        return best
 
     def _cone_not_cylinder(self, p, rf, P, d0):
         """
@@ -17149,8 +17256,9 @@ class Engine:
             fo[j] = topo.faces[hit]
         R.fobjs = fo
 
-    def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
-        self._refresh_fobjs(R)
+    def facet_cap(self, R: Region):
+        """(how deep R's facets may sag below its surface - the mesh's chords elsewhere, see run_phase - or None,
+        whether its rows of facets are uneven)"""
         cap = self.sag_cap
         # (an exporter that limits the ANGLE between chords sags deeper on a
         # bigger radius: see _measure_mesh_turn)
@@ -17173,6 +17281,11 @@ class Engine:
             cc = self._chord_cap(R)
             if cc is not None:
                 cap = max(cap, cc)
+        return cap, uneven
+
+    def convert(self, R: Region, strict_hole: bool = False) -> Tuple[bool, str]:
+        self._refresh_fobjs(R)
+        cap, uneven = self.facet_cap(R)
         # (a hand fix: the user chose the surface, its facets all go in)
         if cap is not None and R.sag > cap and getattr(R, "forced", None) is None:
             # the facets that aren't chords stay tessellated, if the surface
@@ -21206,6 +21319,7 @@ HINTS: Optional[List["Hint"]] = None
 HINT_MAX_DEV = 5.0
 # tools/contours.py's "auto" hints: a plane, cylinder or cone within this (mm, its FIT_TOL) before a free-form patch
 HINT_NEAR = 5e-3
+HINT_FACET_SLACK = 2.0  # a hint's analytic piece may sag below its facets up to this x Engine.facet_cap
 
 
 @dataclass(eq=False)  # confronto per identita': i campi sono array numpy
@@ -21622,7 +21736,7 @@ def fit_hint(kind: str, topo, G: List[int], tol: float, min_faces: int, allow_fr
     return [(p, G)] if p is not None else []
 
 
-def apply_hints(regions: List[Region], topo, tol_fit: float, max_edge_tol: float, min_faces: int, allow_free: bool = True) -> List[Region]:
+def apply_hints(regions: List[Region], topo, tol_fit: float, max_edge_tol: float, min_faces: int, allow_free: bool = True, eng=None) -> List[Region]:
     """
     The hand-fixed groups as regions of their own (R.forced = the Hint),
     first in the list, their facets taken from the regions the seeds made:
@@ -21693,6 +21807,27 @@ def apply_hints(regions: List[Region], topo, tol_fit: float, max_edge_tol: float
             h.result = f"its {h.kind} stands {worst:.2g} mm off the facets, past {cap:.2g} mm: better tessellated than deformed"
             Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
             continue
+        # ⚠️ ...BUT ONLY AS DEEP AS THE MESH'S CHORDS SAG ELSEWHERE (Engine.facet_cap, what an automatic region gets).
+        # test0's flat wall, four strips 20.4 mm long, took from a hint read off the mesh alone a cylinder r 262
+        # through their ends: vertices within 3e-3, facets 0.199 mm below it - the chords of an exact mesh sag
+        # 0.002. test9's coarse cylinders r 250-400 (facets 0.12 off) are within what its own chords sag at that
+        # radius. Hand picks keep their surface: the user chose it.
+        # ⚠️ ...WITH HINT_FACET_SLACK OVER IT: the cap is where the automatic segmentation gave up, and a hint is
+        # there to do better. test12_foro's tori/cones/cylinders at 1.0-1.4 x it, all turned away: 230 -> 379 faces,
+        # circles 46 -> 35. test0's wall stands 2.5 x, test15's sphere 15 x.
+        if h.max_dev is not None and eng is not None:
+            deep = None
+            for (pr, F), R in zip(pieces, Rs):
+                if R.prim.kind != FREE:
+                    R.fobjs = [topo.faces[i] for i in F]
+                    c_, _ = eng.facet_cap(R)
+                    if c_ is not None and R.sag > HINT_FACET_SLACK * c_:
+                        deep = (R.sag, HINT_FACET_SLACK * c_)
+                        break
+            if deep is not None:
+                h.result = f"its facets sag {deep[0]:.2g} mm below its {h.kind}, the mesh's chords at most {deep[1]:.2g}: they aren't its chords"
+                Log.warn(f"{tag}: {h.result} - left to the automatic segmentation")
+                continue
         for (pr, F), R in zip(pieces, Rs):
             R.forced = h
             R.repeated = True
@@ -21816,7 +21951,7 @@ def run_phase(
     eng.min_faces_hint = min_faces
     # (the hand fixes: regions of their own, converted first - see apply_hints)
     if HINTS and not is_b:
-        regions = apply_hints(regions, topo, tol_fit, max_edge_tol, min_faces, allow_free)
+        regions = apply_hints(regions, topo, tol_fit, max_edge_tol, min_faces, allow_free, eng=eng)
     # order: large regions first (more analytic boundary for the following ones)
     order = sorted(range(len(regions)), key=lambda k: (getattr(regions[k], "forced", None) is None, -sum(topo.areas[i] for i in regions[k].faces)))
     pending = list(order)
